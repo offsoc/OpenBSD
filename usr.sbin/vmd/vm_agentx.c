@@ -1,4 +1,4 @@
-/*	$OpenBSD: vm_agentx.c,v 1.4 2025/05/12 17:17:42 dv Exp $ */
+/*	$OpenBSD: vm_agentx.c,v 1.6 2025/11/13 22:58:42 martijn Exp $ */
 
 /*
  * Copyright (c) 2022 Martijn van Duren <martijn@openbsd.org>
@@ -121,10 +121,9 @@ vm_agentx_run(struct privsep *ps, struct privsep_proc *p, void *arg)
 	/*
 	 * pledge in agentx process
 	 * stdio - for malloc and basic I/O including events.
-	 * recvfd - for the proc fd exchange.
 	 * unix - for access to the agentx master socket.
 	 */
-	if (pledge("stdio recvfd unix", NULL) == -1)
+	if (pledge("stdio unix", NULL) == -1)
 		fatal("pledge");
 }
 
@@ -523,7 +522,7 @@ vm_agentx_vminfo(struct agentx_varbind *vb)
 	}
 
 	if (!vmcollecting) {
-		if (proc_compose_imsg(&(env->vmd_ps), PROC_PARENT, -1,
+		if (proc_compose_imsg(&(env->vmd_ps), PROC_PARENT,
 		    IMSG_VMDOP_GET_INFO_VM_REQUEST, IMSG_AGENTX_PEERID,
 		    -1, NULL, 0) == -1) {
 			log_warn("%s: Couldn't retrieve vm information",

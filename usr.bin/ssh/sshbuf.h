@@ -1,4 +1,4 @@
-/*	$OpenBSD: sshbuf.h,v 1.30 2025/05/21 06:43:48 djm Exp $	*/
+/*	$OpenBSD: sshbuf.h,v 1.34 2025/12/29 23:52:09 djm Exp $	*/
 /*
  * Copyright (c) 2011 Damien Miller
  *
@@ -67,7 +67,8 @@ struct sshbuf *sshbuf_fromb(struct sshbuf *buf);
  * an existing buffer (the string is consumed in the process).
  * The contents of "buf" must not change in the lifetime of the resultant
  * buffer.
- * Returns pointer to buffer on success, or NULL on allocation failure.
+ * On success, a pointer to the newly allocated buffer is placed in *bufp.
+ * Returns 0 on success, or a negative SSH_ERR_* error code on failure.
  */
 int	sshbuf_froms(struct sshbuf *buf, struct sshbuf **bufp);
 
@@ -147,6 +148,24 @@ int	sshbuf_consume(struct sshbuf *buf, size_t len);
  * Returns 0 on success, or a negative SSH_ERR_* error code on failure.
  */
 int	sshbuf_consume_end(struct sshbuf *buf, size_t len);
+
+/*
+ * Consume data from a parent buffer up to that of a child buffer (i.e.
+ * one created by sshbuf_fromb()).
+ *
+ * Intended to be used in a pattern like:
+ *
+ *     b = sshbuf_fromb(parent);
+ *     sshbuf_get_string(b, &foo, &foostr);
+ *     sshbuf_get_u32(b, &bar);
+ *     sshbuf_consume_upto_child(parent, b);
+ *
+ * After which, both "b" and "parent" will point to the same data.
+ *
+ * "child" must be a direct child of "buf" (i.e. neither an unrelated buffer
+ * nor a grandchild) which has consumed data past that of "buf".
+ */
+int	sshbuf_consume_upto_child(struct sshbuf *buf, const struct sshbuf *child);
 
 /* Extract or deposit some bytes */
 int	sshbuf_get(struct sshbuf *buf, void *v, size_t len);
@@ -230,6 +249,10 @@ int	sshbuf_put_ec(struct sshbuf *buf, const EC_POINT *v, const EC_GROUP *g);
 int	sshbuf_put_eckey(struct sshbuf *buf, const EC_KEY *v);
 int	sshbuf_put_ec_pkey(struct sshbuf *buf, EVP_PKEY *pkey);
 
+/* Functions to extract or store various non-SSH wire encoded values */
+int	sshbuf_get_nulterminated_string(struct sshbuf *buf, size_t maxlen,
+	    char **valp, size_t *lenp);
+
 /* Dump the contents of the buffer in a human-readable format */
 void	sshbuf_dump(const struct sshbuf *buf, FILE *f);
 
@@ -264,6 +287,15 @@ int	sshbuf_b64tod(struct sshbuf *buf, const char *b64);
  */
 int	sshbuf_cmp(const struct sshbuf *b, size_t offset,
     const void *s, size_t len);
+
+/*
+ * Test whether two buffers have identical contents.
+ * SSH_ERR_MESSAGE_INCOMPLETE indicates the buffers had differing size.
+ * SSH_ERR_INVALID_FORMAT indicates the buffers were the same size but
+ * had differing contents.
+ * Returns 0 on successful compare (comparing two empty buffers returns 0).
+ */
+int sshbuf_equals(const struct sshbuf *a, const struct sshbuf *b);
 
 /*
  * Searches the buffer for the specified string. Returns 0 on success

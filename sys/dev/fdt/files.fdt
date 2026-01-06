@@ -1,9 +1,8 @@
-#	$OpenBSD: files.fdt,v 1.208 2025/04/22 05:31:50 deraadt Exp $
+#	$OpenBSD: files.fdt,v 1.218 2025/12/27 15:01:06 patrick Exp $
 #
 # Config file and device description for machine-independent FDT code.
 # Included by ports that need it.
 
-define	spi {}
 define	spmi {}
 
 device	iicmux: i2cbus
@@ -132,7 +131,7 @@ device	bcmmbox
 attach	bcmmbox at fdt
 file	dev/fdt/bcm2835_mbox.c		bcmmbox
 
-device	bcmpcie: pcibus, fdt
+device	bcmpcie: pcibus
 attach	bcmpcie at fdt
 file	dev/fdt/bcm2711_pcie.c		bcmpcie
 
@@ -143,6 +142,26 @@ file	dev/fdt/bcm2835_rng.c		bcmrng
 device	bcmsdhost: sdmmcbus
 attach	bcmsdhost at fdt
 file	dev/fdt/bcm2835_sdhost.c	bcmsdhost
+
+device	bcmstbgpio
+attach	bcmstbgpio at fdt
+file	dev/fdt/bcmstbgpio.c		bcmstbgpio
+
+device	bcmstbintc
+attach	bcmstbintc at fdt
+file	dev/fdt/bcmstbintc.c		bcmstbintc
+
+device	bcmstbpinctrl
+attach	bcmstbpinctrl at fdt
+file	dev/fdt/bcmstbpinctrl.c		bcmstbpinctrl
+
+device	bcmstbrescal
+attach	bcmstbrescal at fdt
+file	dev/fdt/bcmstbrescal.c		bcmstbrescal
+
+device	bcmstbreset
+attach	bcmstbreset at fdt
+file	dev/fdt/bcmstbreset.c		bcmstbreset
 
 device	bcmtemp
 attach	bcmtemp at fdt
@@ -312,6 +331,10 @@ device	cad: ether, ifnet, mii, ifmedia
 attach	cad at fdt
 file	dev/fdt/if_cad.c		cad
 
+device	cdpcie: pcibus
+attach	cdpcie at fdt
+file	dev/fdt/cdpcie.c		cdpcie
+
 device	cdsdhc: sdmmcbus, sdhc
 attach	cdsdhc at fdt
 file	dev/fdt/cdsdhc.c		cdsdhc
@@ -360,6 +383,10 @@ file	dev/fdt/rkclock.c		rkclock
 device	rkcomphy
 attach	rkcomphy at fdt
 file	dev/fdt/rkcomphy.c		rkcomphy
+
+device	rkusbdpphy
+attach	rkusbdpphy at fdt
+file	dev/fdt/rkusbdpphy.c		rkusbdpphy
 
 device	rkusbphy
 attach	rkusbphy at fdt
@@ -700,6 +727,14 @@ file	dev/fdt/qccpu.c		qccpu
 device	qccpucp
 attach	qccpucp at fdt
 file	dev/fdt/qccpucp.c		qccpucp
+
+device	qcdrm: fdt
+attach	qcdrm at fdt
+file	dev/fdt/qcdrm.c			qcdrm
+
+device	qcdpc: fdt
+attach	qcdpc at fdt
+file	dev/fdt/qcdpc.c			qcdpc
 
 device	qcdwusb: fdt
 attach	qcdwusb at fdt

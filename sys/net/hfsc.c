@@ -1,4 +1,4 @@
-/*	$OpenBSD: hfsc.c,v 1.50 2024/10/29 23:57:54 dlg Exp $	*/
+/*	$OpenBSD: hfsc.c,v 1.52 2025/11/22 05:07:24 dlg Exp $	*/
 
 /*
  * Copyright (c) 2012-2013 Henning Brauer <henning@openbsd.org>
@@ -46,7 +46,6 @@
 #include <sys/malloc.h>
 #include <sys/pool.h>
 #include <sys/mbuf.h>
-#include <sys/socket.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
 #include <sys/queue.h>
@@ -55,7 +54,6 @@
 
 #include <net/if.h>
 #include <net/if_var.h>
-#include <netinet/in.h>
 
 #include <net/pfvar.h>
 #include <net/hfsc.h>
@@ -251,8 +249,6 @@ struct hfsc_class	*hfsc_clh2cph(struct hfsc_if *, u_int32_t);
 #define	HFSC_FREQ		1000000000LL
 #define	HFSC_CLK_PER_TICK	tick_nsec
 #define	HFSC_HT_INFINITY	0xffffffffffffffffLL /* infinite time value */
-
-#define hfsc_uptime()		nsecuptime()
 
 struct pool	hfsc_class_pl, hfsc_internal_sc_pl;
 
@@ -836,7 +832,7 @@ hfsc_deq_begin(struct ifqueue *ifq, void **cookiep)
 	struct mbuf *m;
 	u_int64_t cur_time;
 
-	cur_time = hfsc_uptime();
+	cur_time = nsecuptime();
 
 	/*
 	 * if there are eligible classes, use real-time criteria.
@@ -998,7 +994,7 @@ hfsc_init_ed(struct hfsc_if *hif, struct hfsc_class *cl, int next_len)
 {
 	u_int64_t cur_time;
 
-	cur_time = hfsc_uptime();
+	cur_time = nsecuptime();
 
 	/* update the deadline curve */
 	hfsc_rtsc_min(&cl->cl_deadline, cl->cl_rsc, cur_time, cl->cl_cumul);
@@ -1105,7 +1101,7 @@ hfsc_init_vf(struct hfsc_class *cl, int len)
 			if (cl->cl_usc != NULL) {
 				/* class has upper limit curve */
 				if (cur_time == 0)
-					cur_time = hfsc_uptime();
+					cur_time = nsecuptime();
 
 				/* update the ulimit curve */
 				hfsc_rtsc_min(&cl->cl_ulimit, cl->cl_usc, cur_time,
@@ -1692,7 +1688,7 @@ hfsc_getclstats(struct hfsc_class_stats *sp, struct hfsc_class *cl)
 	sp->myfadj = cl->cl_myfadj;
 	sp->vtadj = cl->cl_vtadj;
 
-	sp->cur_time = hfsc_uptime();
+	sp->cur_time = nsecuptime();
 	sp->machclk_freq = HFSC_FREQ;
 
 	sp->qlength = hfsc_class_qlength(cl);

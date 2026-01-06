@@ -1,4 +1,4 @@
-#	$OpenBSD: files,v 1.745 2025/04/23 21:40:22 kettenis Exp $
+#	$OpenBSD: files,v 1.748 2025/11/14 01:55:07 jcs Exp $
 #	$NetBSD: files,v 1.87 1996/05/19 17:17:50 jonathan Exp $
 
 #	@(#)files.newconf	7.5 (Berkeley) 5/10/93
@@ -20,9 +20,11 @@ define	radiobus {}
 define	i2cbus {}
 define	gpiobus {}
 define	onewirebus {}
+define	spi {}
 define	video {}
 define	intrmap {}
 define	fdt {[early = 0]}
+define	xcall
 
 # filesystem firmware loading attribute
 define firmload
@@ -474,7 +476,7 @@ device	ccp {}
 file	dev/ic/ccp.c			ccp
 
 # AMD Platform Security Processor
-device	psp
+device	psp: xcall
 attach	psp at ccp
 file	dev/ic/psp.c			psp	needs-flag
 
@@ -564,6 +566,10 @@ device	qcscm
 # UFS HC
 device	ufshci: scsi
 file	dev/ic/ufshci.c			ufshci needs-flag
+
+# Intel LPSS SPI controller
+device	ispi: spi
+file	dev/ic/ispi.c			ispi
 
 # legitimate pseudo-devices
 pseudo-device vnd: disk
@@ -750,6 +756,7 @@ file kern/kern_uuid.c
 file kern/kern_watchdog.c		!small_kernel
 file kern/kern_task.c
 file kern/kern_srp.c
+file kern/kern_xcall.c			xcall			needs-flag
 file kern/kern_xxx.c
 file kern/sched_bsd.c
 file kern/subr_autoconf.c

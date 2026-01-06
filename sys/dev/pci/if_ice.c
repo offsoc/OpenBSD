@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ice.c,v 1.46 2025/05/23 11:50:21 stsp Exp $	*/
+/*	$OpenBSD: if_ice.c,v 1.66 2025/11/18 09:13:55 jan Exp $	*/
 
 /*  Copyright (c) 2024, Intel Corporation
  *  All rights reserved.
@@ -84,6 +84,9 @@
 
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
+#include <netinet/tcp.h>
+#include <netinet/tcp_timer.h>
+#include <netinet/tcp_var.h>
 #include <netinet/udp.h>
 
 #define STRUCT_HACK_VAR_LEN
@@ -101,6 +104,12 @@
 
 #include "if_icereg.h"
 #include "if_icevar.h"
+
+/*
+ * Our network stack cannot handle packets greater than MAXMCLBYTES.
+ * This interface cannot handle packets greater than ICE_TSO_SIZE.
+ */
+CTASSERT(MAXMCLBYTES < ICE_TSO_SIZE);
 
 /**
  * @var ice_driver_version
@@ -130,10 +139,14 @@ const uint8_t ice_rc_version = 0;
 typedef void *ice_match_t;
 
 static const struct pci_matchid ice_devices[] = {
-	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_E810_XXV_SFP },
-#if 0 /* no hardware available for testing: */
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_E810_C_QSFP },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_E810_C_SFP },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_E810_XXV_QSFP },
-#endif
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_E810_XXV_SFP },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_E823_L_SFP },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_E823_L_10G },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_E823_L_1G },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_E823_L_QSFP },
 };
 
 int
@@ -174,7 +187,7 @@ ice_match(struct device *parent, ice_match_t match __unused, void *aux)
 				 ICE_DBG_AQ_CMD)
 #define ICE_DBG_PARSER		(1UL << 28)
 #define ICE_DBG_USER		(1UL << 31)
-uint32_t	ice_debug = 0xffffffff & ~(ICE_DBG_AQ);
+uint32_t	ice_debug = 0xffffffff & ~(ICE_DBG_AQ | ICE_DBG_TRACE);
 #else
 #define DPRINTF(x...)
 #define DNPRINTF(n,x...)
@@ -188,6 +201,10 @@ uint32_t	ice_debug = 0xffffffff & ~(ICE_DBG_AQ);
 
 #define ICE_WRITE(hw, reg, val)						\
 	bus_space_write_4((hw)->hw_sc->sc_st, (hw)->hw_sc->sc_sh, (reg), (val))
+
+#define ICE_WRITE_RAW(hw, reg, val)					\
+	bus_space_write_raw_4((hw)->hw_sc->sc_st, (hw)->hw_sc->sc_sh, (reg), \
+	    (val))
 
 #define ice_flush(_hw) ICE_READ((_hw), GLGEN_STAT)
 
@@ -247,6 +264,8 @@ struct ice_intr_vector {
 };
 
 #define ICE_MAX_VECTORS			8 /* XXX this is pretty arbitrary */
+
+static struct rwlock ice_sff_lock = RWLOCK_INITIALIZER("icesff");
 
 struct ice_softc {
 	struct device sc_dev;
@@ -322,6 +341,8 @@ struct ice_softc {
 
 	int sw_intr[ICE_MAX_VECTORS];
 };
+
+static int ice_rxrinfo(struct ice_softc *, struct if_rxrinfo *);
 
 /**
  * ice_driver_is_detaching - Check if the driver is detaching/unloading
@@ -622,67 +643,72 @@ ice_mdd_tx_tclan_str(uint8_t event)
 
 	switch (event) {
 	case 0:
-		str = "Wrong descriptor format/order";
+		str = "Wrong order/Format of descriptors";
 		break;
 	case 1:
-		str = "Descriptor fetch failed";
+		str = "Unsupported Requests";
 		break;
 	case 2:
-		str = "Tail descriptor not EOP/NOP";
+		str = "Tail descriptor is not DDESC with EOP/NOP";
 		break;
 	case 3:
-		str = "False scheduling error";
+		str = "False Scheduling";
 		break;
 	case 4:
-		str = "Tail value larger than ring len";
+		str = "Tail value is bigger than ring length";
 		break;
 	case 5:
-		str = "Too many data commands";
+		str = "More than 8 data commands in packet";
 		break;
 	case 6:
-		str = "Zero packets sent in quanta";
+		str = "Zero packets sent in quanta and"
+		    " no head update in this quanta";
 		break;
 	case 7:
 		str = "Packet too small or too big";
 		break;
 	case 8:
-		str = "TSO length doesn't match sum";
+		str = "TSO: TLEN is not coherent with sum";
 		break;
 	case 9:
-		str = "TSO tail reached before TLEN";
+		str = "TSO: Tail reached before TLEN ended";
 		break;
 	case 10:
-		str = "TSO max 3 descs for headers";
+		str = "TSO: Headers are spread on more than 3 descriptors";
 		break;
 	case 11:
-		str = "EOP on header descriptor";
+		str = "TSO: Sum of TSO buffers < sum of headers";
 		break;
 	case 12:
-		str = "MSS is 0 or TLEN is 0";
+		str = "TSO: Sum of headers is 0/MSS is 0/TLEN is 0";
 		break;
 	case 13:
 		str = "CTX desc invalid IPSec fields";
 		break;
 	case 14:
-		str = "Quanta invalid # of SSO packets";
+		str = "SSO: Quanta does not include a whole number"
+		    " of SSO packets";
 		break;
 	case 15:
-		str = "Quanta bytes exceeds pkt_len*64";
+		str = "SSO+TSO: Quanta bytes before additions exceed"
+		    "pkt_len*64";
 		break;
 	case 16:
-		str = "Quanta exceeds max_cmds_in_sq";
+		str = "SSO+TSO: Quanta commands exceed max_cmds_in_sq";
 		break;
 	case 17:
-		str = "incoherent last_lso_quanta";
+		str = "TSO: total_descs_in_lso is not coherent with"
+		    " last_lso_quanta";
 		break;
 	case 18:
-		str = "incoherent TSO TLEN";
+		str = "TSO: total_descs_in_lso is not coherent with TLEN";
 		break;
 	case 19:
-		str = "Quanta: too many descriptors";
+		str = "TSO: Quanta bytes is spread on more than max descriptors"
+		    " in quanta";
 		break;
 	case 20:
-		str = "Quanta: # of packets mismatch";
+		str = "Number of packets in quanta mismatch";
 		break;
 	default:
 		break;
@@ -846,7 +872,7 @@ enum ice_memcpy_type {
 };
 
 /*
- * ice_calloc - Allocate an array of elementes
+ * ice_calloc - Allocate an array of elements
  * @hw: the hardware private structure
  * @count: number of elements to allocate
  * @size: the size of each element
@@ -962,12 +988,11 @@ ice_set_mac_type(struct ice_hw *hw)
 	switch (sc->sc_pid) {
 #if 0
 	case ICE_DEV_ID_E810C_BACKPLANE:
-	case ICE_DEV_ID_E810C_QSFP:
-	case ICE_DEV_ID_E810C_SFP:
 	case ICE_DEV_ID_E810_XXV_BACKPLANE:
-	case ICE_DEV_ID_E810_XXV_QSFP:
-	case ICE_DEV_ID_E810_XXV_SFP:
 #endif
+	case PCI_PRODUCT_INTEL_E810_C_QSFP:
+	case PCI_PRODUCT_INTEL_E810_C_SFP:
+	case PCI_PRODUCT_INTEL_E810_XXV_QSFP:
 	case PCI_PRODUCT_INTEL_E810_XXV_SFP:
 		hw->mac_type = ICE_MAC_E810;
 		break;
@@ -981,19 +1006,21 @@ ice_set_mac_type(struct ice_hw *hw)
 	case ICE_DEV_ID_E822L_BACKPLANE:
 	case ICE_DEV_ID_E822L_SFP:
 	case ICE_DEV_ID_E822L_SGMII:
-	case ICE_DEV_ID_E823L_10G_BASE_T:
-	case ICE_DEV_ID_E823L_1GBE:
+#endif
+	case PCI_PRODUCT_INTEL_E823_L_10G:
+	case PCI_PRODUCT_INTEL_E823_L_1G:
+	case PCI_PRODUCT_INTEL_E823_L_QSFP:
+	case PCI_PRODUCT_INTEL_E823_L_SFP:
+#if 0
 	case ICE_DEV_ID_E823L_BACKPLANE:
-	case ICE_DEV_ID_E823L_QSFP:
-	case ICE_DEV_ID_E823L_SFP:
 	case ICE_DEV_ID_E823C_10G_BASE_T:
 	case ICE_DEV_ID_E823C_BACKPLANE:
 	case ICE_DEV_ID_E823C_QSFP:
 	case ICE_DEV_ID_E823C_SFP:
 	case ICE_DEV_ID_E823C_SGMII:
+#endif
 		hw->mac_type = ICE_MAC_GENERIC;
 		break;
-#endif
 	default:
 		hw->mac_type = ICE_MAC_UNKNOWN;
 		break;
@@ -10814,11 +10841,12 @@ ice_copy_rxq_ctx_to_hw(struct ice_hw *hw, uint8_t *ice_rxq_ctx,
 
 	/* Copy each dword separately to HW */
 	for (i = 0; i < ICE_RXQ_CTX_SIZE_DWORDS; i++) {
-		ICE_WRITE(hw, QRX_CONTEXT(i, rxq_index),
+		ICE_WRITE_RAW(hw, QRX_CONTEXT(i, rxq_index),
 		     *((uint32_t *)(ice_rxq_ctx + (i * sizeof(uint32_t)))));
 
 		DNPRINTF(ICE_DBG_QCTX, "%s: qrxdata[%d]: %08X\n", __func__,
-		    i, *((uint32_t *)(ice_rxq_ctx + (i * sizeof(uint32_t)))));
+		    i, le32toh(*((uint32_t *)(ice_rxq_ctx +
+		    (i * sizeof(uint32_t))))));
 	}
 
 	return ICE_SUCCESS;
@@ -13416,8 +13444,10 @@ ice_txq_clean(struct ice_softc *sc, struct ice_tx_queue *txq)
 
 		if (txm->txm_m == NULL)
 			continue;
-
-		map = txm->txm_map;
+		if (ISSET(txm->txm_m->m_pkthdr.csum_flags, M_TCP_TSO))
+			map = txm->txm_map_tso;
+		else
+			map = txm->txm_map;
 		bus_dmamap_sync(sc->sc_dmat, map, 0, map->dm_mapsize,
 		    BUS_DMASYNC_POSTWRITE);
 		bus_dmamap_unload(sc->sc_dmat, map);
@@ -13554,6 +13584,160 @@ ice_down(struct ice_softc *sc)
 	return 0;
 }
 
+/* Read SFF EEPROM (0x06EE) */
+int
+ice_aq_sff_eeprom(struct ice_hw *hw, uint16_t lport, uint8_t bus_addr,
+    uint16_t mem_addr, uint8_t page, uint8_t set_page,
+    uint8_t *data, uint8_t length, int write, struct ice_sq_cd *cd)
+{
+	struct ice_aqc_sff_eeprom *cmd;
+	struct ice_aq_desc desc;
+	int status;
+
+	if (!data || (mem_addr & 0xff00))
+		return ICE_ERR_PARAM;
+
+	ice_fill_dflt_direct_cmd_desc(&desc, ice_aqc_opc_sff_eeprom);
+	cmd = &desc.params.read_write_sff_param;
+	desc.flags = htole16(ICE_AQ_FLAG_RD);
+	cmd->lport_num = (uint8_t)(lport & 0xff);
+	cmd->lport_num_valid = (uint8_t)((lport >> 8) & 0x01);
+	cmd->i2c_bus_addr = htole16(
+	    ((bus_addr >> 1) & ICE_AQC_SFF_I2CBUS_7BIT_M) |
+	    ((set_page << ICE_AQC_SFF_SET_EEPROM_PAGE_S) &
+	    ICE_AQC_SFF_SET_EEPROM_PAGE_M));
+	cmd->i2c_mem_addr = htole16(mem_addr & 0xff);
+	cmd->eeprom_page = htole16((uint16_t)page << ICE_AQC_SFF_EEPROM_PAGE_S);
+	if (write)
+		cmd->i2c_bus_addr |= htole16(ICE_AQC_SFF_IS_WRITE);
+
+	status = ice_aq_send_cmd(hw, &desc, data, length, cd);
+	return status;
+}
+
+int
+ice_rw_sff_eeprom(struct ice_softc *sc, uint16_t dev_addr, uint16_t offset,
+    uint8_t page, uint8_t* data, uint16_t length, uint8_t set_page, int write)
+{
+	struct ice_hw *hw = &sc->hw;
+	int ret = 0, retries = 0;
+	int status;
+
+	if (length > 16)
+		return (EINVAL);
+
+	if (ice_test_state(&sc->state, ICE_STATE_RECOVERY_MODE))
+		return (ENOSYS);
+
+	if (ice_test_state(&sc->state, ICE_STATE_NO_MEDIA))
+		return (ENXIO);
+
+	do {
+		status = ice_aq_sff_eeprom(hw, 0, dev_addr, offset, page,
+		    set_page, data, length, write, NULL);
+		if (!status) {
+			ret = 0;
+			break;
+		}
+		if (status == ICE_ERR_AQ_ERROR &&
+		    hw->adminq.sq_last_status == ICE_AQ_RC_EBUSY) {
+			ret = EBUSY;
+			continue;
+		}
+		if (status == ICE_ERR_AQ_ERROR &&
+		    hw->adminq.sq_last_status == ICE_AQ_RC_EACCES) {
+			/* FW says I2C access isn't supported */
+			ret = EACCES;
+			break;
+		}
+		if (status == ICE_ERR_AQ_ERROR &&
+		    hw->adminq.sq_last_status == ICE_AQ_RC_EPERM) {
+			ret = EPERM;
+			break;
+		} else {
+			ret = EIO;
+			break;
+		}
+	} while (retries++ < ICE_I2C_MAX_RETRIES);
+
+	return (ret);
+}
+
+/*
+ * Read from the SFF eeprom.
+ * The I2C device address is typically 0xA0 or 0xA2. For more details on
+ * the contents of an SFF eeprom, refer to SFF-8724 (SFP), SFF-8636 (QSFP),
+ * and SFF-8024 (both).
+ */
+int
+ice_read_sff_eeprom(struct ice_softc *sc, uint16_t dev_addr, uint16_t offset,
+    uint8_t page, uint8_t* data, uint16_t length)
+{
+	return ice_rw_sff_eeprom(sc, dev_addr, offset, page, data, length,
+	    0, 0);
+}
+
+/* Write to the SFF eeprom. */
+int
+ice_write_sff_eeprom(struct ice_softc *sc, uint16_t dev_addr, uint16_t offset,
+    uint8_t page, uint8_t* data, uint16_t length, uint8_t set_page)
+{
+	return ice_rw_sff_eeprom(sc, dev_addr, offset, page, data, length,
+	    1, set_page);
+}
+
+int
+ice_get_sffpage(struct ice_softc *sc, struct if_sffpage *sff)
+{
+	struct ice_hw *hw = &sc->hw;
+	struct ice_port_info *pi = hw->port_info;
+	struct ice_link_status *li = &pi->phy.link_info;
+	const uint16_t chunksize = 16;
+	uint16_t offset = 0;
+	uint8_t curpage = 0;
+	int error;
+
+	if (sff->sff_addr != IFSFF_ADDR_EEPROM &&
+	    sff->sff_addr != IFSFF_ADDR_DDM)
+		return (EINVAL);
+
+	if (li->module_type[0] == ICE_SFF8024_ID_NONE)
+		return (ENXIO);
+
+	if (sff->sff_addr == IFSFF_ADDR_EEPROM &&
+	    li->module_type[0] == ICE_SFF8024_ID_SFP) {
+		error = ice_read_sff_eeprom(sc, sff->sff_addr, 127, 0,
+		    &curpage, 1);
+		if (error)
+			return error;
+
+		if (curpage != sff->sff_page) {
+			error = ice_write_sff_eeprom(sc, sff->sff_addr, 127, 0,
+			    &sff->sff_page, 1, 1);
+			if (error)
+				return error;
+		}
+	}
+
+	for (; offset <= IFSFF_DATA_LEN - chunksize; offset += chunksize) {
+		error = ice_read_sff_eeprom(sc, sff->sff_addr, offset,
+		    sff->sff_page, &sff->sff_data[0] + offset, chunksize);
+		if (error)
+			return error;
+	}
+
+	if (sff->sff_addr == IFSFF_ADDR_EEPROM &&
+	    li->module_type[0] == ICE_SFF8024_ID_SFP &&
+	    curpage != sff->sff_page) {
+		error = ice_write_sff_eeprom(sc, sff->sff_addr, 127, 0,
+		    &curpage, 1, 1);
+		if (error)
+			return error;
+	}
+
+	return 0;
+}
+
 int
 ice_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 {
@@ -13583,6 +13767,9 @@ ice_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	case SIOCSIFMEDIA:
 	case SIOCGIFMEDIA:
 		error = ifmedia_ioctl(ifp, ifr, &sc->media, cmd);
+		break;
+	case SIOCGIFRXR:
+		error = ice_rxrinfo(sc, (struct if_rxrinfo *)ifr->ifr_data);
 		break;
 	case SIOCADDMULTI:
 		error = ether_addmulti(ifr, &sc->sc_ac);
@@ -13623,6 +13810,13 @@ ice_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 			}
 		}
 		break;
+	case SIOCGIFSFFPAGE:
+		error = rw_enter(&ice_sff_lock, RW_WRITE|RW_INTR);
+		if (error)
+			break;
+		error = ice_get_sffpage(sc, (struct if_sffpage *)data);
+		rw_exit(&ice_sff_lock);
+		break;
 	default:
 		error = ether_ioctl(ifp, &sc->sc_ac, cmd, data);
 		break;
@@ -13641,16 +13835,102 @@ ice_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	return error;
 }
 
-uint64_t
-ice_tx_setup_offload(struct mbuf *m0, struct ice_tx_queue *txq,
-    unsigned int prod)
+/**
+ * ice_tso_detect_sparse - detect TSO packets with too many segments
+ *
+ * Hardware only transmits packets with a maximum of 8 descriptors. For TSO
+ * packets, hardware needs to be able to build the split packets using 8 or
+ * fewer descriptors. Additionally, the header must be contained within at
+ * most 3 descriptors.
+ *
+ * To verify this, we walk the headers to find out how many descriptors the
+ * headers require (usually 1). Then we ensure that, for each TSO segment, its
+ * data plus the headers are contained within 8 or fewer descriptors.
+ */
+int
+ice_tso_detect_sparse(struct mbuf *m, struct ether_extracted *ext,
+    bus_dmamap_t map)
 {
-	struct ether_extracted ext;
+	int count, curseg, i, hlen, segsz, seglen, hdrs, maxsegs;
+	bus_dma_segment_t *segs;
+	uint64_t paylen, outlen, nsegs;
+
+	curseg = hdrs = 0;
+
+	hlen = ETHER_HDR_LEN + ext->iphlen + ext->tcphlen;
+	outlen = MIN(9668, MAX(64, m->m_pkthdr.ph_mss));
+	paylen = m->m_pkthdr.len - hlen;
+	nsegs = (paylen + outlen - 1) / outlen;
+
+	segs = map->dm_segs;
+
+	/* First, count the number of descriptors for the header.
+	 * Additionally, make sure it does not span more than 3 segments.
+	 */
+	i = 0;
+	curseg = segs[0].ds_len;
+	while (hlen > 0) {
+		hdrs++;
+		if (hdrs > ICE_MAX_TSO_HDR_SEGS)
+			return (1);
+		if (curseg == 0) {
+			i++;
+			if (i == nsegs)
+				return (1);
+
+			curseg = segs[i].ds_len;
+		}
+		seglen = MIN(curseg, hlen);
+		curseg -= seglen;
+		hlen -= seglen;
+	}
+
+	maxsegs = ICE_MAX_TSO_SEGS - hdrs;
+
+	/* We must count the headers, in order to verify that they take up
+	 * 128 or fewer descriptors. However, we don't need to check the data
+	 * if the total segments is small.
+	 */
+	if (nsegs <= maxsegs)
+		return (0);
+
+	count = 0;
+
+	/* Now check the data to make sure that each TSO segment is made up of
+	 * no more than maxsegs descriptors. This ensures that hardware will
+	 * be capable of performing TSO offload.
+	 */
+	while (paylen > 0) {
+		segsz = m->m_pkthdr.ph_mss;
+		while (segsz > 0 && paylen != 0) {
+			count++;
+			if (count > maxsegs)
+				return (1);
+			if (curseg == 0) {
+				i++;
+				if (i == nsegs)
+					return (1);
+				curseg = segs[i].ds_len;
+			}
+			seglen = MIN(curseg, segsz);
+			segsz -= seglen;
+			curseg -= seglen;
+			paylen -= seglen;
+		}
+		count = 0;
+	}
+
+	return (0);
+}
+
+uint64_t
+ice_tx_setup_offload(struct mbuf *m0, struct ether_extracted *ext)
+{
 	uint64_t offload = 0, hlen;
 
 #if NVLAN > 0
 	if (ISSET(m0->m_flags, M_VLANTAG)) {
-		uint64_t vtag = htole16(m0->m_pkthdr.ether_vtag);
+		uint64_t vtag = m0->m_pkthdr.ether_vtag;
 		offload |= (ICE_TX_DESC_CMD_IL2TAG1 << ICE_TXD_QW1_CMD_S) |
 		    (vtag << ICE_TXD_QW1_L2TAG1_S);
 	}
@@ -13659,17 +13939,16 @@ ice_tx_setup_offload(struct mbuf *m0, struct ice_tx_queue *txq,
 	    M_IPV4_CSUM_OUT|M_TCP_CSUM_OUT|M_UDP_CSUM_OUT|M_TCP_TSO))
 		return offload;
 
-	ether_extract_headers(m0, &ext);
-	hlen = ext.iphlen;
+	hlen = ext->iphlen;
 
-	if (ext.ip4) {
+	if (ext->ip4) {
 		if (ISSET(m0->m_pkthdr.csum_flags, M_IPV4_CSUM_OUT))
 			offload |= ICE_TX_DESC_CMD_IIPT_IPV4_CSUM <<
 			    ICE_TXD_QW1_CMD_S;
 		else
 			offload |= ICE_TX_DESC_CMD_IIPT_IPV4 <<
 			    ICE_TXD_QW1_CMD_S;
-	} else if (ext.ip6)
+	} else if (ext->ip6)
 		offload |= ICE_TX_DESC_CMD_IIPT_IPV6 << ICE_TXD_QW1_CMD_S;
 	else
 		return offload;
@@ -13679,13 +13958,13 @@ ice_tx_setup_offload(struct mbuf *m0, struct ice_tx_queue *txq,
 	offload |= ((hlen >> 2) << ICE_TX_DESC_LEN_IPLEN_S) <<
 	    ICE_TXD_QW1_OFFSET_S;
 
-	if (ext.tcp && ISSET(m0->m_pkthdr.csum_flags, M_TCP_CSUM_OUT)) {
+	if (ext->tcp && ISSET(m0->m_pkthdr.csum_flags, M_TCP_CSUM_OUT)) {
 		offload |= ICE_TX_DESC_CMD_L4T_EOFT_TCP << ICE_TXD_QW1_CMD_S;
-		offload |= ((uint64_t)(ext.tcphlen >> 2) <<
+		offload |= ((uint64_t)(ext->tcphlen >> 2) <<
 		    ICE_TX_DESC_LEN_L4_LEN_S) << ICE_TXD_QW1_OFFSET_S;
-	} else if (ext.udp && ISSET(m0->m_pkthdr.csum_flags, M_UDP_CSUM_OUT)) {
+	} else if (ext->udp && ISSET(m0->m_pkthdr.csum_flags, M_UDP_CSUM_OUT)) {
 		offload |= ICE_TX_DESC_CMD_L4T_EOFT_UDP << ICE_TXD_QW1_CMD_S;
-		offload |= ((uint64_t)(sizeof(*ext.udp) >> 2) <<
+		offload |= ((uint64_t)(sizeof(*ext->udp) >> 2) <<
 		    ICE_TX_DESC_LEN_L4_LEN_S) << ICE_TXD_QW1_OFFSET_S;
 	}
 
@@ -13711,6 +13990,36 @@ ice_load_mbuf(bus_dma_tag_t dmat, bus_dmamap_t map, struct mbuf *m)
 }
 
 void
+ice_set_tso_context(struct mbuf *m0, struct ice_tx_queue *txq,
+    unsigned int prod, struct ether_extracted *ext)
+{
+	struct ice_tx_desc *ring;
+	struct ice_tx_ctx_desc *txd;
+	uint64_t qword1 = 0, paylen, outlen;
+
+	/*
+	 * The MSS should not be set to a lower value than 64.
+	 */
+	outlen = MAX(64, m0->m_pkthdr.ph_mss);
+	paylen = m0->m_pkthdr.len - ETHER_HDR_LEN - ext->iphlen - ext->tcphlen;
+
+	ring = ICE_DMA_KVA(&txq->tx_desc_mem);
+	txd = (struct ice_tx_ctx_desc *)&ring[prod];
+
+	qword1 |= ICE_TX_DESC_DTYPE_CTX;
+	qword1 |= ICE_TX_CTX_DESC_TSO << ICE_TXD_CTX_QW1_CMD_S;
+	qword1 |= paylen << ICE_TXD_CTX_QW1_TSO_LEN_S;
+	qword1 |= outlen << ICE_TXD_CTX_QW1_MSS_S;
+
+	htolem32(&txd->tunneling_params, 0);
+	htolem16(&txd->l2tag2, 0);
+	htolem16(&txd->rsvd, 0);
+	htolem64(&txd->qw1, qword1);
+
+	tcpstat_add(tcps_outpkttso, (paylen + outlen - 1) / outlen);
+}
+
+void
 ice_start(struct ifqueue *ifq)
 {
 	struct ifnet *ifp = ifq->ifq_if;
@@ -13727,6 +14036,7 @@ ice_start(struct ifqueue *ifq)
 	uint64_t offload;
 	uint64_t paddr;
 	uint64_t seglen;
+	struct ether_extracted ext;
 #if NBPFILTER > 0
 	caddr_t if_bpf;
 #endif
@@ -13759,21 +14069,56 @@ ice_start(struct ifqueue *ifq)
 		if (m == NULL)
 			break;
 
-		offload = ice_tx_setup_offload(m, txq, prod);
+		ether_extract_headers(m, &ext);
+		offload = ice_tx_setup_offload(m, &ext);
+
+		if (ISSET(m->m_pkthdr.csum_flags, M_TCP_TSO)) {
+			if (ext.tcp == NULL || m->m_pkthdr.ph_mss == 0 ||
+			    m->m_pkthdr.ph_mss > ICE_TXD_CTX_MAX_MSS) {
+				tcpstat_inc(tcps_outbadtso);
+				ifq->ifq_errors++;
+				m_freem(m);
+				continue;
+			}
+		}
 
 		txm = &txq->tx_map[prod];
-		map = txm->txm_map;
-#if 0
-		if (ISSET(m->m_pkthdr.csum_flags, M_TCP_TSO)) {
-			prod++;
-			prod &= mask;
-			free--;
-		}
-#endif
+
+		if (ISSET(m->m_pkthdr.csum_flags, M_TCP_TSO))
+			map = txm->txm_map_tso;
+		else
+			map = txm->txm_map;
+
 		if (ice_load_mbuf(sc->sc_dmat, map, m) != 0) {
 			ifq->ifq_errors++;
 			m_freem(m);
 			continue;
+		}
+
+		if (ISSET(m->m_pkthdr.csum_flags, M_TCP_TSO)) {
+			if (ice_tso_detect_sparse(m, &ext, map)) {
+				bus_dmamap_unload(sc->sc_dmat, map);
+				if (m_defrag(m, M_DONTWAIT) != 0 ||
+				    bus_dmamap_load_mbuf(sc->sc_dmat, map, m,
+				    BUS_DMA_STREAMING | BUS_DMA_NOWAIT) != 0) {
+					tcpstat_inc(tcps_outbadtso);
+					ifq->ifq_errors++;
+					m_freem(m);
+					continue;
+				}
+				if (ice_tso_detect_sparse(m, &ext, map)) {
+					bus_dmamap_unload(sc->sc_dmat, map);
+					tcpstat_inc(tcps_outbadtso);
+					ifq->ifq_errors++;
+					m_freem(m);
+					continue;
+				}
+			}
+
+			ice_set_tso_context(m, txq, prod, &ext);
+			prod++;
+			prod &= mask;
+			free--;
 		}
 
 		bus_dmamap_sync(sc->sc_dmat, map, 0,
@@ -14439,7 +14784,7 @@ ice_get_set_tx_topo(struct ice_hw *hw, uint8_t *buf, uint16_t buf_size,
 	if (set) {
 		ice_fill_dflt_direct_cmd_desc(&desc, ice_aqc_opc_set_tx_topo);
 		cmd->set_flags = ICE_AQC_TX_TOPO_FLAGS_ISSUED;
-		/* requested to update a new topology, not a default topolgy */
+		/* requested to update a new topology, not a default topology */
 		if (buf)
 			cmd->set_flags |= ICE_AQC_TX_TOPO_FLAGS_SRC_RAM |
 					  ICE_AQC_TX_TOPO_FLAGS_LOAD_NEW;
@@ -17607,9 +17952,10 @@ ice_print_nvm_version(struct ice_softc *sc)
 
 	ice_os_pkg_version_str(hw, os_pkg, sizeof(os_pkg));
 
-	printf("%s: %s%s%s, address %s\n", sc->sc_dev.dv_xname,
+	printf("%s: %s%s%s, %u queue%s, address %s\n", sc->sc_dev.dv_xname,
 	    ice_nvm_version_str(hw, buf, sizeof(buf)),
 	    os_pkg[0] ? " ddp " : "", os_pkg[0] ? os_pkg : "",
+	    sc->sc_nqueues, sc->sc_nqueues > 1 ? "s" : "",
 	    ether_sprintf(hw->port_info->mac.perm_addr));
 }
 
@@ -23465,7 +23811,7 @@ ice_add_dscp_tc_bw_tlv(struct ice_lldp_org_tlv *tlv,
 			   ICE_DSCP_SUBTYPE_TCBW);
 	tlv->ouisubtype = htonl(ouisubtype);
 
-	/* First Octect after subtype
+	/* First Octet after subtype
 	 * ----------------------------
 	 * | RSV | CBS | RSV | Max TCs |
 	 * | 1b  | 1b  | 3b  | 3b      |
@@ -27844,108 +28190,108 @@ ice_print_health_status_string(struct ice_softc *sc,
 
 	switch (status_code) {
 	case ICE_AQC_HEALTH_STATUS_INFO_RECOVERY:
-		printf("%s: The device is in firmware recovery mode.\n",
+		DPRINTF("%s: The device is in firmware recovery mode.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_FLASH_ACCESS:
-		printf("%s: The flash chip cannot be accessed.\n",
+		DPRINTF("%s: The flash chip cannot be accessed.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_NVM_AUTH:
-		printf("%s: NVM authentication failed.\n",
+		DPRINTF("%s: NVM authentication failed.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_OROM_AUTH:
-		printf("%s: Option ROM authentication failed.\n",
+		DPRINTF("%s: Option ROM authentication failed.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_DDP_AUTH:
-		printf("%s: DDP package failed.\n", sc->sc_dev.dv_xname);
+		DPRINTF("%s: DDP package failed.\n", sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_NVM_COMPAT:
-		printf("%s: NVM image is incompatible.\n", sc->sc_dev.dv_xname);
+		DPRINTF("%s: NVM image is incompatible.\n", sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_OROM_COMPAT:
-		printf("%s: Option ROM is incompatible.\n", sc->sc_dev.dv_xname);
+		DPRINTF("%s: Option ROM is incompatible.\n", sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_DCB_MIB:
-		printf("%s: Supplied MIB file is invalid. "
+		DPRINTF("%s: Supplied MIB file is invalid. "
 		    "DCB reverted to default configuration.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_UNKNOWN_MOD_STRICT:
-		printf("%s: An unsupported module was detected.\n",
+		DPRINTF("%s: An unsupported module was detected.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_MOD_TYPE:
-		printf("%s: Module type is not supported.\n",
+		DPRINTF("%s: Module type is not supported.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_MOD_QUAL:
-		printf("%s: Module is not qualified.\n", sc->sc_dev.dv_xname);
+		DPRINTF("%s: Module is not qualified.\n", sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_MOD_COMM:
-		printf("%s: Device cannot communicate with the module.\n",
+		DPRINTF("%s: Device cannot communicate with the module.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_MOD_CONFLICT:
-		printf("%s: Unresolved module conflict.\n",
+		DPRINTF("%s: Unresolved module conflict.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_MOD_NOT_PRESENT:
-		printf("%s: Module is not present.\n", sc->sc_dev.dv_xname);
+		DPRINTF("%s: Module is not present.\n", sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_INFO_MOD_UNDERUTILIZED:
-		printf("%s: Underutilized module.\n", sc->sc_dev.dv_xname);
+		DPRINTF("%s: Underutilized module.\n", sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_UNKNOWN_MOD_LENIENT:
-		printf("%s: An unsupported module was detected.\n",
+		DPRINTF("%s: An unsupported module was detected.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_INVALID_LINK_CFG:
-		printf("%s: Invalid link configuration.\n",
+		DPRINTF("%s: Invalid link configuration.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_PORT_ACCESS:
-		printf("%s: Port hardware access error.\n",
+		DPRINTF("%s: Port hardware access error.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_PORT_UNREACHABLE:
-		printf("%s: A port is unreachable.\n", sc->sc_dev.dv_xname);
+		DPRINTF("%s: A port is unreachable.\n", sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_INFO_PORT_SPEED_MOD_LIMITED:
-		printf("%s: Port speed is limited due to module.\n",
+		DPRINTF("%s: Port speed is limited due to module.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_PARALLEL_FAULT:
-		printf("%s: A parallel fault was detected.\n",
+		DPRINTF("%s: A parallel fault was detected.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_INFO_PORT_SPEED_PHY_LIMITED:
-		printf("%s: Port speed is limited by PHY capabilities.\n",
+		DPRINTF("%s: Port speed is limited by PHY capabilities.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_NETLIST_TOPO:
-		printf("%s: LOM topology netlist is corrupted.\n",
+		DPRINTF("%s: LOM topology netlist is corrupted.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_NETLIST:
-		printf("%s: Unrecoverable netlist error.\n",
+		DPRINTF("%s: Unrecoverable netlist error.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_TOPO_CONFLICT:
-		printf("%s: Port topology conflict.\n", sc->sc_dev.dv_xname);
+		DPRINTF("%s: Port topology conflict.\n", sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_LINK_HW_ACCESS:
-		printf("%s: Unrecoverable hardware access error.\n",
+		DPRINTF("%s: Unrecoverable hardware access error.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_LINK_RUNTIME:
-		printf("%s: Unrecoverable runtime error.\n",
+		DPRINTF("%s: Unrecoverable runtime error.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	case ICE_AQC_HEALTH_STATUS_ERR_DNL_INIT:
-		printf("%s: Link management engine failed to initialize.\n",
+		DPRINTF("%s: Link management engine failed to initialize.\n",
 		    sc->sc_dev.dv_xname);
 		break;
 	default:
@@ -28997,6 +29343,7 @@ ice_rxeof(struct ice_softc *sc, struct ice_rx_queue *rxq)
 	struct ice_rx_map *rxm;
 	bus_dmamap_t map;
 	unsigned int cons, prod;
+	struct mbuf_list mltcp = MBUF_LIST_INITIALIZER();
 	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct mbuf *m;
 	uint16_t status0, ptype;
@@ -29080,7 +29427,14 @@ ice_rxeof(struct ice_softc *sc, struct ice_rx_queue *rxq)
 				ICE_RX_FLEX_DESC_PTYPE_M;
 			ice_rx_checksum(m, status0, ptype);
 
-			ml_enqueue(&ml, m);
+#ifndef SMALL_KERNEL
+			if (ISSET(ifp->if_xflags, IFXF_LRO) &&
+			    (ptype == ICE_RX_FLEX_DECS_PTYPE_MAC_IPV4_TCP ||
+			     ptype == ICE_RX_FLEX_DECS_PTYPE_MAC_IPV6_TCP))
+				tcp_softlro_glue(&mltcp, m, ifp);
+			else
+#endif
+				ml_enqueue(&ml, m);
 
 			rxq->rxq_m_head = NULL;
 			rxq->rxq_m_tail = &rxq->rxq_m_head;
@@ -29093,8 +29447,15 @@ ice_rxeof(struct ice_softc *sc, struct ice_rx_queue *rxq)
 	} while (cons != prod);
 
 	if (done) {
+		int livelocked = 0;
+
 		rxq->rxq_cons = cons;
+		if (ifiq_input(ifiq, &mltcp))
+			livelocked = 1;
 		if (ifiq_input(ifiq, &ml))
+			livelocked = 1;
+
+		if (livelocked)
 			if_rxr_livelocked(&rxq->rxq_acct);
 		ice_rxfill(sc, rxq);
 	}
@@ -29112,7 +29473,7 @@ ice_txeof(struct ice_softc *sc, struct ice_tx_queue *txq)
 	struct ice_tx_desc *ring, *txd;
 	struct ice_tx_map *txm;
 	bus_dmamap_t map;
-	unsigned int cons, prod, last, free;
+	unsigned int cons, prod, last;
 	unsigned int mask;
 	uint64_t dtype;
 	int done = 0;
@@ -29122,11 +29483,6 @@ ice_txeof(struct ice_softc *sc, struct ice_tx_queue *txq)
 
 	if (cons == prod)
 		return (0);
-
-	free = cons;
-	if (free <= prod)
-		free += txq->desc_count;
-	free -= prod;
 
 	bus_dmamap_sync(sc->sc_dmat, ICE_DMA_MAP(&txq->tx_desc_mem),
 	    0, ICE_DMA_LEN(&txq->tx_desc_mem), BUS_DMASYNC_POSTREAD);
@@ -29139,12 +29495,15 @@ ice_txeof(struct ice_softc *sc, struct ice_tx_queue *txq)
 		last = txm->txm_eop;
 		txd = &ring[last];
 
-		dtype = htole64((txd->cmd_type_offset_bsz &
-		    ICE_TXD_QW1_DTYPE_M) >> ICE_TXD_QW1_DTYPE_S);
-		if (dtype != htole64(ICE_TX_DESC_DTYPE_DESC_DONE))
+		dtype = (htole64(txd->cmd_type_offset_bsz) &
+		    ICE_TXD_QW1_DTYPE_M) >> ICE_TXD_QW1_DTYPE_S;
+		if (dtype != ICE_TX_DESC_DTYPE_DESC_DONE)
 			break;
 
-		map = txm->txm_map;
+		if (ISSET(txm->txm_m->m_pkthdr.csum_flags, M_TCP_TSO))
+			map = txm->txm_map_tso;
+		else
+			map = txm->txm_map;
 
 		bus_dmamap_sync(sc->sc_dmat, map, 0, map->dm_mapsize,
 		    BUS_DMASYNC_POSTWRITE);
@@ -29167,17 +29526,8 @@ ice_txeof(struct ice_softc *sc, struct ice_tx_queue *txq)
 
 	//ixl_enable(sc, txr->txr_msix);
 
-	if (ifq_is_oactive(ifq))
+	if (done && ifq_is_oactive(ifq))
 		ifq_restart(ifq);
-	else if (free <= ICE_MIN_DESC_COUNT + 1) {
-		/* XXX sometimes ring was OACTIVE but is_oactive() is false */
-		free = cons;
-		if (free <= prod)
-			free += txq->desc_count;
-		free -= prod;
-		if (free > ICE_MIN_DESC_COUNT + 1)
-			ifq_restart(ifq);
-	}
 
 	return (done);
 }
@@ -29276,6 +29626,11 @@ ice_free_tx_queues(struct ice_softc *sc)
 				bus_dmamap_destroy(sc->sc_dmat, map->txm_map);
 				map->txm_map = NULL;
 			}
+			if (map->txm_map_tso != NULL) {
+				bus_dmamap_destroy(sc->sc_dmat,
+				    map->txm_map_tso);
+				map->txm_map_tso = NULL;
+			}
 		}
 		free(txq->tx_map, M_DEVBUF, txq->desc_count * sizeof(*map));
 		txq->tx_map = NULL;
@@ -29345,11 +29700,21 @@ ice_tx_queues_alloc(struct ice_softc *sc)
 
 		for (j = 0; j < sc->isc_ntxd[i]; j++) {
 			map = &txq->tx_map[j];
-			if (bus_dmamap_create(sc->sc_dmat, ICE_MAX_FRAME_SIZE,
-			    ICE_MAX_TX_SEGS, ICE_MAX_FRAME_SIZE, 0,
+			if (bus_dmamap_create(sc->sc_dmat, MAXMCLBYTES,
+			    ICE_MAX_TX_SEGS, ICE_MAX_DMA_SEG_SIZE, 0,
 			    BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW | BUS_DMA_64BIT,
 			    &map->txm_map) != 0) {
 				printf("%s: could not allocate Tx DMA map\n",
+				    sc->sc_dev.dv_xname);
+				err = ENOMEM;
+				goto free_tx_queues;
+			}
+
+			if (bus_dmamap_create(sc->sc_dmat, MAXMCLBYTES,
+			    ICE_MAX_TSO_SEGS, ICE_MAX_DMA_SEG_SIZE, 0,
+			    BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW | BUS_DMA_64BIT,
+			    &map->txm_map_tso) != 0) {
+				printf("%s: could not allocate TSO DMA map\n",
 				    sc->sc_dev.dv_xname);
 				err = ENOMEM;
 				goto free_tx_queues;
@@ -29451,6 +29816,35 @@ ice_rxrefill(void *arg)
 	struct ice_softc *sc = rxq->vsi->sc;
 
 	ice_rxfill(sc, rxq);
+}
+
+static int
+ice_rxrinfo(struct ice_softc *sc, struct if_rxrinfo *ifri)
+{
+	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	struct if_rxring_info *ifr;
+	struct ice_rx_queue *rxq;
+	int i, rv;
+
+	if (!ISSET(ifp->if_flags, IFF_RUNNING))
+		return (ENOTTY);
+
+	ifr = mallocarray(sizeof(*ifr), sc->sc_nqueues, M_TEMP,
+	    M_WAITOK|M_CANFAIL|M_ZERO);
+	if (ifr == NULL)
+		return (ENOMEM);
+
+	for (i = 0; i < sc->sc_nqueues; i++) {
+		rxq = ifp->if_iqs[i]->ifiq_softc;
+		ifr[i].ifr_size = MCLBYTES + ETHER_ALIGN;
+		snprintf(ifr[i].ifr_name, sizeof(ifr[i].ifr_name), "%d", i);
+		ifr[i].ifr_info = rxq->rxq_acct;
+	}
+
+	rv = if_rxr_info_ioctl(ifri, sc->sc_nqueues, ifr);
+	free(ifr, M_TEMP, sc->sc_nqueues * sizeof(*ifr));
+
+	return (rv);
 }
 
 /* ice_rx_queues_alloc - Allocate Rx queue memory */
@@ -30131,8 +30525,6 @@ ice_attach_hook(struct device *self)
 		goto deinit_hw;
 	}
 
-	ice_print_nvm_version(sc);
-
 	ice_setup_scctx(sc);
 	if (ice_is_bit_set(sc->feat_en, ICE_FEATURE_SAFE_MODE))
 		ice_set_safe_mode_caps(hw);
@@ -30150,9 +30542,10 @@ ice_attach_hook(struct device *self)
 		goto deinit_hw;
 	}
 	sc->sc_nmsix = nmsix;
-	nqueues_max = MIN(sc->isc_nrxqsets_max, sc->isc_ntxqsets_max);
+	nqueues_max = MIN(MIN(sc->isc_nrxqsets_max, sc->isc_ntxqsets_max),
+	    ICE_MAX_VECTORS);
 	sc->sc_intrmap = intrmap_create(&sc->sc_dev, sc->sc_nmsix - 1,
-	    nqueues_max, INTRMAP_POWEROF2);
+	    MIN(nqueues_max, IF_MAX_VECTORS), INTRMAP_POWEROF2);
 	nqueues = intrmap_count(sc->sc_intrmap);
 	KASSERT(nqueues > 0);
 	KASSERT(powerof2(nqueues));
@@ -30160,6 +30553,8 @@ ice_attach_hook(struct device *self)
 	DPRINTF("%s: %d MSIx vector%s available, using %d queue%s\n", __func__,
 	    sc->sc_nmsix, sc->sc_nmsix > 1 ? "s" : "",
 	    sc->sc_nqueues, sc->sc_nqueues > 1 ? "s" : "");
+
+	ice_print_nvm_version(sc);
 
 	/* Initialize the Tx queue manager */
 	err = ice_resmgr_init(&sc->tx_qmgr, sc->sc_nqueues);
@@ -30276,7 +30671,10 @@ ice_attach_hook(struct device *self)
 #endif
 	ifp->if_capabilities |= IFCAP_CSUM_IPv4 |
 	    IFCAP_CSUM_TCPv4 | IFCAP_CSUM_UDPv4 |
-	    IFCAP_CSUM_TCPv6 | IFCAP_CSUM_UDPv6;
+	    IFCAP_CSUM_TCPv6 | IFCAP_CSUM_UDPv6 |
+	    IFCAP_TSOv4 | IFCAP_TSOv6;
+	ifp->if_capabilities |= IFCAP_LRO;
+	ifp->if_xflags |= IFXF_LRO;
 
 	if_attach(ifp);
 	ether_ifattach(ifp);

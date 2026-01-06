@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_exec.c,v 1.264 2025/05/31 12:40:33 dlg Exp $	*/
+/*	$OpenBSD: kern_exec.c,v 1.268 2025/09/16 12:15:06 kettenis Exp $	*/
 /*	$NetBSD: kern_exec.c,v 1.75 1996/02/09 18:59:28 christos Exp $	*/
 
 /*-
@@ -531,7 +531,7 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	}
 
 	stopprofclock(pr);	/* stop profiling */
-	fdcloseexec(p);		/* handle close on exec */
+	fdprepforexec(p);	/* handle close on exec and close on fork */
 	execsigs(p);		/* reset caught signals */
 	TCB_SET(p, NULL);	/* reset the TCB address */
 	pr->ps_kbind_addr = 0;	/* reset the kbind bits */
@@ -550,15 +550,13 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	if (otvp)
 		vrele(otvp);
 
+	p->p_p->ps_iflags &= ~(PSI_NOBTCFI | PSI_PROFILE | PSI_WXNEEDED);
 	if (pack.ep_flags & EXEC_NOBTCFI)
-		atomic_setbits_int(&p->p_p->ps_flags, PS_NOBTCFI);
-	else
-		atomic_clearbits_int(&p->p_p->ps_flags, PS_NOBTCFI);
-
+		p->p_p->ps_iflags |= PSI_NOBTCFI;
 	if (pack.ep_flags & EXEC_PROFILE)
-		atomic_setbits_int(&p->p_p->ps_flags, PS_PROFILE);
-	else
-		atomic_clearbits_int(&p->p_p->ps_flags, PS_PROFILE);
+		p->p_p->ps_iflags |= PSI_PROFILE;
+	if (pack.ep_flags & EXEC_WXNEEDED)
+		p->p_p->ps_iflags |= PSI_WXNEEDED;
 
 	atomic_setbits_int(&pr->ps_flags, PS_EXEC);
 	if (pr->ps_flags & PS_PPWAIT) {
@@ -753,11 +751,6 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	if ((pack.ep_flags & EXEC_HASFD) && pack.ep_fd < 255)
 		p->p_descfd = pack.ep_fd;
 
-	if (pack.ep_flags & EXEC_WXNEEDED)
-		atomic_setbits_int(&p->p_p->ps_flags, PS_WXNEEDED);
-	else
-		atomic_clearbits_int(&p->p_p->ps_flags, PS_WXNEEDED);
-
 	atomic_clearbits_int(&pr->ps_flags, PS_INEXEC);
 	single_thread_clear(p);
 
@@ -867,29 +860,27 @@ exec_sigcode_map(struct process *pr)
 	/*
 	 * If we don't have a sigobject yet, create one.
 	 *
-	 * sigobject is an anonymous memory object (just like SYSV shared
-	 * memory) that we keep a permanent reference to and that we map
-	 * in all processes that need this sigcode. The creation is simple,
-	 * we create an object, add a permanent reference to it, map it in
-	 * kernel space, copy out the sigcode to it and unmap it.  Then we map
-	 * it with PROT_EXEC into the process just the way sys_mmap would map it.
+	 * sigobject is an anonymous memory object (just like SYSV
+	 * shared memory) that we keep a permanent reference to and
+	 * that we map in all processes that need this sigcode. The
+	 * creation is simple, we create an object, map it in kernel
+	 * space, copy out the sigcode to it and map it PROT_READ such
+	 * that the coredump code can write it out into core dumps.
+	 * Then we map it with PROT_EXEC into the process just the way
+	 * sys_mmap would map it.
 	 */
 	if (sigobject == NULL) {
 		extern int sigfillsiz;
 		extern u_char sigfill[];
 		size_t off, left;
 		vaddr_t va;
-		int r;
 
-		sigobject = uao_create(sz, 0);
-		uao_reference(sigobject);	/* permanent reference */
+		sigobject = uao_create(sz, 0);	/* permanent reference */
 
-		if ((r = uvm_map(kernel_map, &va, round_page(sz), sigobject,
-		    0, 0, UVM_MAPFLAG(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE,
-		    MAP_INHERIT_SHARE, MADV_RANDOM, 0)))) {
-			uao_detach(sigobject);
-			return (ENOMEM);
-		}
+		if (uvm_map(kernel_map, &va, round_page(sz), sigobject, 0, 0,
+		    UVM_MAPFLAG(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE,
+		    MAP_INHERIT_SHARE, MADV_RANDOM, 0)))
+			panic("can't map sigobject");
 
 		for (off = 0, left = round_page(sz); left != 0;
 		    off += sigfillsiz) {
@@ -899,8 +890,10 @@ exec_sigcode_map(struct process *pr)
 		}
 		memcpy((caddr_t)va, sigcode, sz);
 
-		(void) uvm_map_protect(kernel_map, va, round_page(sz),
-		    PROT_READ, 0, FALSE, FALSE);
+		if (uvm_map_protect(kernel_map, va, round_page(va + sz),
+		    PROT_READ, 0, FALSE, FALSE))
+			panic("can't write-protect sigobject");
+
 		sigcode_va = va;
 		sigcode_sz = round_page(sz);
 	}

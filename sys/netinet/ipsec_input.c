@@ -1,4 +1,4 @@
-/*	$OpenBSD: ipsec_input.c,v 1.216 2025/05/22 03:12:33 bluhm Exp $	*/
+/*	$OpenBSD: ipsec_input.c,v 1.222 2025/12/11 05:06:02 dlg Exp $	*/
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr) and
@@ -44,14 +44,11 @@
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
-#include <sys/kernel.h>
 #include <sys/timeout.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/netisr.h>
 #include <net/bpf.h>
-#include <net/route.h>
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -69,7 +66,6 @@
 #endif
 
 #ifdef INET6
-#include <netinet6/in6_var.h>
 #include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
 #endif /* INET6 */
@@ -80,9 +76,6 @@
 #include <netinet/ip_ipcomp.h>
 
 #include <net/if_enc.h>
-
-#include <crypto/cryptodev.h>
-#include <crypto/xform.h>
 
 #include "bpfilter.h"
 
@@ -118,7 +111,7 @@ int ipsec_soft_first_use = IPSEC_DEFAULT_SOFT_FIRST_USE;	/* [a] */
 int ipsec_exp_first_use = IPSEC_DEFAULT_EXP_FIRST_USE;		/* [a] */
 int ipsec_expire_acquire = IPSEC_DEFAULT_EXPIRE_ACQUIRE;	/* [a] */
 
-int esp_enable = 1;
+int esp_enable = 1;		/* [a] */
 int ah_enable = 1;		/* [a] */
 int ipcomp_enable = 0;		/* [a] */
 
@@ -127,6 +120,7 @@ const struct sysctl_bounded_args espctl_vars[] = {
 	{ESPCTL_UDPENCAP_ENABLE, &udpencap_enable, 0, 1},
 	{ESPCTL_UDPENCAP_PORT, &udpencap_port, 0, 65535},
 };
+
 const struct sysctl_bounded_args ahctl_vars[] = {
 	{AHCTL_ENABLE, &ah_enable, 0, 1},
 };
@@ -570,11 +564,11 @@ ipsec_common_input_cb(struct mbuf **mp, struct tdb *tdbp, int skip,
 			m->m_pkthdr.ph_ifidx = encif->if_index;
 		}
 		if (encif->if_bpf) {
-			struct enchdr hdr;
-
-			hdr.af = af;
-			hdr.spi = tdbp->tdb_spi;
-			hdr.flags = m->m_flags & (M_AUTH|M_CONF);
+			struct enchdr hdr = {
+				.af = htonl(af),
+				.spi = tdbp->tdb_spi,
+				.flags = htonl(m->m_flags & (M_AUTH|M_CONF)),
+			};
 
 			bpf_mtap_hdr(encif->if_bpf, (char *)&hdr,
 			    ENC_HDRLEN, m, BPF_DIRECTION_IN);
@@ -715,8 +709,6 @@ int
 esp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen)
 {
-	int error;
-
 	/* All sysctl names at this level are terminal. */
 	if (namelen != 1)
 		return (ENOTDIR);
@@ -725,11 +717,8 @@ esp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	case ESPCTL_STATS:
 		return (esp_sysctl_espstat(oldp, oldlenp, newp));
 	default:
-		NET_LOCK();
-		error = sysctl_bounded_arr(espctl_vars, nitems(espctl_vars),
-		    name, namelen, oldp, oldlenp, newp, newlen);
-		NET_UNLOCK();
-		return (error);
+		return (sysctl_bounded_arr(espctl_vars, nitems(espctl_vars),
+		    name, namelen, oldp, oldlenp, newp, newlen));
 	}
 }
 
@@ -876,7 +865,7 @@ esp46_input(struct mbuf **mp, int *offp, int proto, int af,
 #if NPF > 0
 	    ((*mp)->m_pkthdr.pf.flags & PF_TAG_DIVERTED) ||
 #endif
-	    !esp_enable)
+	    !atomic_load_int(&esp_enable))
 		return ipsec_input_disabled(mp, offp, proto, af, ns);
 
 	protoff = ipsec_protoff(*mp, *offp, af);
@@ -932,7 +921,8 @@ ipsec_set_mtu(struct tdb *tdbp, u_int32_t mtu)
 
 		/* Store adjusted MTU in tdb */
 		tdbp->tdb_mtu = mtu;
-		tdbp->tdb_mtutimeout = gettime() + ip_mtudisc_timeout;
+		tdbp->tdb_mtutimeout = gettime() +
+		    atomic_load_int(&ip_mtudisc_timeout);
 		DPRINTF("spi %08x mtu %d adjust %ld",
 		    ntohl(tdbp->tdb_spi), tdbp->tdb_mtu, adjust);
 	}
@@ -944,7 +934,8 @@ ipsec_common_ctlinput(u_int rdomain, int cmd, struct sockaddr *sa,
 {
 	struct ip *ip = v;
 
-	if (cmd == PRC_MSGSIZE && ip && ip_mtudisc && ip->ip_v == 4) {
+	if (cmd == PRC_MSGSIZE && ip && atomic_load_int(&ip_mtudisc) &&
+	    ip->ip_v == 4) {
 		struct tdb *tdbp;
 		struct sockaddr_in dst;
 		struct icmp *icp;

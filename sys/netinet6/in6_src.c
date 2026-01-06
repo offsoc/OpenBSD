@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6_src.c,v 1.101 2025/05/20 05:51:43 bluhm Exp $	*/
+/*	$OpenBSD: in6_src.c,v 1.104 2025/07/18 08:39:14 mvs Exp $	*/
 /*	$KAME: in6_src.c,v 1.36 2001/02/06 04:08:17 itojun Exp $	*/
 
 /*
@@ -63,12 +63,8 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
-#include <sys/ioctl.h>
 #include <sys/errno.h>
-#include <sys/time.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -78,9 +74,7 @@
 #include <netinet/ip.h>
 #include <netinet/in_pcb.h>
 #include <netinet6/in6_var.h>
-#include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
-#include <netinet6/nd6.h>
 
 int in6_selectif(const struct in6_addr *, struct ip6_pktopts *,
     struct ip6_moptions *, struct route *, struct ifnet **, u_int);
@@ -204,8 +198,7 @@ in6_pcbselsrc(const struct in6_addr **in6src,
 	 * - preferred source address is set
 	 * - output interface is UP
 	 */
-	if (rt != NULL && !(rt->rt_flags & RTF_LLINFO) &&
-	    !(rt->rt_flags & RTF_HOST)) {
+	if (rt != NULL && ISSET(rt->rt_flags, RTF_GATEWAY)) {
 		ip6_source = rtable_getsource(rtableid, AF_INET6);
 		if (ip6_source != NULL) {
 			struct ifaddr *ifa;
@@ -384,7 +377,7 @@ in6_selecthlim(const struct inpcb *inp)
 	if (inp && inp->inp_hops >= 0)
 		return (inp->inp_hops);
 
-	return (ip6_defhlim);
+	return (atomic_load_int(&ip6_defhlim));
 }
 
 /*

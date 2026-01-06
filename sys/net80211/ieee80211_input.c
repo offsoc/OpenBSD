@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_input.c,v 1.255 2025/03/22 07:24:08 kevlo Exp $	*/
+/*	$OpenBSD: ieee80211_input.c,v 1.257 2025/12/01 16:03:55 stsp Exp $	*/
 /*	$NetBSD: ieee80211_input.c,v 1.24 2004/05/31 11:12:24 dyoung Exp $	*/
 
 /*-
@@ -637,26 +637,39 @@ ieee80211_inputm(struct ifnet *ifp, struct mbuf *m, struct ieee80211_node *ni,
 		}
 
 		if (ni->ni_flags & IEEE80211_NODE_RXMGMTPROT) {
+			int is_multicast, is_protected;
+
+			is_multicast = IEEE80211_IS_MULTICAST(wh->i_addr1);
+			is_protected = (wh->i_fc[1] & IEEE80211_FC1_PROTECTED);
+
 			/* MMPDU protection is on for Rx */
 			if (subtype == IEEE80211_FC0_SUBTYPE_DISASSOC ||
 			    subtype == IEEE80211_FC0_SUBTYPE_DEAUTH ||
 			    subtype == IEEE80211_FC0_SUBTYPE_ACTION) {
-				if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
-				    !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
+				if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
+					m = ieee80211_input_hwdecrypt(ic, ni,
+					    m, rxi);
+					if (m == NULL)
+						goto out;
+				} else if (!is_multicast && !is_protected) {
 					/* unicast mgmt not encrypted */
+					ic->ic_stats.is_rx_unencrypted++;
 					goto out;
-				}
-				/* do software decryption */
-				m = ieee80211_decrypt(ic, m, ni);
-				if (m == NULL) {
-					/* XXX stats */
-					goto out;
+				} else {
+					/* do software decryption */
+					m = ieee80211_decrypt(ic, m, ni);
+					if (m == NULL) {
+						ic->ic_stats.is_rx_wepfail++;
+						goto out;
+					}
 				}
 				wh = mtod(m, struct ieee80211_frame *);
 			}
 		} else if ((ic->ic_flags & IEEE80211_F_RSNON) &&
-		    (wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
+		    ((wh->i_fc[1] & IEEE80211_FC1_PROTECTED) ||
+		    (rxi->rxi_flags & IEEE80211_RXI_HWDEC))) {
 			/* encrypted but MMPDU Rx protection off for TA */
+			ic->ic_stats.is_rx_nowep++;
 			goto out;
 		}
 
@@ -2671,7 +2684,7 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 	else if (ni->ni_flags & IEEE80211_NODE_HT)
 		ieee80211_setmode(ic, IEEE80211_MODE_11N);
 	else
-		ieee80211_setmode(ic, ieee80211_chan2mode(ic, ni->ni_chan));
+		ieee80211_setmode(ic, ieee80211_node_abg_mode(ic, ni));
 	/*
 	 * Reset the erp state (mostly the slot time) now that
 	 * our operating mode has been nailed down.

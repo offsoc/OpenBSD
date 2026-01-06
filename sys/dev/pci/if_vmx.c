@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_vmx.c,v 1.92 2025/03/05 06:51:25 dlg Exp $	*/
+/*	$OpenBSD: if_vmx.c,v 1.94 2025/11/11 17:43:18 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2013 Tsubai Masanari
@@ -317,7 +317,8 @@ vmxnet3_attach(struct device *parent, struct device *self, void *aux)
 
 				isr = vmxnet3_intr_event;
 				sc->sc_intrmap = intrmap_create(&sc->sc_dev,
-				    msix, VMX_MAX_QUEUES, INTRMAP_POWEROF2);
+				    msix, MIN(VMX_MAX_QUEUES, IF_MAX_VECTORS),
+				    INTRMAP_POWEROF2);
 				sc->sc_nqueues = intrmap_count(sc->sc_intrmap);
 			}
 			break;
@@ -1050,6 +1051,7 @@ vmxnet3_txintr(struct vmxnet3_softc *sc, struct vmxnet3_txqueue *tq)
 	struct mbuf *m;
 	u_int prod, cons, next;
 	uint32_t rgen;
+	unsigned int done = 0;
 
 	prod = ring->prod;
 	cons = ring->cons;
@@ -1085,6 +1087,7 @@ vmxnet3_txintr(struct vmxnet3_softc *sc, struct vmxnet3_txqueue *tq)
 		cons = (letoh32(txcd->txc_word0) >> VMXNET3_TXC_EOPIDX_S) &
 		    VMXNET3_TXC_EOPIDX_M;
 		cons++;
+		done = 1;
 		cons %= NTXDESC;
 	} while (cons != prod);
 
@@ -1095,7 +1098,7 @@ vmxnet3_txintr(struct vmxnet3_softc *sc, struct vmxnet3_txqueue *tq)
 	comp_ring->gen = rgen;
 	ring->cons = cons;
 
-	if (ifq_is_oactive(ifq))
+	if (done && ifq_is_oactive(ifq))
 		ifq_restart(ifq);
 }
 

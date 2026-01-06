@@ -1,4 +1,4 @@
-/* $OpenBSD: a_bitstr.c,v 1.44 2025/05/10 05:54:38 tb Exp $ */
+/* $OpenBSD: a_bitstr.c,v 1.48 2026/01/04 09:54:23 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -182,18 +182,9 @@ i2c_ASN1_BIT_STRING(ASN1_BIT_STRING *a, unsigned char **pp)
 	unsigned char *p, *d;
 
 	if (a == NULL)
-		return (0);
-
-	if (a->length == INT_MAX)
-		return (0);
-
-	ret = a->length + 1;
-
-	if (pp == NULL)
-		return (ret);
+		return 0;
 
 	len = a->length;
-
 	if (len > 0) {
 		if (a->flags & ASN1_STRING_FLAG_BITS_LEFT) {
 			bits = (int)a->flags & 0x07;
@@ -222,12 +213,20 @@ i2c_ASN1_BIT_STRING(ASN1_BIT_STRING *a, unsigned char **pp)
 			else if (j & 0x80)
 				bits = 7;
 			else
-				bits = 0; /* should not happen */
+				bits = 0;
 		}
 	} else
 		bits = 0;
 
-	p= *pp;
+	if (len > INT_MAX - 1)
+		return 0;
+
+	ret = len + 1;
+
+	if (pp == NULL)
+		return ret;
+
+	p = *pp;
 
 	*(p++) = (unsigned char)bits;
 	d = a->data;
@@ -237,7 +236,7 @@ i2c_ASN1_BIT_STRING(ASN1_BIT_STRING *a, unsigned char **pp)
 		p[-1] &= 0xff << bits;
 	}
 	*pp = p;
-	return (ret);
+	return ret;
 }
 
 int

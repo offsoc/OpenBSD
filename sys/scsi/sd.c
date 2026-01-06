@@ -1,4 +1,4 @@
-/*	$OpenBSD: sd.c,v 1.337 2024/09/04 07:54:53 mglocker Exp $	*/
+/*	$OpenBSD: sd.c,v 1.341 2025/11/17 14:27:43 jsg Exp $	*/
 /*	$NetBSD: sd.c,v 1.111 1997/04/02 02:29:41 mycroft Exp $	*/
 
 /*-
@@ -116,7 +116,7 @@ const struct cfattach sd_ca = {
 };
 
 struct cfdriver sd_cd = {
-	NULL, "sd", DV_DISK
+	NULL, "sd", DV_DISK, CD_COCOVM
 };
 
 const struct scsi_inquiry_pattern sd_patterns[] = {
@@ -892,6 +892,12 @@ sdioctl(dev_t dev, u_long cmd, caddr_t addr, int flag, struct proc *p)
 		*(struct disklabel *)addr = *(sc->sc_dk.dk_label);
 		goto exit;
 
+	/* XXX temporary to support the transition to more partitions */
+	case O_DIOCGDINFO:
+		/* truncate the buffer, good enough */
+		bcopy(sc->sc_dk.dk_label, addr, O_disklabel);
+		goto exit;
+
 	case DIOCGPART:
 		((struct partinfo *)addr)->disklab = sc->sc_dk.dk_label;
 		((struct partinfo *)addr)->part =
@@ -1221,7 +1227,8 @@ sdsize(dev_t dev)
 	struct disklabel		*lp;
 	struct sd_softc			*sc;
 	daddr_t				 size;
-	int				 part, omask;
+	int				 part;
+	uint64_t			 omask;
 
 	sc = sdlookup(DISKUNIT(dev));
 	if (sc == NULL)
@@ -1232,7 +1239,7 @@ sdsize(dev_t dev)
 	}
 
 	part = DISKPART(dev);
-	omask = sc->sc_dk.dk_openmask & (1 << part);
+	omask = sc->sc_dk.dk_openmask & (1ULL << part);
 
 	if (omask == 0 && sdopen(dev, 0, S_IFBLK, NULL) != 0) {
 		size = -1;

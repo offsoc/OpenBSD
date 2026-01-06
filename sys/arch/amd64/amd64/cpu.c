@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.195 2024/11/07 17:24:42 bluhm Exp $	*/
+/*	$OpenBSD: cpu.c,v 1.203 2025/12/30 10:59:08 jsg Exp $	*/
 /* $NetBSD: cpu.c,v 1.1 2003/04/26 18:39:26 fvdl Exp $ */
 
 /*-
@@ -69,6 +69,7 @@
 #include "vmm.h"
 #include "pctr.h"
 #include "pvbus.h"
+#include "xcall.h"
 
 #include <sys/param.h>
 #include <sys/proc.h>
@@ -445,7 +446,7 @@ const struct cfattach cpu_ca = {
 };
 
 struct cfdriver cpu_cd = {
-	NULL, "cpu", DV_DULL
+	NULL, "cpu", DV_DULL, CD_COCOVM
 };
 
 /*
@@ -453,7 +454,10 @@ struct cfdriver cpu_cd = {
  * CPU, on uniprocessors).  The CPU info list is initialized to
  * point at it.
  */
-struct cpu_info_full cpu_info_full_primary = { .cif_cpu = { .ci_self = &cpu_info_primary } };
+struct cpu_info_full cpu_info_full_primary = { .cif_cpu = {
+	.ci_self = &cpu_info_primary,
+	.ci_flags = CPUF_PRIMARY,
+} };
 
 struct cpu_info *cpu_info_list = &cpu_info_primary;
 
@@ -479,6 +483,11 @@ cpu_match(struct device *parent, void *match, void *aux)
 		return 0;
 
 	if (cf->cf_unit >= MAXCPUS)
+		return 0;
+
+	/* XXX We don't support MP with SEV-ES, yet */
+	if (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED) &&
+	    cf->cf_unit >= 1)
 		return 0;
 
 	return 1;
@@ -634,6 +643,10 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 #endif
 
 #if defined(MULTIPROCESSOR)
+#if NXCALL > 0
+	cpu_xcall_establish(ci);
+#endif
+
 	/*
 	 * Allocate UPAGES contiguous pages for the idle PCB and stack.
 	 */
@@ -853,12 +866,6 @@ cpu_init(struct cpu_info *ci)
 	} else {
 		fpureset();
 	}
-
-#if NVMM > 0
-	/* Re-enable VMM if needed */
-	if (ci->ci_flags & CPUF_VMM)
-		start_vmm_on_cpu(ci);
-#endif /* NVMM > 0 */
 
 #ifdef MULTIPROCESSOR
 	atomic_setbits_int(&ci->ci_flags, CPUF_RUNNING);
@@ -1211,7 +1218,7 @@ mp_cpu_start_cleanup(struct cpu_info *ci)
 #endif	/* MULTIPROCESSOR */
 
 typedef void (vector)(void);
-extern vector Xsyscall_meltdown, Xsyscall, Xsyscall32;
+extern vector Xsyscall_meltdown, Xsyscall;
 
 void
 cpu_init_msrs(struct cpu_info *ci)
@@ -1471,47 +1478,6 @@ wbinvd_on_all_cpus(void)
 	x86_broadcast_ipi(X86_IPI_WBINVD);
 	wbinvd();
 	return 0;
-}
-
-volatile long wbinvd_wait __attribute__((section(".kudata")));
-
-void
-wbinvd_on_all_cpus_acked(void)
-{
-	struct cpu_info *ci, *self = curcpu();;
-	CPU_INFO_ITERATOR cii;
-	long wait = 0;
-	u_int64_t mask = 0;
-	int s;
-
-	CPU_INFO_FOREACH(cii, ci) {
-		if (ci == self)
-			continue;
-		mask |= (1ULL << ci->ci_cpuid);
-		wait++;
-	}
-
-	KASSERT(wait > 0);
-
-	s = splvm();
-	while (atomic_cas_ulong(&wbinvd_wait, 0 , wait) != 0) {
-		while (wbinvd_wait != 0) {
-			CPU_BUSY_CYCLE();
-		}
-	}
-
-	CPU_INFO_FOREACH(cii, ci) {
-		if ((mask & (1ULL << ci->ci_cpuid)) == 0)
-			continue;
-		if (x86_fast_ipi(ci, LAPIC_IPI_WBINVD) != 0)
-			panic("%s: ipi failed", __func__);
-	}
-	splx(s);
-
-	wbinvd();
-
-	while (wbinvd_wait != 0)
-		CPU_BUSY_CYCLE();
 }
 #endif /* MULTIPROCESSOR */
 

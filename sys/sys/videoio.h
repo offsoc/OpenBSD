@@ -1,4 +1,4 @@
-/*	$OpenBSD: videoio.h,v 1.23 2025/05/30 21:40:26 kirill Exp $	*/
+/*	$OpenBSD: videoio.h,v 1.28 2025/12/04 22:57:47 kirill Exp $	*/
 
 /*
  *  Video for Linux Two header file
@@ -54,7 +54,7 @@
  *
  *	Author: Bill Dirks <bill@thedirks.org>
  *		Justin Schoeman
- *              Hans Verkuil <hverkuil@xs4all.nl>
+ *              Hans Verkuil <hverkuil@kernel.org>
  *		et al.
  */
 
@@ -336,6 +336,18 @@ enum v4l2_colorfx {
  * We reserve 64 controls for this driver.
  */
 #define V4L2_CID_USER_UVC_BASE			(V4L2_CID_USER_BASE + 0x11e0)
+
+/*
+ * The base for Rockchip ISP1 driver controls.
+ * We reserve 16 controls for this driver.
+ */
+#define V4L2_CID_USER_RKISP1_BASE		(V4L2_CID_USER_BASE + 0x1220)
+
+/*
+ * The base for the Arm Mali-C55 ISP driver controls.
+ * We reserve 16 controls for this driver
+ */
+#define V4L2_CID_USER_MALI_C55_BASE		(V4L2_CID_USER_BASE + 0x1230)
 
 /* MPEG-class control IDs */
 /* The MPEG controls are applicable to all codec controls
@@ -1300,7 +1312,7 @@ enum v4l2_flash_strobe_source {
 #define V4L2_CID_JPEG_CLASS_BASE		(V4L2_CTRL_CLASS_JPEG | 0x900)
 #define V4L2_CID_JPEG_CLASS			(V4L2_CTRL_CLASS_JPEG | 1)
 
-#define	V4L2_CID_JPEG_CHROMA_SUBSAMPLING	(V4L2_CID_JPEG_CLASS_BASE + 1)
+#define V4L2_CID_JPEG_CHROMA_SUBSAMPLING	(V4L2_CID_JPEG_CLASS_BASE + 1)
 enum v4l2_jpeg_chroma_subsampling {
 	V4L2_JPEG_CHROMA_SUBSAMPLING_444	= 0,
 	V4L2_JPEG_CHROMA_SUBSAMPLING_422	= 1,
@@ -1309,15 +1321,15 @@ enum v4l2_jpeg_chroma_subsampling {
 	V4L2_JPEG_CHROMA_SUBSAMPLING_410	= 4,
 	V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY	= 5,
 };
-#define	V4L2_CID_JPEG_RESTART_INTERVAL		(V4L2_CID_JPEG_CLASS_BASE + 2)
-#define	V4L2_CID_JPEG_COMPRESSION_QUALITY	(V4L2_CID_JPEG_CLASS_BASE + 3)
+#define V4L2_CID_JPEG_RESTART_INTERVAL		(V4L2_CID_JPEG_CLASS_BASE + 2)
+#define V4L2_CID_JPEG_COMPRESSION_QUALITY	(V4L2_CID_JPEG_CLASS_BASE + 3)
 
-#define	V4L2_CID_JPEG_ACTIVE_MARKER		(V4L2_CID_JPEG_CLASS_BASE + 4)
-#define	V4L2_JPEG_ACTIVE_MARKER_APP0		(1 << 0)
-#define	V4L2_JPEG_ACTIVE_MARKER_APP1		(1 << 1)
-#define	V4L2_JPEG_ACTIVE_MARKER_COM		(1 << 16)
-#define	V4L2_JPEG_ACTIVE_MARKER_DQT		(1 << 17)
-#define	V4L2_JPEG_ACTIVE_MARKER_DHT		(1 << 18)
+#define V4L2_CID_JPEG_ACTIVE_MARKER		(V4L2_CID_JPEG_CLASS_BASE + 4)
+#define V4L2_JPEG_ACTIVE_MARKER_APP0		(1 << 0)
+#define V4L2_JPEG_ACTIVE_MARKER_APP1		(1 << 1)
+#define V4L2_JPEG_ACTIVE_MARKER_COM		(1 << 16)
+#define V4L2_JPEG_ACTIVE_MARKER_DQT		(1 << 17)
+#define V4L2_JPEG_ACTIVE_MARKER_DHT		(1 << 18)
 
 
 /* Image source controls */
@@ -1350,10 +1362,10 @@ enum v4l2_jpeg_chroma_subsampling {
 #define V4L2_CID_DV_CLASS_BASE			(V4L2_CTRL_CLASS_DV | 0x900)
 #define V4L2_CID_DV_CLASS			(V4L2_CTRL_CLASS_DV | 1)
 
-#define	V4L2_CID_DV_TX_HOTPLUG			(V4L2_CID_DV_CLASS_BASE + 1)
-#define	V4L2_CID_DV_TX_RXSENSE			(V4L2_CID_DV_CLASS_BASE + 2)
-#define	V4L2_CID_DV_TX_EDID_PRESENT		(V4L2_CID_DV_CLASS_BASE + 3)
-#define	V4L2_CID_DV_TX_MODE			(V4L2_CID_DV_CLASS_BASE + 4)
+#define V4L2_CID_DV_TX_HOTPLUG			(V4L2_CID_DV_CLASS_BASE + 1)
+#define V4L2_CID_DV_TX_RXSENSE			(V4L2_CID_DV_CLASS_BASE + 2)
+#define V4L2_CID_DV_TX_EDID_PRESENT		(V4L2_CID_DV_CLASS_BASE + 3)
+#define V4L2_CID_DV_TX_MODE			(V4L2_CID_DV_CLASS_BASE + 4)
 enum v4l2_dv_tx_mode {
 	V4L2_DV_TX_MODE_DVI_D	= 0,
 	V4L2_DV_TX_MODE_HDMI	= 1,
@@ -1374,7 +1386,7 @@ enum v4l2_dv_it_content_type {
 	V4L2_DV_IT_CONTENT_TYPE_NO_ITC	  = 4,
 };
 
-#define	V4L2_CID_DV_RX_POWER_PRESENT		(V4L2_CID_DV_CLASS_BASE + 100)
+#define V4L2_CID_DV_RX_POWER_PRESENT		(V4L2_CID_DV_CLASS_BASE + 100)
 #define V4L2_CID_DV_RX_RGB_RANGE		(V4L2_CID_DV_CLASS_BASE + 101)
 #define V4L2_CID_DV_RX_IT_CONTENT_TYPE		(V4L2_CID_DV_CLASS_BASE + 102)
 
@@ -1644,15 +1656,6 @@ struct v4l2_ctrl_h264_pred_weights {
 	struct v4l2_h264_weight_factors weight_factors[2];
 };
 
-#define V4L2_H264_SLICE_TYPE_P				0
-#define V4L2_H264_SLICE_TYPE_B				1
-#define V4L2_H264_SLICE_TYPE_I				2
-#define V4L2_H264_SLICE_TYPE_SP				3
-#define V4L2_H264_SLICE_TYPE_SI				4
-
-#define V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED	0x01
-#define V4L2_H264_SLICE_FLAG_SP_FOR_SWITCH		0x02
-
 #define V4L2_H264_TOP_FIELD_REF				0x1
 #define V4L2_H264_BOTTOM_FIELD_REF			0x2
 #define V4L2_H264_FRAME_REF				0x3
@@ -1673,8 +1676,17 @@ struct v4l2_h264_reference {
  * Maximum DPB size, as specified by section 'A.3.1 Level limits
  * common to the Baseline, Main, and Extended profiles'.
  */
-#define V4L2_H264_NUM_DPB_ENTRIES 16
-#define V4L2_H264_REF_LIST_LEN (2 * V4L2_H264_NUM_DPB_ENTRIES)
+#define V4L2_H264_NUM_DPB_ENTRIES		16
+#define V4L2_H264_REF_LIST_LEN			(2 * V4L2_H264_NUM_DPB_ENTRIES)
+
+#define V4L2_H264_SLICE_TYPE_P				0
+#define V4L2_H264_SLICE_TYPE_B				1
+#define V4L2_H264_SLICE_TYPE_I				2
+#define V4L2_H264_SLICE_TYPE_SP				3
+#define V4L2_H264_SLICE_TYPE_SI				4
+
+#define V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED		0x01
+#define V4L2_H264_SLICE_FLAG_SP_FOR_SWITCH			0x02
 
 #define V4L2_CID_STATELESS_H264_SLICE_PARAMS	(V4L2_CID_CODEC_STATELESS_BASE + 6)
 /**
@@ -1813,7 +1825,6 @@ struct v4l2_ctrl_h264_decode_params {
 	u_int32_t reserved;
 	u_int32_t flags;
 };
-
 
 /* Stateless FWHT control, used by the vicodec driver */
 
@@ -2656,44 +2667,10 @@ struct v4l2_ctrl_hevc_scaling_matrix {
 	u_int8_t	scaling_list_dc_coef_32x32[2];
 };
 
-#define V4L2_CID_COLORIMETRY_CLASS_BASE	(V4L2_CTRL_CLASS_COLORIMETRY | 0x900)
-#define V4L2_CID_COLORIMETRY_CLASS	(V4L2_CTRL_CLASS_COLORIMETRY | 1)
-
-#define V4L2_CID_COLORIMETRY_HDR10_CLL_INFO	(V4L2_CID_COLORIMETRY_CLASS_BASE + 0)
-
-struct v4l2_ctrl_hdr10_cll_info {
-	u_int16_t max_content_light_level;
-	u_int16_t max_pic_average_light_level;
-};
-
-#define V4L2_CID_COLORIMETRY_HDR10_MASTERING_DISPLAY	(V4L2_CID_COLORIMETRY_CLASS_BASE + 1)
-
-#define V4L2_HDR10_MASTERING_PRIMARIES_X_LOW	5
-#define V4L2_HDR10_MASTERING_PRIMARIES_X_HIGH	37000
-#define V4L2_HDR10_MASTERING_PRIMARIES_Y_LOW	5
-#define V4L2_HDR10_MASTERING_PRIMARIES_Y_HIGH	42000
-#define V4L2_HDR10_MASTERING_WHITE_POINT_X_LOW	5
-#define V4L2_HDR10_MASTERING_WHITE_POINT_X_HIGH	37000
-#define V4L2_HDR10_MASTERING_WHITE_POINT_Y_LOW	5
-#define V4L2_HDR10_MASTERING_WHITE_POINT_Y_HIGH	42000
-#define V4L2_HDR10_MASTERING_MAX_LUMA_LOW	50000
-#define V4L2_HDR10_MASTERING_MAX_LUMA_HIGH	100000000
-#define V4L2_HDR10_MASTERING_MIN_LUMA_LOW	1
-#define V4L2_HDR10_MASTERING_MIN_LUMA_HIGH	50000
-
-struct v4l2_ctrl_hdr10_mastering_display {
-	u_int16_t display_primaries_x[3];
-	u_int16_t display_primaries_y[3];
-	u_int16_t white_point_x;
-	u_int16_t white_point_y;
-	u_int32_t max_display_mastering_luminance;
-	u_int32_t min_display_mastering_luminance;
-};
-
 /* Stateless VP9 controls */
 
 #define V4L2_VP9_LOOP_FILTER_FLAG_DELTA_ENABLED	0x1
-#define	V4L2_VP9_LOOP_FILTER_FLAG_DELTA_UPDATE	0x2
+#define V4L2_VP9_LOOP_FILTER_FLAG_DELTA_UPDATE	0x2
 
 /**
  * struct v4l2_vp9_loop_filter - VP9 loop filter parameters
@@ -3619,6 +3596,40 @@ struct v4l2_ctrl_av1_film_grain {
 #define V4L2_CID_MPEG_BASE              V4L2_CID_CODEC_BASE
 #define V4L2_CID_MPEG_CX2341X_BASE      V4L2_CID_CODEC_CX2341X_BASE
 #define V4L2_CID_MPEG_MFC51_BASE        V4L2_CID_CODEC_MFC51_BASE
+#define V4L2_CID_COLORIMETRY_CLASS_BASE	(V4L2_CTRL_CLASS_COLORIMETRY | 0x900)
+#define V4L2_CID_COLORIMETRY_CLASS	(V4L2_CTRL_CLASS_COLORIMETRY | 1)
+
+#define V4L2_CID_COLORIMETRY_HDR10_CLL_INFO	(V4L2_CID_COLORIMETRY_CLASS_BASE + 0)
+
+struct v4l2_ctrl_hdr10_cll_info {
+	u_int16_t max_content_light_level;
+	u_int16_t max_pic_average_light_level;
+};
+
+#define V4L2_CID_COLORIMETRY_HDR10_MASTERING_DISPLAY	(V4L2_CID_COLORIMETRY_CLASS_BASE + 1)
+
+#define V4L2_HDR10_MASTERING_PRIMARIES_X_LOW	5
+#define V4L2_HDR10_MASTERING_PRIMARIES_X_HIGH	37000
+#define V4L2_HDR10_MASTERING_PRIMARIES_Y_LOW	5
+#define V4L2_HDR10_MASTERING_PRIMARIES_Y_HIGH	42000
+#define V4L2_HDR10_MASTERING_WHITE_POINT_X_LOW	5
+#define V4L2_HDR10_MASTERING_WHITE_POINT_X_HIGH	37000
+#define V4L2_HDR10_MASTERING_WHITE_POINT_Y_LOW	5
+#define V4L2_HDR10_MASTERING_WHITE_POINT_Y_HIGH	42000
+#define V4L2_HDR10_MASTERING_MAX_LUMA_LOW	50000
+#define V4L2_HDR10_MASTERING_MAX_LUMA_HIGH	100000000
+#define V4L2_HDR10_MASTERING_MIN_LUMA_LOW	1
+#define V4L2_HDR10_MASTERING_MIN_LUMA_HIGH	50000
+
+struct v4l2_ctrl_hdr10_mastering_display {
+	u_int16_t display_primaries_x[3];
+	u_int16_t display_primaries_y[3];
+	u_int16_t white_point_x;
+	u_int16_t white_point_y;
+	u_int32_t max_display_mastering_luminance;
+	u_int32_t min_display_mastering_luminance;
+};
+
 /*
  * End of v4l2-controls.h
  */
@@ -4261,7 +4272,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_SGBRG12 v4l2_fourcc('G', 'B', '1', '2') /* 12  GBGB.. RGRG.. */
 #define V4L2_PIX_FMT_SGRBG12 v4l2_fourcc('B', 'A', '1', '2') /* 12  GRGR.. BGBG.. */
 #define V4L2_PIX_FMT_SRGGB12 v4l2_fourcc('R', 'G', '1', '2') /* 12  RGRG.. GBGB.. */
-	/* 12bit raw bayer packed, 6 bytes for every 4 pixels */
+	/* 12bit raw bayer packed, 3 bytes for every 2 pixels */
 #define V4L2_PIX_FMT_SBGGR12P v4l2_fourcc('p', 'B', 'C', 'C')
 #define V4L2_PIX_FMT_SGBRG12P v4l2_fourcc('p', 'G', 'C', 'C')
 #define V4L2_PIX_FMT_SGRBG12P v4l2_fourcc('p', 'g', 'C', 'C')
@@ -4375,6 +4386,12 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_PISP_COMP2_BGGR	v4l2_fourcc('P', 'C', '2', 'B') /* PiSP 8-bit mode 2 compressed BGGR bayer */
 #define V4L2_PIX_FMT_PISP_COMP2_MONO	v4l2_fourcc('P', 'C', '2', 'M') /* PiSP 8-bit mode 2 compressed monochrome */
 
+/* Renesas RZ/V2H CRU packed formats. 64-bit units with contiguous pixels */
+#define V4L2_PIX_FMT_RAW_CRU10	v4l2_fourcc('C', 'R', '1', '0')
+#define V4L2_PIX_FMT_RAW_CRU12	v4l2_fourcc('C', 'R', '1', '2')
+#define V4L2_PIX_FMT_RAW_CRU14	v4l2_fourcc('C', 'R', '1', '4')
+#define V4L2_PIX_FMT_RAW_CRU20	v4l2_fourcc('C', 'R', '2', '0')
+
 /* SDR formats - used only for Software Defined Radio devices */
 #define V4L2_SDR_FMT_CU8          v4l2_fourcc('C', 'U', '0', '8') /* IQ u8 */
 #define V4L2_SDR_FMT_CU16LE       v4l2_fourcc('C', 'U', '1', '6') /* IQ u16le */
@@ -4396,6 +4413,7 @@ struct v4l2_pix_format {
 #define V4L2_META_FMT_VSP1_HGT    v4l2_fourcc('V', 'S', 'P', 'T') /* R-Car VSP1 2-D Histogram */
 #define V4L2_META_FMT_UVC         v4l2_fourcc('U', 'V', 'C', 'H') /* UVC Payload Header metadata */
 #define V4L2_META_FMT_D4XX        v4l2_fourcc('D', '4', 'X', 'X') /* D4XX Payload Header metadata */
+#define V4L2_META_FMT_UVC_MSXU_1_5  v4l2_fourcc('U', 'V', 'C', 'M') /* UVC MSXU metadata */
 #define V4L2_META_FMT_VIVID	  v4l2_fourcc('V', 'I', 'V', 'D') /* Vivid Metadata */
 
 /* Vendor specific - used for RK_ISP1 camera sub-system */
@@ -4411,6 +4429,10 @@ struct v4l2_pix_format {
 #define V4L2_META_FMT_RPI_BE_CFG	v4l2_fourcc('R', 'P', 'B', 'C') /* PiSP BE configuration */
 #define V4L2_META_FMT_RPI_FE_CFG	v4l2_fourcc('R', 'P', 'F', 'C') /* PiSP FE configuration */
 #define V4L2_META_FMT_RPI_FE_STATS	v4l2_fourcc('R', 'P', 'F', 'S') /* PiSP FE stats */
+
+/* Vendor specific - used for Arm Mali-C55 ISP */
+#define V4L2_META_FMT_MALI_C55_PARAMS	v4l2_fourcc('C', '5', '5', 'P') /* ARM Mali-C55 Parameters */
+#define V4L2_META_FMT_MALI_C55_STATS	v4l2_fourcc('C', '5', '5', 'S') /* ARM Mali-C55 3A Statistics */
 
 /* priv field value to indicates that subsequent fields are valid. */
 #define V4L2_PIX_FMT_PRIV_MAGIC		0xfeedcafe
@@ -5095,8 +5117,8 @@ struct v4l2_bt_timings {
 } __attribute__ ((packed));
 
 /* Interlaced or progressive format */
-#define	V4L2_DV_PROGRESSIVE	0
-#define	V4L2_DV_INTERLACED	1
+#define V4L2_DV_PROGRESSIVE	0
+#define V4L2_DV_INTERLACED	1
 
 /* Polarities. If bit is not set, it is assumed to be negative polarity */
 #define V4L2_DV_VSYNC_POS_POL	0x00000001
@@ -6268,15 +6290,15 @@ struct v4l2_remove_buffers {
  * Only implemented if CONFIG_VIDEO_ADV_DEBUG is defined.
  * You must be root to use these ioctls. Never use these in applications!
  */
-#define	VIDIOC_DBG_S_REGISTER	 _IOW('V', 79, struct v4l2_dbg_register)
-#define	VIDIOC_DBG_G_REGISTER	_IOWR('V', 80, struct v4l2_dbg_register)
+#define VIDIOC_DBG_S_REGISTER	 _IOW('V', 79, struct v4l2_dbg_register)
+#define VIDIOC_DBG_G_REGISTER	_IOWR('V', 80, struct v4l2_dbg_register)
 
 #define VIDIOC_S_HW_FREQ_SEEK	 _IOW('V', 82, struct v4l2_hw_freq_seek)
-#define	VIDIOC_S_DV_TIMINGS	_IOWR('V', 87, struct v4l2_dv_timings)
-#define	VIDIOC_G_DV_TIMINGS	_IOWR('V', 88, struct v4l2_dv_timings)
-#define	VIDIOC_DQEVENT		 _IOR('V', 89, struct v4l2_event)
-#define	VIDIOC_SUBSCRIBE_EVENT	 _IOW('V', 90, struct v4l2_event_subscription)
-#define	VIDIOC_UNSUBSCRIBE_EVENT _IOW('V', 91, struct v4l2_event_subscription)
+#define VIDIOC_S_DV_TIMINGS	_IOWR('V', 87, struct v4l2_dv_timings)
+#define VIDIOC_G_DV_TIMINGS	_IOWR('V', 88, struct v4l2_dv_timings)
+#define VIDIOC_DQEVENT		 _IOR('V', 89, struct v4l2_event)
+#define VIDIOC_SUBSCRIBE_EVENT	 _IOW('V', 90, struct v4l2_event_subscription)
+#define VIDIOC_UNSUBSCRIBE_EVENT _IOW('V', 91, struct v4l2_event_subscription)
 #define VIDIOC_CREATE_BUFS	_IOWR('V', 92, struct v4l2_create_buffers)
 #define VIDIOC_PREPARE_BUF	_IOWR('V', 93, struct v4l2_buffer)
 #define VIDIOC_G_SELECTION	_IOWR('V', 94, struct v4l2_selection)

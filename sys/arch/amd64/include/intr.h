@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.h,v 1.35 2025/04/23 15:08:05 visa Exp $	*/
+/*	$OpenBSD: intr.h,v 1.37 2025/11/10 12:34:52 dlg Exp $	*/
 /*	$NetBSD: intr.h,v 1.2 2003/05/04 22:01:56 fvdl Exp $	*/
 
 /*-
@@ -210,6 +210,7 @@ int intr_handler(struct intrframe *, struct intrhand *);
 void cpu_intr_init(struct cpu_info *);
 void intr_printconfig(void);
 void intr_barrier(void *);
+void intr_set_wakeup(void *);
 void intr_enable_wakeup(void);
 void intr_disable_wakeup(void);
 
@@ -221,7 +222,10 @@ void x86_ipi_handler(void);
 void x86_setperf_ipi(struct cpu_info *);
 
 extern void (*ipifunc[X86_NIPI])(struct cpu_info *);
-#endif
+
+#define cpu_xcall_ipi(_ci) x86_send_ipi((_ci), X86_IPI_XCALL)
+void Xxcallintr(void);
+#endif /* MULTIPROCESSOR */
 
 #endif /* !_LOCORE */
 

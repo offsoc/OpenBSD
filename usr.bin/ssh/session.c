@@ -1,4 +1,4 @@
-/* $OpenBSD: session.c,v 1.342 2025/05/05 02:48:06 djm Exp $ */
+/* $OpenBSD: session.c,v 1.345 2025/11/17 12:59:29 jca Exp $ */
 /*
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
  *                    All rights reserved
@@ -121,9 +121,6 @@ static int session_pty_req(struct ssh *, Session *);
 extern ServerOptions options;
 extern char *__progname;
 extern int debug_flag;
-extern u_int utmp_len;
-extern int startup_pipe;
-extern void destroy_sensitive_data(void);
 extern struct sshbuf *loginmsg;
 extern struct sshauthopt *auth_opts;
 extern char *tun_fwd_ifnames; /* serverloop.c */
@@ -470,9 +467,6 @@ do_exec_no_pty(struct ssh *ssh, Session *s, const char *command)
 	}
 
 	s->pid = pid;
-	/* Set interactive/non-interactive mode. */
-	ssh_packet_set_interactive(ssh, s->display != NULL,
-	    options.ip_qos_interactive, options.ip_qos_bulk);
 
 #ifdef USE_PIPES
 	/* We are the parent.  Close the child sides of the pipes. */
@@ -587,8 +581,6 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 
 	/* Enter interactive session. */
 	s->ptymaster = ptymaster;
-	ssh_packet_set_interactive(ssh, 1,
-	    options.ip_qos_interactive, options.ip_qos_bulk);
 	session_set_fds(ssh, s, ptyfd, fdout, -1, 1, 1);
 	return 0;
 }
@@ -835,6 +827,10 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
 
 	if (getenv("TZ"))
 		child_set_env(&env, &envsize, "TZ", getenv("TZ"));
+	if (getenv("XDG_RUNTIME_DIR")) {
+		child_set_env(&env, &envsize, "XDG_RUNTIME_DIR",
+		    getenv("XDG_RUNTIME_DIR"));
+	}
 	if (s->term)
 		child_set_env(&env, &envsize, "TERM", s->term);
 	if (s->display)

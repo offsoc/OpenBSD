@@ -1,4 +1,4 @@
-/*	$OpenBSD: tcp_timer.c,v 1.83 2025/02/12 21:28:11 bluhm Exp $	*/
+/*	$OpenBSD: tcp_timer.c,v 1.88 2025/09/17 17:29:14 bluhm Exp $	*/
 /*	$NetBSD: tcp_timer.c,v 1.14 1996/02/13 23:44:09 christos Exp $	*/
 
 /*
@@ -36,9 +36,7 @@
 #include <sys/systm.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 #include <sys/protosw.h>
-#include <sys/kernel.h>
 #include <sys/pool.h>
 
 #include <net/route.h>
@@ -91,7 +89,7 @@ tcp_timer_enter(struct inpcb *inp, struct socket **so, struct tcpcb **tp,
 	KASSERT(timer < TCPT_NTIMERS);
 
 	NET_LOCK_SHARED();
-	*so = in_pcbsolock_ref(inp);
+	*so = in_pcbsolock(inp);
 	if (*so == NULL) {
 		*tp = NULL;
 		return -1;
@@ -109,7 +107,7 @@ tcp_timer_enter(struct inpcb *inp, struct socket **so, struct tcpcb **tp,
 static inline void
 tcp_timer_leave(struct inpcb *inp, struct socket *so)
 {
-	in_pcbsounlock_rele(inp, so);
+	in_pcbsounlock(inp, so);
 	NET_UNLOCK_SHARED();
 	in_pcbunref(inp);
 }
@@ -237,7 +235,7 @@ tcp_timer_rexmt(void *arg)
 		sin.sin_family = AF_INET;
 		sin.sin_addr = inp->inp_faddr;
 
-		in_pcbsounlock_rele(inp, so);
+		in_pcbsounlock(inp, so);
 		in_pcbunref(inp);
 
 		icmp_mtudisc(&icmp, rtableid);
@@ -277,7 +275,7 @@ tcp_timer_rexmt(void *arg)
 	 * lots more sophisticated searching to find the right
 	 * value here...
 	 */
-	if (ip_mtudisc &&
+	if (atomic_load_int(&ip_mtudisc) &&
 	    TCPS_HAVEESTABLISHED(tp->t_state) &&
 	    tp->t_rxtshift > TCP_MAXRXTSHIFT / 6) {
 		struct rtentry *rt = NULL;
@@ -474,11 +472,12 @@ tcp_timer_keep(void *arg)
 	if ((atomic_load_int(&tcp_always_keepalive) ||
 	    so->so_options & SO_KEEPALIVE) &&
 	    tp->t_state <= TCPS_CLOSING) {
-		int keepidle, maxidle;
+		int keepidle, keepintvl, maxidle;
 		uint64_t now;
 
 		keepidle = atomic_load_int(&tcp_keepidle);
-		maxidle = TCPTV_KEEPCNT * keepidle;
+		keepintvl = atomic_load_int(&tcp_keepintvl);
+		maxidle = TCPTV_KEEPCNT * keepintvl;
 		now = tcp_now();
 		if ((maxidle > 0) &&
 		    ((now - tp->t_rcvtime) >= keepidle + maxidle)) {
@@ -501,7 +500,7 @@ tcp_timer_keep(void *arg)
 		tcpstat_inc(tcps_keepprobe);
 		tcp_respond(tp, mtod(tp->t_template, caddr_t),
 		    NULL, tp->rcv_nxt, tp->snd_una - 1, 0, 0, now);
-		TCP_TIMER_ARM(tp, TCPT_KEEP, atomic_load_int(&tcp_keepintvl));
+		TCP_TIMER_ARM(tp, TCPT_KEEP, keepintvl);
 	} else
 		TCP_TIMER_ARM(tp, TCPT_KEEP, atomic_load_int(&tcp_keepidle));
 	if (otp)
@@ -518,7 +517,7 @@ tcp_timer_2msl(void *arg)
 	struct tcpcb *otp = NULL, *tp;
 	short ostate;
 	uint64_t now;
-	int maxidle;
+	int keepintvl, maxidle;
 
 	if (tcp_timer_enter(inp, &so, &tp, TCPT_2MSL))
 		goto out;
@@ -529,31 +528,16 @@ tcp_timer_2msl(void *arg)
 	}
 	tcp_timer_freesack(tp);
 
-	maxidle = TCPTV_KEEPCNT * atomic_load_int(&tcp_keepidle);
+	keepintvl = atomic_load_int(&tcp_keepintvl);
+	maxidle = TCPTV_KEEPCNT * keepintvl;
 	now = tcp_now();
 	if (tp->t_state != TCPS_TIME_WAIT &&
 	    ((maxidle == 0) || ((now - tp->t_rcvtime) <= maxidle)))
-		TCP_TIMER_ARM(tp, TCPT_2MSL, atomic_load_int(&tcp_keepintvl));
+		TCP_TIMER_ARM(tp, TCPT_2MSL, keepintvl);
 	else
 		tp = tcp_close(tp);
 	if (otp)
 		tcp_trace(TA_TIMER, ostate, tp, otp, NULL, TCPT_2MSL, 0);
  out:
 	tcp_timer_leave(inp, so);
-}
-
-void
-tcp_timer_reaper(void *arg)
-{
-	struct tcpcb *tp = arg;
-
-	/*
-	 * This timer is necessary to delay the pool_put() after all timers
-	 * have finished, even if they were sleeping to grab the net lock.
-	 * Putting the pool_put() in a timer is sufficient as all timers run
-	 * from the same timeout thread.  Note that neither softnet thread nor
-	 * user process may access the tcpcb after arming the reaper timer.
-	 * Freeing may run in parallel as it does not grab the net lock.
-	 */
-	pool_put(&tcpcb_pool, tp);
 }

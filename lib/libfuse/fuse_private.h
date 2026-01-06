@@ -1,4 +1,4 @@
-/* $OpenBSD: fuse_private.h,v 1.23 2024/09/20 02:00:46 jsg Exp $ */
+/* $OpenBSD: fuse_private.h,v 1.26 2025/12/08 06:37:05 helg Exp $ */
 /*
  * Copyright (c) 2013 Sylvestre Gallon <ccna.syl@gmail.com>
  *
@@ -18,8 +18,8 @@
 #ifndef _FUSE_SUBR_H_
 #define _FUSE_SUBR_H_
 
+#include <sys/types.h>
 #include <sys/dirent.h>
-#include <sys/event.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -28,8 +28,7 @@
 #include <limits.h>
 
 #include "fuse.h"
-
-struct fuse_args;
+#include "fuse_lowlevel.h"
 
 struct fuse_vnode {
 	ino_t ino;
@@ -65,10 +64,8 @@ struct fuse_chan {
 	struct fuse_args *args;
 
 	int fd;
+	int init;
 	int dead;
-
-	/* kqueue stuff */
-	int kq;
 };
 
 struct fuse_config {
@@ -150,20 +147,32 @@ void			*dict_pop(struct dict *, const char *);
 #define	DEF(x)		__strong_alias(x, __##x)
 
 PROTO(fuse_daemonize);
+PROTO(fuse_teardown);
 PROTO(fuse_destroy);
 PROTO(fuse_get_context);
 PROTO(fuse_get_session);
 PROTO(fuse_loop);
+PROTO(fuse_loop_mt);
 PROTO(fuse_mount);
 PROTO(fuse_new);
 PROTO(fuse_opt_add_arg);
+PROTO(fuse_opt_add_opt);
+PROTO(fuse_opt_add_opt_escaped);
 PROTO(fuse_opt_free_args);
 PROTO(fuse_opt_insert_arg);
 PROTO(fuse_opt_match);
 PROTO(fuse_opt_parse);
 PROTO(fuse_parse_cmdline);
 PROTO(fuse_remove_signal_handlers);
+PROTO(fuse_set_signal_handlers);
 PROTO(fuse_setup);
 PROTO(fuse_unmount);
+PROTO(fuse_main);
+PROTO(fuse_version);
+PROTO(fuse_invalidate);
+PROTO(fuse_is_lib_option);
+
+/* FUSE low-level */
+PROTO(fuse_chan_fd);
 
 #endif /* _FUSE_SUBR_ */

@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_pledge.c,v 1.324 2025/05/24 06:49:16 deraadt Exp $	*/
+/*	$OpenBSD: kern_pledge.c,v 1.335 2025/11/13 20:59:14 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2015 Nicholas Marriott <nicm@openbsd.org>
@@ -350,18 +350,21 @@ const uint64_t pledge_syscalls[SYS_MAXSYSCALL] = {
 	[SYS_socket] = PLEDGE_INET | PLEDGE_UNIX | PLEDGE_DNS,
 	[SYS_connect] = PLEDGE_INET | PLEDGE_UNIX | PLEDGE_DNS,
 	[SYS_bind] = PLEDGE_INET | PLEDGE_UNIX | PLEDGE_DNS,
-	[SYS_getsockname] = PLEDGE_INET | PLEDGE_UNIX | PLEDGE_DNS,
+	[SYS_getsockname] = PLEDGE_STDIO,
 
 	[SYS_listen] = PLEDGE_INET | PLEDGE_UNIX,
 	[SYS_accept4] = PLEDGE_INET | PLEDGE_UNIX,
 	[SYS_accept] = PLEDGE_INET | PLEDGE_UNIX,
-	[SYS_getpeername] = PLEDGE_INET | PLEDGE_UNIX,
+	[SYS_getpeername] = PLEDGE_STDIO,
 
 	[SYS_flock] = PLEDGE_FLOCK,
 
 	[SYS_ypconnect] = PLEDGE_GETPW,
 
 	[SYS_swapctl] = PLEDGE_VMINFO,
+
+	/* for sysarch(*_SYNC_ICACHE) requests only */
+	[SYS_sysarch] = PLEDGE_PROTEXEC,
 };
 
 static const struct {
@@ -716,13 +719,9 @@ pledge_namei(struct proc *p, struct nameidata *ni, char *origpath)
 
 		break;
 	case SYS_stat:
-		/* DNS needs /etc/{resolv.conf,hosts}. */
+		/* XXX go library stats /etc/hosts, remove this soon */
 		if ((ni->ni_pledge == PLEDGE_RPATH) &&
 		    (pledge & PLEDGE_DNS)) {
-			if (strcmp(path, "/etc/resolv.conf") == 0) {
-				ni->ni_cnd.cn_flags |= BYPASSUNVEIL;
-				return (0);
-			}
 			if (strcmp(path, "/etc/hosts") == 0) {
 				ni->ni_cnd.cn_flags |= BYPASSUNVEIL;
 				return (0);
@@ -833,13 +832,6 @@ pledge_sysctl(struct proc *p, int miblen, int *mib, void *new)
 		    mib[2] == 0 &&
 		    (mib[3] == 0 || mib[3] == AF_INET6 || mib[3] == AF_INET) &&
 		    mib[4] == NET_RT_FLAGS && mib[5] == RTF_LLINFO)
-			return (0);
-	}
-
-	if ((pledge & PLEDGE_WROUTE)) {
-		if (miblen == 4 &&
-		    mib[0] == CTL_NET && mib[1] == PF_INET6 &&
-		    mib[2] == IPPROTO_IPV6 && mib[3] == IPV6CTL_SOIIKEY)
 			return (0);
 	}
 
@@ -1156,6 +1148,7 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 	if ((pledge & PLEDGE_DISKLABEL)) {
 		switch (com) {
 		case DIOCGDINFO:
+		case O_DIOCGDINFO: /* XXX temporary transition to 52 partitions */
 		case DIOCGPDINFO:
 		case DIOCRLDINFO:
 		case DIOCWDINFO:
@@ -1236,9 +1229,9 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 		case DIOCXBEGIN:
 		case DIOCXCOMMIT:
 		case DIOCKILLSRCNODES:
-			if ((fp->f_type == DTYPE_VNODE) &&
-			    (vp->v_type == VCHR) &&
-			    (cdevsw[major(vp->v_rdev)].d_open == pfopen))
+			if (fp->f_type == DTYPE_VNODE &&
+			    vp->v_type == VCHR &&
+			    cdevsw[major(vp->v_rdev)].d_open == pfopen)
 				return (0);
 			break;
 		}
@@ -1253,19 +1246,21 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 				break;
 			if ((pledge & PLEDGE_WPATH) == 0)
 				break;
-			if (fp->f_type != DTYPE_VNODE || vp->v_type != VCHR)
-				break;
-			if (cdevsw[major(vp->v_rdev)].d_open != ptmopen)
-				break;
-			return (0);
+			if (fp->f_type == DTYPE_VNODE &&
+			    vp->v_type == VCHR &&
+			    cdevsw[major(vp->v_rdev)].d_open == ptmopen)
+				return (0);
+			break;
 		case TIOCUCNTL:		/* vmd */
 			if ((pledge & PLEDGE_RPATH) == 0)
 				break;
 			if ((pledge & PLEDGE_WPATH) == 0)
 				break;
-			if (cdevsw[major(vp->v_rdev)].d_open != ptcopen)
-				break;
-			return (0);
+			if (fp->f_type == DTYPE_VNODE &&
+			    vp->v_type == VCHR &&
+			    cdevsw[major(vp->v_rdev)].d_open == ptcopen)
+				return (0);
+			break;
 #endif /* NPTY > 0 */
 		case TIOCSPGRP:
 			if ((pledge & PLEDGE_PROC) == 0)
@@ -1337,9 +1332,9 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 
 #if NVMM > 0
 	if ((pledge & PLEDGE_VMM)) {
-		if ((fp->f_type == DTYPE_VNODE) &&
-		    (vp->v_type == VCHR) &&
-		    (cdevsw[major(vp->v_rdev)].d_open == vmmopen)) {
+		if (fp->f_type == DTYPE_VNODE &&
+		    vp->v_type == VCHR &&
+		    cdevsw[major(vp->v_rdev)].d_open == vmmopen) {
 			error = pledge_ioctl_vmm(p, com);
 			if (error == 0)
 				return 0;
@@ -1349,9 +1344,9 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 
 #if NPSP > 0
 	if ((pledge & PLEDGE_VMM)) {
-		if ((fp->f_type == DTYPE_VNODE) &&
-		    (vp->v_type == VCHR) &&
-		    (cdevsw[major(vp->v_rdev)].d_open == pspopen)) {
+		if (fp->f_type == DTYPE_VNODE &&
+		    vp->v_type == VCHR &&
+		    cdevsw[major(vp->v_rdev)].d_open == pspopen) {
 			error = pledge_ioctl_psp(p, com);
 			if (error == 0)
 				return (0);
@@ -1383,6 +1378,18 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 	case IPPROTO_TCP:
 		switch (optname) {
 		case TCP_NODELAY:
+			return (0);
+		}
+		break;
+	case IPPROTO_IP:
+		switch (optname) {
+		case IP_TOS:
+			return (0);
+		}
+		break;
+	case IPPROTO_IPV6:
+		switch (optname) {
+		case IPV6_TCLASS:
 			return (0);
 		}
 		break;
@@ -1452,7 +1459,6 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 			if (!set)
 				return (0);
 			break;
-		case IP_TOS:
 		case IP_TTL:
 		case IP_MINTTL:
 		case IP_IPDEFTTL:
@@ -1474,13 +1480,14 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 		break;
 	case IPPROTO_IPV6:
 		switch (optname) {
-		case IPV6_TCLASS:
+		case IPV6_DONTFRAG:
 		case IPV6_UNICAST_HOPS:
 		case IPV6_MINHOPCOUNT:
 		case IPV6_RECVHOPLIMIT:
 		case IPV6_PORTRANGE:
 		case IPV6_RECVPKTINFO:
 		case IPV6_RECVDSTPORT:
+		case IPV6_RECVTCLASS:
 		case IPV6_V6ONLY:
 			return (0);
 		case IPV6_MULTICAST_IF:

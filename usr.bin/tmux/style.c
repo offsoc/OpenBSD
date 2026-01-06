@@ -1,4 +1,4 @@
-/* $OpenBSD: style.c,v 1.37 2025/05/22 07:43:38 nicm Exp $ */
+/* $OpenBSD: style.c,v 1.39 2025/12/01 08:14:29 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -217,19 +217,24 @@ style_parse(struct style *sy, const struct grid_cell *base, const char *in)
 		} else if (strcasecmp(tmp, "none") == 0)
 			sy->gc.attr = 0;
 		else if (end > 2 && strncasecmp(tmp, "no", 2) == 0) {
-			if ((value = attributes_fromstring(tmp + 2)) == -1)
-				goto error;
-			sy->gc.attr &= ~value;
+			if (strcmp(tmp + 2, "attr") == 0)
+				sy->gc.attr |= GRID_ATTR_NOATTR;
+			else {
+				value = attributes_fromstring(tmp + 2);
+				if (value == -1)
+					goto error;
+				sy->gc.attr &= ~value;
+			}
 		} else if (end > 6 && strncasecmp(tmp, "width=", 6) == 0) {
-                        n = strtonum(tmp + 6, 0, UINT_MAX, &errstr);
-                        if (errstr != NULL)
-                                goto error;
-                        sy->width = (int)n;
+			n = strtonum(tmp + 6, 0, UINT_MAX, &errstr);
+			if (errstr != NULL)
+				goto error;
+			sy->width = (int)n;
 		} else if (end > 4 && strncasecmp(tmp, "pad=", 4) == 0) {
-                        n = strtonum(tmp + 4, 0, UINT_MAX, &errstr);
-                        if (errstr != NULL)
-                                goto error;
-                        sy->pad = (int)n;
+			n = strtonum(tmp + 4, 0, UINT_MAX, &errstr);
+			if (errstr != NULL)
+				goto error;
+			sy->pad = (int)n;
 		} else {
 			if ((value = attributes_fromstring(tmp)) == -1)
 				goto error;
@@ -342,13 +347,13 @@ style_tostring(struct style *sy)
 		    attributes_tostring(gc->attr));
 		comma = ",";
 	}
-        if (sy->width >= 0) {
-                xsnprintf(s + off, sizeof s - off, "%swidth=%u", comma,
+	if (sy->width >= 0) {
+		xsnprintf(s + off, sizeof s - off, "%swidth=%u", comma,
 		    sy->width);
 		comma = ",";
 	}
-        if (sy->pad >= 0) {
-                xsnprintf(s + off, sizeof s - off, "%spad=%u", comma,
+	if (sy->pad >= 0) {
+		xsnprintf(s + off, sizeof s - off, "%spad=%u", comma,
 		    sy->pad);
 		comma = ",";
 	}

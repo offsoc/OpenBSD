@@ -56,7 +56,6 @@
 
 static void amdgpu_bo_destroy(struct ttm_buffer_object *tbo)
 {
-	struct amdgpu_device *adev = amdgpu_ttm_adev(tbo->bdev);
 	struct amdgpu_bo *bo = ttm_to_amdgpu_bo(tbo);
 
 	amdgpu_bo_kunmap(bo);
@@ -567,7 +566,6 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 		return -ENOMEM;
 	drm_gem_private_object_init(adev_to_drm(adev), &bo->tbo.base, size);
 	bo->tbo.base.funcs = &amdgpu_gem_object_funcs;
-	bo->adev = adev;
 	bo->vm_bo = NULL;
 	bo->preferred_domains = bp->preferred_domain ? bp->preferred_domain :
 		bp->domain;

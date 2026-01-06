@@ -1,4 +1,4 @@
-# $OpenBSD: files.arm64,v 1.73 2025/04/25 12:48:48 mvs Exp $
+# $OpenBSD: files.arm64,v 1.79 2025/09/17 09:32:55 kettenis Exp $
 
 maxpartitions	16
 maxusers	2 8 128
@@ -250,6 +250,10 @@ device	bcmintc
 attach	bcmintc at fdt
 file	arch/arm64/dev/bcm2836_intr.c		bcmintc
 
+device	bcmmip
+attach	bcmmip at fdt
+file	arch/arm64/dev/bcm2712_mip.c		bcmmip
+
 device	pciecam: pcibus
 attach	pciecam at fdt
 file	dev/fdt/pciecam.c			pciecam
@@ -259,15 +263,33 @@ attach	smmu at fdt with smmu_fdt
 file	arch/arm64/dev/smmu.c			smmu
 file	arch/arm64/dev/smmu_fdt.c		smmu_fdt
 
+# Raspberry Pi RP1
+device	rpone: fdt
+attach	rpone at pci
+file	arch/arm64/dev/rpone.c			rpone
+
+device	rpiclock
+attach	rpiclock at fdt
+file	arch/arm64/dev/rpiclock.c		rpiclock
+
 device	rpigpio
 attach	rpigpio at fdt
 file	arch/arm64/dev/rpigpio.c		rpigpio
+
+device	rpipwm
+attach	rpipwm at fdt
+file	arch/arm64/dev/rpipwm.c			rpipwm
+
+device	rpirtc
+attach	rpirtc at fdt
+file	arch/arm64/dev/rpirtc.c			rpirtc
 
 # ACPI
 include "dev/acpi/files.acpi"
 
 attach	acpi at fdt with acpi_fdt
 file	arch/arm64/arm64/acpi_machdep.c		acpi_fdt
+file	arch/arm64/dev/acpicpu.c		acpicpu
 
 define	acpiiort {}
 device	acpiiort: acpiiort

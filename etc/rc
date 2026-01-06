@@ -1,4 +1,4 @@
-#	$OpenBSD: rc,v 1.583 2025/05/24 12:24:43 kn Exp $
+#	$OpenBSD: rc,v 1.588 2025/11/14 10:08:10 jca Exp $
 
 # System startup script run by init on autoboot or after single-user.
 # Output and error are redirected to console by init, and the console is the
@@ -163,9 +163,7 @@ make_keys() {
 	    (read sz fp comm type && echo "sshd: $type $fp")
 
 	if [[ ! -f /etc/soii.key ]]; then
-		openssl rand -hex 16 > /etc/soii.key &&
-		    chmod 600 /etc/soii.key && sysctl -q \
-		    "net.inet6.ip6.soiikey=$(</etc/soii.key)"
+		openssl rand -hex 16 > /etc/soii.key && chmod 600 /etc/soii.key
 	fi
 }
 
@@ -297,6 +295,31 @@ run_upgrade_script() {
 	rm -f /etc/rc.$_suffix.run
 }
 
+# If system still has old 16-partition disklabel, create fallback device nodes
+# for the root filesystem to allow repair in a future kernel with 64-partition
+# disklabel.  This is important if root isn't on sd0 or wd0.  When things fail:
+#   fsck /dev/rrootdisk
+#   mount -uw /dev/rootdisk /
+#   cd /dev && ./MAKEDEV redodisks
+rootdisk_nodes() {
+	if [ $(sysctl -n kern.maxpartitions) = 16 ]; then
+		_rootdev=$(mount | grep ' / ' | cut -d' ' -f1)
+		_maj=$(stat -f "%Hr" $_rootdev)
+		_omin=$(stat -f "%Lr" $_rootdev)
+		_min=$((_omin / 16 * 64))
+		if [ -b /dev/rootdisk -a \
+		    "$(stat -qf %Hr,%Lr /dev/rootdisk)" = "$_maj,$_min" ]; then
+			return
+		fi
+		# does not exist or device changed, redo
+		_rrootdev=$(echo $_rootdev | sed -e 's,dev/,dev/r,')
+		_rmaj=$(stat -f "%Hr" $_rrootdev)
+		rm -f /dev/rrootdisk /dev/rootdisk
+		mknod -m 600 /dev/rrootdisk c $_rmaj $_min
+		mknod -m 600 /dev/rootdisk b $_maj $_min
+	fi
+}
+
 # Check filesystems, optionally by using a fsck(8) flag.
 # Usage: do_fsck [-flag]
 do_fsck() {
@@ -422,6 +445,8 @@ ln -fh /bsd /bsd.booted
 
 rm -f /fastboot
 
+rootdisk_nodes
+
 # Set flags on ttys.
 ttyflags -a
 
@@ -517,7 +542,7 @@ dmesg >/var/run/dmesg.boot
 make_keys
 
 echo -n 'starting early daemons:'
-start_daemon syslogd ldattach pflogd nsd unbound ntpd
+start_daemon syslogd ldattach bpflogd pflogd nsd unbound ntpd
 start_daemon iscsid isakmpd iked sasyncd ldapd npppd
 echo '.'
 
@@ -584,6 +609,9 @@ echo clearing /tmp
 # Create Unix sockets directories for X if needed and make sure they have
 # correct permissions.
 [[ -d /usr/X11R6/lib ]] && mkdir -m 1777 /tmp/.{X11,ICE}-unix
+
+# Create parent directory for XDG_RUNTIME_DIR
+mkdir -p -m 755 /tmp/run/user
 
 [[ -f /etc/rc.securelevel ]] && sh /etc/rc.securelevel
 

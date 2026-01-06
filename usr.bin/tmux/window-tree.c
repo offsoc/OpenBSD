@@ -1,4 +1,4 @@
-/* $OpenBSD: window-tree.c,v 1.68 2025/04/22 12:23:26 nicm Exp $ */
+/* $OpenBSD: window-tree.c,v 1.71 2025/10/28 14:21:06 nicm Exp $ */
 
 /*
  * Copyright (c) 2017 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -657,8 +657,10 @@ window_tree_draw_session(struct window_tree_modedata *data, struct session *s,
 		screen_write_preview(ctx, &w->active->base, width, sy);
 
 		xasprintf(&label, " %u:%s ", wl->idx, w->name);
-		if (strlen(label) > width)
+		if (strlen(label) > width) {
+			free(label);
 			xasprintf(&label, " %u ", wl->idx);
+		}
 		window_tree_draw_label(ctx, cx + offset, cy, width, sy, &gc,
 		    label);
 		free(label);
@@ -834,7 +836,8 @@ window_tree_draw(void *modedata, void *itemdata, struct screen_write_ctx *ctx,
 }
 
 static int
-window_tree_search(__unused void *modedata, void *itemdata, const char *ss)
+window_tree_search(__unused void *modedata, void *itemdata, const char *ss,
+    int icase)
 {
 	struct window_tree_itemdata	*item = itemdata;
 	struct session			*s;
@@ -851,18 +854,27 @@ window_tree_search(__unused void *modedata, void *itemdata, const char *ss)
 	case WINDOW_TREE_SESSION:
 		if (s == NULL)
 			return (0);
-		return (strstr(s->name, ss) != NULL);
+		if (icase)
+			return (strcasestr(s->name, ss) != NULL);
+ 		return (strstr(s->name, ss) != NULL);
 	case WINDOW_TREE_WINDOW:
 		if (s == NULL || wl == NULL)
 			return (0);
+		if (icase)
+			return (strcasestr(wl->window->name, ss) != NULL);
 		return (strstr(wl->window->name, ss) != NULL);
 	case WINDOW_TREE_PANE:
 		if (s == NULL || wl == NULL || wp == NULL)
 			break;
 		cmd = get_proc_name(wp->fd, wp->tty);
-		if (cmd == NULL || *cmd == '\0')
+		if (cmd == NULL || *cmd == '\0') {
+			free(cmd);
 			return (0);
-		retval = (strstr(cmd, ss) != NULL);
+		}
+		if (icase)
+			retval = (strcasestr(cmd, ss) != NULL);
+		else
+			retval = (strstr(cmd, ss) != NULL);
 		free(cmd);
 		return (retval);
 	}

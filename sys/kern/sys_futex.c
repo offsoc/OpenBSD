@@ -1,4 +1,4 @@
-/*	$OpenBSD: sys_futex.c,v 1.23 2025/05/07 00:39:09 dlg Exp $ */
+/*	$OpenBSD: sys_futex.c,v 1.26 2025/08/18 03:51:45 dlg Exp $ */
 
 /*
  * Copyright (c) 2016-2017 Martin Pieuchot
@@ -25,7 +25,6 @@
 #include <sys/time.h>
 #include <sys/rwlock.h>
 #include <sys/percpu.h> /* CACHELINESIZE */
-#include <sys/kernel.h> /* tick_nsec */
 #include <sys/futex.h>
 
 #ifdef KTRACE
@@ -66,7 +65,11 @@
  * to the futexes on the list until it clears ft_proc.
  */
 
+struct futex_slpque;
+
 struct futex {
+	struct futex_slpque * volatile
+				 ft_fsq;	/* [f] current futex_slpque */
 	TAILQ_ENTRY(futex)	 ft_entry;	/* [f] entry on futex_slpque */
 
 	struct process		*ft_ps;		/* [I] for private futexes */
@@ -224,7 +227,7 @@ futex_unwait(struct futex_slpque *ofsq, struct futex *f)
 
 	for (;;) {
 		rw_enter_write(&ofsq->fsq_lock);
-		fsq = futex_get_slpque(f);
+		fsq = f->ft_fsq;
 		if (ofsq == fsq)
 			break;
 
@@ -251,13 +254,12 @@ futex_wait(struct proc *p, uint32_t *uaddr, uint32_t val,
 {
 	struct futex f;
 	struct futex_slpque *fsq;
-	uint64_t to_ticks = 0;
+	uint64_t nsecs = INFSLP;
 	uint32_t cval;
 	int error;
 
 	if (timeout != NULL) {
 		struct timespec ts;
-		uint64_t nsecs;
 
 		if ((error = copyin(timeout, &ts, sizeof(ts))))
 			return error;
@@ -268,16 +270,16 @@ futex_wait(struct proc *p, uint32_t *uaddr, uint32_t val,
 		if (ts.tv_sec < 0 || !timespecisvalid(&ts))
 			return EINVAL;
 
-		nsecs = MAX(1, MIN(TIMESPEC_TO_NSEC(&ts), MAXTSLP));
-		to_ticks = (nsecs + tick_nsec - 1) / (tick_nsec + 1) + 1;
-		if (to_ticks > INT_MAX)
-			to_ticks = INT_MAX;
+		nsecs = MIN(TIMESPEC_TO_NSEC(&ts), MAXTSLP);
+		if (nsecs == 0)
+			return ETIMEDOUT;
 	}
 
 	futex_addrs(p, &f, uaddr, flags);
 	fsq = futex_get_slpque(&f);
 
 	/* Mark futex as waiting. */
+	f.ft_fsq = fsq;
 	f.ft_proc = p;
 	rw_enter_write(&fsq->fsq_lock);
 	/* Make the waiting futex visible to wake/requeue */
@@ -301,7 +303,7 @@ futex_wait(struct proc *p, uint32_t *uaddr, uint32_t val,
 	}
 
 	sleep_setup(&f, PWAIT|PCATCH, "fsleep");
-	error = sleep_finish(to_ticks, f.ft_proc != NULL);
+	error = sleep_finish(nsecs, f.ft_proc != NULL);
 	/* Remove ourself if we haven't been awaken. */
 	if (error != 0 || f.ft_proc != NULL) {
 		if (futex_unwait(fsq, &f) == 0)
@@ -418,6 +420,7 @@ futex_requeue(struct proc *p, uint32_t *uaddr, uint32_t n,
 				continue;
 
 			TAILQ_REMOVE(&ofsq->fsq_list, f, ft_entry);
+			f->ft_fsq = nfsq;
 			f->ft_ps = nkey.ft_ps;
 			f->ft_obj = nkey.ft_obj;
 			f->ft_amap = nkey.ft_amap;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: mld6.c,v 1.67 2025/05/27 07:52:49 bluhm Exp $	*/
+/*	$OpenBSD: mld6.c,v 1.72 2026/01/03 14:10:04 bluhm Exp $	*/
 /*	$KAME: mld6.c,v 1.26 2001/02/16 14:50:35 itojun Exp $	*/
 
 /*
@@ -70,11 +70,9 @@
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/protosw.h>
-#include <sys/syslog.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/route.h>
 
 #include <netinet/in.h>
 #include <netinet6/in6_var.h>
@@ -310,7 +308,7 @@ mld6_input(struct mbuf *m, int off)
 		 * If we belong to the group being reported, stop
 		 * our timer for that group.
 		 */
-		IN6_LOOKUP_MULTI(mldh->mld_addr, ifp, in6m);
+		in6m = in6_lookupmulti(&mldh->mld_addr, ifp);
 		if (in6m) {
 			in6m->in6m_timer = 0; /* transit to idle state */
 			in6m->in6m_state = MLD_OTHERLISTENER; /* clear flag */
@@ -341,7 +339,7 @@ mld6_input(struct mbuf *m, int off)
 }
 
 void
-mld6_fasttimeo(void)
+mld6_fasttimo(void)
 {
 	struct ifnet *ifp;
 	int running = 0;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_anon.c,v 1.64 2025/04/27 08:37:47 mpi Exp $	*/
+/*	$OpenBSD: uvm_anon.c,v 1.66 2025/12/15 13:02:18 mpi Exp $	*/
 /*	$NetBSD: uvm_anon.c,v 1.10 2000/11/25 06:27:59 chs Exp $	*/
 
 /*
@@ -79,14 +79,13 @@ uvm_analloc(void)
 }
 
 /*
- * uvm_anfree_list: free a single anon structure
+ * uvm_anfree: free a single anon structure
  *
  * => anon must be removed from the amap (if anon was in an amap).
  * => amap must be locked, if anon was owned by amap.
- * => we may lock the pageq's.
  */
 void
-uvm_anfree_list(struct vm_anon *anon, struct pglist *pgl)
+uvm_anfree(struct vm_anon *anon)
 {
 	struct vm_page *pg = anon->an_page;
 
@@ -109,16 +108,7 @@ uvm_anfree_list(struct vm_anon *anon, struct pglist *pgl)
 			return;
 		}
 		pmap_page_protect(pg, PROT_NONE);
-		if (pgl != NULL) {
-			/*
-			 * clean page, and put it on pglist
-			 * for later freeing.
-			 */
-			uvm_pageclean(pg);
-			TAILQ_INSERT_HEAD(pgl, pg, pageq);
-		} else {
-			uvm_pagefree(pg);	/* bye bye */
-		}
+		uvm_pagefree(pg);
 	} else {
 		if (anon->an_swslot != 0 && anon->an_swslot != SWSLOT_BAD) {
 			/* This page is no longer only in swap. */
@@ -208,9 +198,7 @@ uvm_anon_pagein(struct vm_amap *amap, struct vm_anon *anon)
 	/*
 	 * Deactivate the page (to put it on a page queue).
 	 */
-	uvm_lock_pageq();
 	uvm_pagedeactivate(pg);
-	uvm_unlock_pageq();
 	rw_exit(anon->an_lock);
 
 	return FALSE;

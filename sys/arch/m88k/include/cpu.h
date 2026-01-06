@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.82 2024/10/23 07:41:44 mpi Exp $ */
+/*	$OpenBSD: cpu.h,v 1.84 2025/12/10 19:09:17 miod Exp $ */
 /*
  * Copyright (c) 1996 Nivas Madhur
  * Copyright (c) 1992, 1993
@@ -53,6 +53,12 @@
 	{ "console_device", CTLTYPE_STRUCT }, \
 	{ "cputype", CTLTYPE_INT }, \
 }
+
+/*
+ * Values for the machdep.cputype sysctl.
+ */
+#define CPU_88100	0x00
+#define CPU_88110	0x01
 
 #ifdef _KERNEL
 
@@ -139,8 +145,6 @@ struct cpu_info {
 #define	ci_ipi_arg2	 ci_cpudep1
 #define	ci_h_sxip	 ci_cpudep2		/* trapframe values */
 #define	ci_h_epsr	 ci_cpudep3		/* for hardclock */
-#define	ci_s_sxip	 ci_cpudep4		/* and softclock */
-#define	ci_s_epsr	 ci_cpudep5
 
 	struct schedstate_percpu
 			 ci_schedstate;		/* scheduling state */

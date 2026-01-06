@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip6_mroute.c,v 1.147 2025/05/20 05:50:18 jan Exp $	*/
+/*	$OpenBSD: ip6_mroute.c,v 1.156 2025/11/13 23:30:01 bluhm Exp $	*/
 /*	$NetBSD: ip6_mroute.c,v 1.59 2003/12/10 09:28:38 itojun Exp $	*/
 /*	$KAME: ip6_mroute.c,v 1.45 2001/03/25 08:38:51 itojun Exp $	*/
 
@@ -84,12 +84,9 @@
 #include <sys/param.h>
 #include <sys/malloc.h>
 #include <sys/systm.h>
-#include <sys/timeout.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 #include <sys/protosw.h>
-#include <sys/kernel.h>
 #include <sys/ioctl.h>
 #include <sys/syslog.h>
 #include <sys/sysctl.h>
@@ -107,6 +104,11 @@
 #include <netinet6/ip6_mroute.h>
 #include <netinet/in_pcb.h>
 
+/*
+ * Locks used to protect data:
+ *	I	immutable after creation
+ */
+
 /* #define MCAST_DEBUG */
 
 #ifdef MCAST_DEBUG
@@ -123,7 +125,7 @@ int mcast6_debug = 1;
 #endif
 
 int ip6_mdq(struct mbuf *, struct ifnet *, struct rtentry *, int);
-void phyint_send6(struct ifnet *, struct ip6_hdr *, struct mbuf *, int);
+void phyint_send6(struct ifnet *, struct ip6_hdr *, struct mbuf *, int, int);
 
 /*
  * Globals.  All but ip6_mrouter, ip6_mrtproto and mrt6stat could be static,
@@ -132,7 +134,7 @@ void phyint_send6(struct ifnet *, struct ip6_hdr *, struct mbuf *, int);
 struct socket  *ip6_mrouter[RT_TABLEID_MAX + 1];
 struct rttimer_queue ip6_mrouterq;
 int		ip6_mrouter_ver = 0;
-int		ip6_mrtproto;    /* for netstat only */
+int		ip6_mrtproto;    /* [I] for netstat only */
 struct cpumem *mrt6counters;
 
 int get_sg6_cnt(struct sioc_sg_req6 *, unsigned int);
@@ -302,18 +304,36 @@ get_mif6_cnt(struct sioc_mif_req6 *req, unsigned int rtableid)
 int
 mrt6_sysctl_mif(void *oldp, size_t *oldlenp)
 {
+	TAILQ_HEAD(, ifnet) if_tmplist =
+	    TAILQ_HEAD_INITIALIZER(if_tmplist);
 	struct ifnet *ifp;
 	caddr_t where = oldp;
 	size_t needed, given;
 	struct mif6 *mifp;
 	struct mif6info minfo;
+	int error = 0;
 
 	given = *oldlenp;
 	needed = 0;
 	memset(&minfo, 0, sizeof minfo);
+
+	rw_enter_write(&if_tmplist_lock);
+	NET_LOCK_SHARED();
+
 	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
-		if ((mifp = (struct mif6 *)ifp->if_mcast6) == NULL)
+		if (ifp->if_mcast6 != NULL) {
+			if_ref(ifp);
+			TAILQ_INSERT_TAIL(&if_tmplist, ifp, if_tmplist);
+		}
+	}
+	NET_UNLOCK_SHARED();
+
+	TAILQ_FOREACH (ifp, &if_tmplist, if_tmplist) {
+		NET_LOCK_SHARED();
+		if ((mifp = (struct mif6 *)ifp->if_mcast6) == NULL) {
+			NET_UNLOCK_SHARED();
 			continue;
+		}
 
 		minfo.m6_mifi = mifp->m6_mifi;
 		minfo.m6_flags = mifp->m6_flags;
@@ -324,17 +344,27 @@ mrt6_sysctl_mif(void *oldp, size_t *oldlenp)
 		minfo.m6_bytes_in = mifp->m6_bytes_in;
 		minfo.m6_bytes_out = mifp->m6_bytes_out;
 		minfo.m6_rate_limit = mifp->m6_rate_limit;
+		NET_UNLOCK_SHARED();
 
 		needed += sizeof(minfo);
 		if (where && needed <= given) {
-			int error;
-
 			error = copyout(&minfo, where, sizeof(minfo));
 			if (error)
-				return (error);
+				break;
 			where += sizeof(minfo);
 		}
 	}
+
+	while ((ifp = TAILQ_FIRST(&if_tmplist))) {
+		TAILQ_REMOVE(&if_tmplist, ifp, if_tmplist);
+		if_put(ifp);
+	}
+
+	rw_exit_write(&if_tmplist_lock);
+
+	if (error)
+		return (error);
+
 	if (where) {
 		*oldlenp = needed;
 		if (given < needed)
@@ -467,10 +497,12 @@ mrt6_sysctl_mfc(void *oldp, size_t *oldlenp)
 		msa.ms6a_len = *oldlenp;
 	}
 
+	NET_LOCK();
 	for (rtableid = 0; rtableid <= RT_TABLEID_MAX; rtableid++) {
 		rtable_walk(rtableid, AF_INET6, NULL, mrt6_rtwalk_mf6csysctl,
 		    &msa);
 	}
+	NET_UNLOCK();
 
 	if (msa.ms6a_minfos != NULL && msa.ms6a_needed > 0 &&
 	    (error = copyout(msa.ms6a_minfos, oldp, msa.ms6a_needed)) != 0) {
@@ -919,17 +951,6 @@ ip6_mforward(struct ip6_hdr *ip6, struct ifnet *ifp, struct mbuf *m, int flags)
 	 */
 	if (IN6_IS_ADDR_UNSPECIFIED(&ip6->ip6_src)) {
 		ip6stat_inc(ip6s_cantforward);
-		if (ip6_log_time + ip6_log_interval < getuptime()) {
-			char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
-
-			ip6_log_time = getuptime();
-
-			inet_ntop(AF_INET6, &ip6->ip6_src, src, sizeof(src));
-			inet_ntop(AF_INET6, &ip6->ip6_dst, dst, sizeof(dst));
-			log(LOG_DEBUG, "cannot forward "
-			    "from %s to %s nxt %d received on interface %u\n",
-			    src, dst, ip6->ip6_nxt, m->m_pkthdr.ph_ifidx);
-		}
 		return 0;
 	}
 
@@ -1043,7 +1064,7 @@ ip6_mdq(struct mbuf *m, struct ifnet *ifp, struct rtentry *rt, int flags)
 	struct mif6 *m6, *mifp = (struct mif6 *)ifp->if_mcast6;
 	struct mf6c *mf6c = (struct mf6c *)rt->rt_llinfo;
 	struct ifnet *ifn;
-	int plen = m->m_pkthdr.len;
+	int plen = m->m_pkthdr.len, ip6_mcast_pmtu_local;
 
 	if (mifp == NULL || mf6c == NULL) {
 		rtfree(rt);
@@ -1076,6 +1097,8 @@ ip6_mdq(struct mbuf *m, struct ifnet *ifp, struct rtentry *rt, int flags)
 	 * For each mif, forward a copy of the packet if there are group
 	 * members downstream on the interface.
 	 */
+	ip6_mcast_pmtu_local = atomic_load_int(&ip6_mcast_pmtu);
+
 	do {
 		/* Don't consider non multicast routes. */
 		if (ISSET(rt->rt_flags, RTF_HOST | RTF_MULTICAST) !=
@@ -1125,7 +1148,7 @@ ip6_mdq(struct mbuf *m, struct ifnet *ifp, struct rtentry *rt, int flags)
 		m6->m6_pkt_out++;
 		m6->m6_bytes_out += plen;
 
-		phyint_send6(ifn, ip6, m, flags);
+		phyint_send6(ifn, ip6, m, flags, ip6_mcast_pmtu_local);
 		if_put(ifn);
 	} while ((rt = rtable_iterate(rt)) != NULL);
 
@@ -1133,7 +1156,8 @@ ip6_mdq(struct mbuf *m, struct ifnet *ifp, struct rtentry *rt, int flags)
 }
 
 void
-phyint_send6(struct ifnet *ifp, struct ip6_hdr *ip6, struct mbuf *m, int flags)
+phyint_send6(struct ifnet *ifp, struct ip6_hdr *ip6, struct mbuf *m,
+    int flags, int mcast_pmtu)
 {
 	struct mbuf *mb_copy;
 	struct sockaddr_in6 *dst6, sin6;
@@ -1193,7 +1217,7 @@ phyint_send6(struct ifnet *ifp, struct ip6_hdr *ip6, struct mbuf *m, int flags)
 		dst6->sin6_addr = ip6->ip6_dst;
 		error = ifp->if_output(ifp, mb_copy, sin6tosa(dst6), NULL);
 	} else {
-		if (ip6_mcast_pmtu)
+		if (mcast_pmtu)
 			icmp6_error(mb_copy, ICMP6_PACKET_TOO_BIG, 0,
 			    ifp->if_mtu);
 		else {
@@ -1207,6 +1231,8 @@ mrt6_iflookupbymif(mifi_t mifi, unsigned int rtableid)
 {
 	struct mif6	*m6;
 	struct ifnet	*ifp;
+
+	NET_ASSERT_LOCKED();
 
 	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
 		if (ifp->if_rdomain != rtableid)

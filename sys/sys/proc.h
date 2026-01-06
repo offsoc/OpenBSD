@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.h,v 1.391 2025/05/31 12:40:33 dlg Exp $	*/
+/*	$OpenBSD: proc.h,v 1.397 2025/08/18 04:15:35 dlg Exp $	*/
 /*	$NetBSD: proc.h,v 1.44 1996/04/22 01:23:21 christos Exp $	*/
 
 /*-
@@ -127,8 +127,6 @@ struct tusage {
  */
 #ifdef __need_process
 struct proc;
-struct tslpentry;
-TAILQ_HEAD(tslpqueue, tslpentry);
 struct unveil;
 
 struct pinsyscall {
@@ -186,7 +184,6 @@ struct process {
 	struct	vmspace *ps_vmspace;	/* Address space */
 	pid_t	ps_pid;			/* [I] Process identifier. */
 
-	struct	tslpqueue ps_tslpqueue;	/* [p] queue of threads in thrsleep */
 	struct	rwlock	ps_lock;	/* per-process rwlock */
 	struct  mutex	ps_mtx;		/* per-process mutex */
 
@@ -246,6 +243,12 @@ struct process {
 	vaddr_t ps_sigcoderet;		/* [I] User ptr to sigreturn retPC */
 	u_long	ps_sigcookie;		/* [I] */
 	u_int	ps_rtableid;		/* [a] Process routing table/domain. */
+	u_short	ps_iflags;		/* [I] flags set at exec time */
+# define	PSI_WXNEEDED	0x0001	/* Process allowed to violate W^X */
+# define	PSI_NOBTCFI	0x0002	/* No Branch Target CFI */
+# define	PSI_PROFILE	0x0004	/* linked with -pg: allow profile(2) */
+# define	PSI_BITS \
+    ("\20" "\001WXNEEDED" "\002NOBTCFI" "\003PROFILE" )
 	char	ps_nice;		/* Process "nice" value. */
 
 	struct uprof {			/* profile arguments */
@@ -287,6 +290,9 @@ struct process {
 
 /*
  * These flags are kept in ps_flags.
+ *
+ * When adding a new flag, carefully consider whether it should be 
+ * added to PS_FLAGS_INHERITED_ON_FORK.
  */
 #define	PS_CONTROLT	0x00000001	/* Has a controlling terminal. */
 #define	PS_EXEC		0x00000002	/* Process called exec. */
@@ -309,13 +315,13 @@ struct process {
 #define	PS_ZOMBIE	0x00040000	/* Dead and ready to be waited for */
 #define	PS_NOBROADCASTKILL 0x00080000	/* Process excluded from kill -1. */
 #define	PS_PLEDGE	0x00100000	/* Has called pledge(2) */
-#define	PS_WXNEEDED	0x00200000	/* Process allowed to violate W^X */
+#define	PS_avail2	0x00200000
 #define	PS_EXECPLEDGE	0x00400000	/* Has exec pledges */
 #define	PS_ORPHAN	0x00800000	/* Process is on an orphan list */
 #define	PS_CHROOT	0x01000000	/* Process is chrooted */
-#define	PS_NOBTCFI	0x02000000	/* No Branch Target CFI */
+#define	PS_avail1	0x02000000
 #define	PS_ITIMER	0x04000000	/* Virtual interval timers running */
-#define	PS_PROFILE	0x08000000	/* linked with -pg: allow profile(2) */
+#define	PS_avail0	0x08000000
 #define	PS_WAITEVENT	0x10000000	/* wait(2) event pending */
 #define	PS_CONTINUED	0x20000000	/* Continued proc not yet waited for */
 #define	PS_STOPPED	0x40000000	/* Stopped process */
@@ -326,9 +332,12 @@ struct process {
      "\06SUGIDEXEC" "\07PPWAIT" "\010ISPWAIT" "\011PROFIL" "\012TRACED" \
      "\013WAITED" "\014COREDUMP" "\015SINGLEEXIT" "\016SINGLEUNWIND" \
      "\017NOZOMBIE" "\020STOPPING" "\021SYSTEM" "\022EMBRYO" "\023ZOMBIE" \
-     "\024NOBROADCASTKILL" "\025PLEDGE" "\026WXNEEDED" "\027EXECPLEDGE" \
-     "\030ORPHAN" "\031CHROOT" "\032NOBTCFI" "\033ITIMER" "\035WAITEVENT" \
-     "\036CONTINUED" "\037STOPPED" "\040TRAPPED")
+     "\024NOBROADCASTKILL" "\025PLEDGE" "\027EXECPLEDGE" \
+     "\030ORPHAN" "\031CHROOT" "\033ITIMER" \
+     "\035WAITEVENT" "\036CONTINUED" "\037STOPPED" "\040TRAPPED")
+
+#define PS_FLAGS_INHERITED_ON_FORK \
+    (PS_SUGID | PS_SUGIDEXEC | PS_PLEDGE | PS_EXECPLEDGE | PS_CHROOT)
 
 struct kcov_dev;
 struct lock_list_entry;
@@ -375,11 +384,12 @@ struct proc {
 	int	p_dupfd;	 /* Sideways return value from filedescopen. XXX */
 
 	/* scheduling */
-	int	p_cpticks;	 /* Ticks of cpu time. */
+	unsigned int	p_cpticks; 	/* [o] Ticks of cpu time. */
+	unsigned int	p_cpticks2; 	/* [K] last times ticks */
 	const volatile void *p_wchan;	/* [S] Sleep address. */
 	struct	timeout p_sleep_to;/* timeout for tsleep() */
 	const char *p_wmesg;		/* [S] Reason for sleep. */
-	fixpt_t	p_pctcpu;		/* [S] %cpu for this thread */
+	volatile fixpt_t p_pctcpu;	/* [a] %cpu for this thread */
 	u_int	p_slptime;		/* [S] Time since last blocked. */
 	struct	cpu_info * volatile p_cpu; /* [S] CPU we're running on. */
 

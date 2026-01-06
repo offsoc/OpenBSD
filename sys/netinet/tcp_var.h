@@ -1,4 +1,4 @@
-/*	$OpenBSD: tcp_var.h,v 1.191 2025/05/07 14:10:19 bluhm Exp $	*/
+/*	$OpenBSD: tcp_var.h,v 1.196 2025/09/16 17:29:35 bluhm Exp $	*/
 /*	$NetBSD: tcp_var.h,v 1.17 1996/02/13 23:44:24 christos Exp $	*/
 
 /*
@@ -70,7 +70,6 @@ struct tcpqent {
 struct tcpcb {
 	struct tcpqehead t_segq;		/* sequencing queue */
 	struct timeout t_timer[TCPT_NTIMERS];	/* tcp timers */
-	struct timeout t_timer_reaper;	/* reaper is special, no refcnt */
 	short	t_state;		/* state of this connection */
 	short	t_rxtshift;		/* log(2) of rexmt exp. backoff */
 	int	t_rxtcur;		/* current retransmit value */
@@ -97,7 +96,6 @@ struct tcpcb {
 #define TF_LASTIDLE	0x00100000U	/* no outstanding ACK on last send */
 #define TF_PMTUD_PEND	0x00400000U	/* Path MTU Discovery pending */
 #define TF_NEEDOUTPUT	0x00800000U	/* call tcp_output after tcp_input */
-#define TF_BLOCKOUTPUT	0x01000000U	/* avert tcp_output during tcp_input */
 #define TF_NOPUSH	0x02000000U	/* don't push */
 #define TF_TMR_REXMT	0x04000000U	/* retransmit timer armed */
 #define TF_TMR_PERSIST	0x08000000U	/* retransmit persistence timer armed */
@@ -393,6 +391,7 @@ struct	tcpstat {
 
 	u_int32_t tcps_pcbhashmiss;	/* input packets missing pcb hash */
 	u_int32_t tcps_noport;		/* no socket on port */
+	u_int32_t tcps_closing;		/* inpcb exists, socket is closing */
 	u_int32_t tcps_badsyn;		/* SYN packet with src==dst rcv'ed */
 	u_int32_t tcps_dropsyn;		/* SYN packet dropped */
 
@@ -583,6 +582,7 @@ enum tcpstat_counters {
 	tcps_preddat,
 	tcps_pcbhashmiss,
 	tcps_noport,
+	tcps_closing,
 	tcps_badsyn,
 	tcps_dropsyn,
 	tcps_rcvbadsig,
@@ -641,20 +641,26 @@ extern struct cpumem *tcpcounters;
 static inline void
 tcpstat_inc(enum tcpstat_counters c)
 {
+	int s = splnet();
 	counters_inc(tcpcounters, c);
+	splx(s);
 }
 
 static inline void
 tcpstat_add(enum tcpstat_counters c, uint64_t v)
 {
+	int s = splnet();
 	counters_add(tcpcounters, c, v);
+	splx(s);
 }
 
 static inline void
 tcpstat_pkt(enum tcpstat_counters pcounter, enum tcpstat_counters bcounter,
     uint64_t v)
 {
+	int s = splnet();
 	counters_pkt(tcpcounters, pcounter, bcounter, v);
+	splx(s);
 }
 
 extern uint64_t tcp_starttime;
@@ -789,7 +795,7 @@ int	tcp_signature_apply(caddr_t, caddr_t, unsigned int);
 int	tcp_signature(struct tdb *, int, struct mbuf *, struct tcphdr *,
 	    int, int, char *);
 #endif /* TCP_SIGNATURE */
-void     tcp_set_iss_tsm(struct tcpcb *);
+void	 tcp_set_iss_tsm(struct tcpcb *);
 
 void	 syn_cache_unreach(const struct sockaddr *, const struct sockaddr *,
 	   struct tcphdr *, u_int);

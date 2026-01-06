@@ -1,4 +1,4 @@
-/* $OpenBSD: job.c,v 1.71 2025/05/12 10:16:42 nicm Exp $ */
+/* $OpenBSD: job.c,v 1.74 2025/09/08 11:21:56 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -52,7 +52,7 @@ struct job {
 
 	char			*cmd;
 	pid_t			 pid;
-	char		         tty[TTY_NAME_MAX];
+	char			 tty[TTY_NAME_MAX];
 	int			 status;
 
 	int			 fd;
@@ -141,10 +141,16 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 		proc_clear_signals(server_proc, 1);
 		sigprocmask(SIG_SETMASK, &oldset, NULL);
 
-		if ((cwd == NULL || chdir(cwd) != 0) &&
-		    ((home = find_home()) == NULL || chdir(home) != 0) &&
-		    chdir("/") != 0)
-			fatal("chdir failed");
+		if (cwd != NULL) {
+			if (chdir(cwd) == 0)
+				environ_set(env, "PWD", 0, "%s", cwd);
+			else if ((home = find_home()) != NULL && chdir(home) == 0)
+				environ_set(env, "PWD", 0, "%s", home);
+			else if (chdir("/") == 0)
+				environ_set(env, "PWD", 0, "/");
+			else
+				fatal("chdir failed");
+		}
 
 		environ_push(env);
 		environ_free(env);
@@ -176,7 +182,8 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 		closefrom(STDERR_FILENO + 1);
 
 		if (cmd != NULL) {
-			setenv("SHELL", shell, 1);
+			if (flags & JOB_DEFAULTSHELL)
+				setenv("SHELL", shell, 1);
 			execl(shell, argv0, "-c", cmd, (char *)NULL);
 			fatal("execl failed");
 		} else {

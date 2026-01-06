@@ -1,10 +1,13 @@
-/* $OpenBSD: modes_local.h,v 1.6 2025/05/18 09:05:59 jsing Exp $ */
+/* $OpenBSD: modes_local.h,v 1.8 2025/11/26 10:19:57 tb Exp $ */
 /* ====================================================================
  * Copyright (c) 2010 The OpenSSL Project.  All rights reserved.
  *
  * Redistribution and use is governed by OpenSSL license.
  * ====================================================================
  */
+
+#ifndef HEADER_MODES_LOCAL_H
+#define HEADER_MODES_LOCAL_H
 
 #include <endian.h>
 
@@ -46,7 +49,7 @@ struct gcm128_context {
 };
 
 struct xts128_context {
-	void      *key1, *key2;
+	const void *key1, *key2;
 	block128_f block1, block2;
 };
 
@@ -61,3 +64,5 @@ struct ccm128_context {
 };
 
 __END_HIDDEN_DECLS
+
+#endif /* HEADER_MODES_LOCAL_H */

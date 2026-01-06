@@ -1,4 +1,4 @@
-/* $OpenBSD: aes.c,v 1.8 2025/05/25 06:27:02 jsing Exp $ */
+/* $OpenBSD: aes.c,v 1.17 2025/09/15 07:36:12 tb Exp $ */
 /* ====================================================================
  * Copyright (c) 2002-2006 The OpenSSL Project.  All rights reserved.
  *
@@ -56,6 +56,8 @@
 #include <openssl/modes.h>
 
 #include "crypto_arch.h"
+#include "crypto_internal.h"
+#include "modes_local.h"
 
 static const unsigned char aes_wrap_default_iv[] = {
 	0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6,
@@ -70,9 +72,30 @@ void aes_encrypt_internal(const unsigned char *in, unsigned char *out,
 void aes_decrypt_internal(const unsigned char *in, unsigned char *out,
     const AES_KEY *key);
 
+static int
+aes_rounds_for_key_length(int bits)
+{
+	if (bits == 128)
+		return 10;
+	if (bits == 192)
+		return 12;
+	if (bits == 256)
+		return 14;
+
+	return 0;
+}
+
 int
 AES_set_encrypt_key(const unsigned char *userKey, const int bits, AES_KEY *key)
 {
+	if (userKey == NULL || key == NULL)
+		return -1;
+
+	explicit_bzero(key->rd_key, sizeof(key->rd_key));
+
+	if ((key->rounds = aes_rounds_for_key_length(bits)) <= 0)
+		return -2;
+
 	return aes_set_encrypt_key_internal(userKey, bits, key);
 }
 LCRYPTO_ALIAS(AES_set_encrypt_key);
@@ -80,6 +103,14 @@ LCRYPTO_ALIAS(AES_set_encrypt_key);
 int
 AES_set_decrypt_key(const unsigned char *userKey, const int bits, AES_KEY *key)
 {
+	if (userKey == NULL || key == NULL)
+		return -1;
+
+	explicit_bzero(key->rd_key, sizeof(key->rd_key));
+
+	if ((key->rounds = aes_rounds_for_key_length(bits)) <= 0)
+		return -2;
+
 	return aes_set_decrypt_key_internal(userKey, bits, key);
 }
 LCRYPTO_ALIAS(AES_set_decrypt_key);
@@ -171,12 +202,129 @@ AES_cfb8_encrypt(const unsigned char *in, unsigned char *out, size_t length,
 LCRYPTO_ALIAS(AES_cfb8_encrypt);
 
 void
+aes_ccm64_encrypt_generic(const unsigned char *in, unsigned char *out,
+    size_t blocks, const void *key, const unsigned char ivec[16],
+    unsigned char cmac[16], int encrypt)
+{
+	uint8_t iv[AES_BLOCK_SIZE], buf[AES_BLOCK_SIZE];
+	uint8_t in_mask;
+	uint64_t ctr;
+	int i;
+
+	in_mask = 0 - (encrypt != 0);
+
+	memcpy(iv, ivec, sizeof(iv));
+
+	ctr = crypto_load_be64toh(&iv[8]);
+
+	while (blocks > 0) {
+		crypto_store_htobe64(&iv[8], ctr);
+		aes_encrypt_internal(iv, buf, key);
+		ctr++;
+
+		for (i = 0; i < 16; i++) {
+			out[i] = in[i] ^ buf[i];
+			cmac[i] ^= (in[i] & in_mask) | (out[i] & ~in_mask);
+		}
+
+		aes_encrypt_internal(cmac, cmac, key);
+
+		in += 16;
+		out += 16;
+		blocks--;
+	}
+
+	explicit_bzero(buf, sizeof(buf));
+	explicit_bzero(iv, sizeof(iv));
+}
+
+#ifdef HAVE_AES_CCM64_ENCRYPT_INTERNAL
+void aes_ccm64_encrypt_internal(const unsigned char *in, unsigned char *out,
+    size_t blocks, const void *key, const unsigned char ivec[16],
+    unsigned char cmac[16], int encrypt);
+
+#else
+static inline void
+aes_ccm64_encrypt_internal(const unsigned char *in, unsigned char *out,
+    size_t blocks, const void *key, const unsigned char ivec[16],
+    unsigned char cmac[16], int encrypt)
+{
+	aes_ccm64_encrypt_generic(in, out, blocks, key, ivec, cmac, encrypt);
+}
+#endif
+
+void
+aes_ccm64_encrypt_ccm128f(const unsigned char *in, unsigned char *out,
+    size_t blocks, const void *key, const unsigned char ivec[16],
+    unsigned char cmac[16])
+{
+	aes_ccm64_encrypt_internal(in, out, blocks, key, ivec, cmac, 1);
+}
+
+void
+aes_ccm64_decrypt_ccm128f(const unsigned char *in, unsigned char *out,
+    size_t blocks, const void *key, const unsigned char ivec[16],
+    unsigned char cmac[16])
+{
+	aes_ccm64_encrypt_internal(in, out, blocks, key, ivec, cmac, 0);
+}
+
+void
+aes_ctr32_encrypt_generic(const unsigned char *in, unsigned char *out,
+    size_t blocks, const AES_KEY *key, const unsigned char ivec[AES_BLOCK_SIZE])
+{
+	uint8_t iv[AES_BLOCK_SIZE], buf[AES_BLOCK_SIZE];
+	uint32_t ctr;
+	int i;
+
+	memcpy(iv, ivec, sizeof(iv));
+
+	ctr = crypto_load_be32toh(&iv[12]);
+
+	while (blocks > 0) {
+		crypto_store_htobe32(&iv[12], ctr);
+		aes_encrypt_internal(iv, buf, key);
+		ctr++;
+
+		for (i = 0; i < AES_BLOCK_SIZE; i++)
+			out[i] = in[i] ^ buf[i];
+
+		in += 16;
+		out += 16;
+		blocks--;
+	}
+
+	explicit_bzero(buf, sizeof(buf));
+	explicit_bzero(iv, sizeof(iv));
+}
+
+#ifdef HAVE_AES_CTR32_ENCRYPT_INTERNAL
+void aes_ctr32_encrypt_internal(const unsigned char *in, unsigned char *out,
+    size_t blocks, const AES_KEY *key, const unsigned char ivec[AES_BLOCK_SIZE]);
+
+#else
+static inline void
+aes_ctr32_encrypt_internal(const unsigned char *in, unsigned char *out,
+    size_t blocks, const AES_KEY *key, const unsigned char ivec[AES_BLOCK_SIZE])
+{
+	aes_ctr32_encrypt_generic(in, out, blocks, key, ivec);
+}
+#endif
+
+void
+aes_ctr32_encrypt_ctr128f(const unsigned char *in, unsigned char *out, size_t blocks,
+    const void *key, const unsigned char ivec[AES_BLOCK_SIZE])
+{
+	aes_ctr32_encrypt_internal(in, out, blocks, key, ivec);
+}
+
+void
 AES_ctr128_encrypt(const unsigned char *in, unsigned char *out,
     size_t length, const AES_KEY *key, unsigned char ivec[AES_BLOCK_SIZE],
     unsigned char ecount_buf[AES_BLOCK_SIZE], unsigned int *num)
 {
-	CRYPTO_ctr128_encrypt(in, out, length, key, ivec, ecount_buf, num,
-	    aes_encrypt_block128);
+	CRYPTO_ctr128_encrypt_ctr32(in, out, length, key, ivec, ecount_buf,
+	    num, aes_ctr32_encrypt_ctr128f);
 }
 LCRYPTO_ALIAS(AES_ctr128_encrypt);
 
@@ -191,6 +339,7 @@ AES_ecb_encrypt(const unsigned char *in, unsigned char *out,
 }
 LCRYPTO_ALIAS(AES_ecb_encrypt);
 
+#ifndef HAVE_AES_ECB_ENCRYPT_INTERNAL
 void
 aes_ecb_encrypt_internal(const unsigned char *in, unsigned char *out,
     size_t len, const AES_KEY *key, int encrypt)
@@ -202,6 +351,7 @@ aes_ecb_encrypt_internal(const unsigned char *in, unsigned char *out,
 		len -= AES_BLOCK_SIZE;
 	}
 }
+#endif
 
 #define N_WORDS (AES_BLOCK_SIZE / sizeof(unsigned long))
 typedef struct {
@@ -275,6 +425,35 @@ AES_ofb128_encrypt(const unsigned char *in, unsigned char *out, size_t length,
 }
 LCRYPTO_ALIAS(AES_ofb128_encrypt);
 
+void
+aes_xts_encrypt_generic(const unsigned char *in, unsigned char *out, size_t len,
+    const AES_KEY *key1, const AES_KEY *key2, const unsigned char iv[16],
+    int encrypt)
+{
+	XTS128_CONTEXT xctx;
+
+	if (encrypt)
+		xctx.block1 = aes_encrypt_block128;
+	else 
+		xctx.block1 = aes_decrypt_block128;
+
+	xctx.block2 = aes_encrypt_block128;
+	xctx.key1 = key1;
+	xctx.key2 = key2;
+
+	CRYPTO_xts128_encrypt(&xctx, iv, in, out, len, encrypt);
+}
+
+#ifndef HAVE_AES_XTS_ENCRYPT_INTERNAL
+void
+aes_xts_encrypt_internal(const unsigned char *in, unsigned char *out, size_t len,
+    const AES_KEY *key1, const AES_KEY *key2, const unsigned char iv[16],
+    int encrypt)
+{
+	aes_xts_encrypt_generic(in, out, len, key1, key2, iv, encrypt);
+}
+#endif
+
 int
 AES_wrap_key(AES_KEY *key, const unsigned char *iv, unsigned char *out,
     const unsigned char *in, unsigned int inlen)
@@ -341,7 +520,7 @@ AES_unwrap_key(AES_KEY *key, const unsigned char *iv, unsigned char *out,
 	}
 	if (!iv)
 		iv = aes_wrap_default_iv;
-	if (memcmp(A, iv, 8)) {
+	if (timingsafe_memcmp(A, iv, 8) != 0) {
 		explicit_bzero(out, inlen);
 		return 0;
 	}

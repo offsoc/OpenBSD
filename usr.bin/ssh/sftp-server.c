@@ -1,4 +1,4 @@
-/* $OpenBSD: sftp-server.c,v 1.148 2024/04/30 06:23:51 djm Exp $ */
+/* $OpenBSD: sftp-server.c,v 1.150 2025/12/08 00:41:46 djm Exp $ */
 /*
  * Copyright (c) 2000-2004 Markus Friedl.  All rights reserved.
  *
@@ -1587,7 +1587,7 @@ process_extended_copy_data(u_int32_t id)
 	    (r = sshbuf_get_u64(iqueue, &read_len)) != 0 ||
 	    (r = get_handle(iqueue, &write_handle)) != 0 ||
 	    (r = sshbuf_get_u64(iqueue, &write_off)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
 
 	debug("request %u: copy-data from \"%s\" (handle %d) off %llu len %llu "
 	    "to \"%s\" (handle %d) off %llu",
@@ -1615,14 +1615,14 @@ process_extended_copy_data(u_int32_t id)
 
 	if (lseek(read_fd, read_off, SEEK_SET) < 0) {
 		status = errno_to_portable(errno);
-		error("%s: read_seek failed", __func__);
+		error_f("read_seek failed");
 		goto out;
 	}
 
 	if ((handle_to_flags(write_handle) & O_APPEND) == 0 &&
 	    lseek(write_fd, write_off, SEEK_SET) < 0) {
 		status = errno_to_portable(errno);
-		error("%s: write_seek failed", __func__);
+		error_f("write_seek failed");
 		goto out;
 	}
 
@@ -1637,7 +1637,7 @@ process_extended_copy_data(u_int32_t id)
 			break;
 		} else if (ret == 0) {
 			status = errno_to_portable(errno);
-			error("%s: read failed: %s", __func__, strerror(errno));
+			error_f("read failed: %s", strerror(errno));
 			break;
 		}
 		len = ret;
@@ -1725,7 +1725,7 @@ process_extended_get_users_groups_by_id(u_int32_t id)
 		debug3_f("gid %u => \"%s\"", n, name);
 		if ((r = sshbuf_put_cstring(groupnames, name)) != 0)
 			fatal_fr(r, "assemble gid reply");
-		nusers++;
+		ngroups++;
 	}
 	verbose("users-groups-by-id: %u users, %u groups", nusers, ngroups);
 

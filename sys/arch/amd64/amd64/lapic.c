@@ -1,4 +1,4 @@
-/*	$OpenBSD: lapic.c,v 1.74 2024/11/07 17:24:42 bluhm Exp $	*/
+/*	$OpenBSD: lapic.c,v 1.77 2025/12/30 15:21:05 kettenis Exp $	*/
 /* $NetBSD: lapic.c,v 1.2 2003/05/08 01:04:35 fvdl Exp $ */
 
 /*-
@@ -179,10 +179,8 @@ lapic_map(paddr_t lapic_base)
 	vaddr_t va;
 	u_int64_t msr;
 	u_long s;
-	int tpr;
 
 	s = intr_disable();
-	tpr = lapic_tpr;
 
 	msr = rdmsr(MSR_APICBASE);
 
@@ -210,7 +208,6 @@ lapic_map(paddr_t lapic_base)
 		x2apic_enabled = 1;
 		codepatch_call(CPTAG_EOI, &x2apic_eoi);
 
-		lapic_writereg(LAPIC_TPRI, tpr);
 		va = (vaddr_t)&local_apic;
 	} else {
 		/*
@@ -225,8 +222,6 @@ lapic_map(paddr_t lapic_base)
 		pte = kvtopte(va);
 		*pte = lapic_base | PG_RW | PG_V | PG_N | PG_G | pg_nx;
 		invlpg(va);
-
-		lapic_tpr = tpr;
 	}
 
 	/*
@@ -369,8 +364,6 @@ lapic_boot_init(paddr_t lapic_base)
 		idt_vec_set(LAPIC_IPI_INVLPG, Xipi_invlpg_pcid);
 		idt_vec_set(LAPIC_IPI_INVLRANGE, Xipi_invlrange_pcid);
 	}
-	idt_allocmap[LAPIC_IPI_WBINVD] = 1;
-	idt_vec_set(LAPIC_IPI_WBINVD, Xipi_wbinvd);
 #if NVMM > 0
 	idt_allocmap[LAPIC_IPI_INVEPT] = 1;
 	idt_vec_set(LAPIC_IPI_INVEPT, Xipi_invept);
@@ -698,6 +691,7 @@ x2apic_ipi(int vec, int target, int dl)
 
 	lo = (target & LAPIC_DEST_MASK) | vec | dl | LAPIC_LVL_ASSERT;
 
+	__asm volatile("mfence; lfence" ::: "memory");
 	x2apic_writeicr(hi, lo);
 }
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: bn_mont.c,v 1.68 2025/05/25 05:12:05 jsing Exp $ */
+/* $OpenBSD: bn_mont.c,v 1.70 2025/08/30 07:54:27 jsing Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -116,6 +116,7 @@
  * sections 3.8 and 4.2 in http://security.ece.orst.edu/koc/papers/r01rsasw.pdf
  */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -214,7 +215,7 @@ BN_MONT_CTX_set(BN_MONT_CTX *mont, const BIGNUM *mod, BN_CTX *ctx)
 		 goto err;
 	mont->N.neg = 0;
 	mont->ri = ((BN_num_bits(mod) + BN_BITS2 - 1) / BN_BITS2) * BN_BITS2;
-	if (mont->ri * 2 < mont->ri)
+	if (mont->ri > INT_MAX / 2)
 		goto err;
 
 	/*
@@ -331,7 +332,7 @@ bn_montgomery_reduce_words(BN_ULONG *r, BN_ULONG *a, const BN_ULONG *n,
 
 	/* Add multiples of the modulus, so that it becomes divisible by R. */
 	for (i = 0; i < n_len; i++) {
-		v = bn_mul_add_words(&a[i], n, n_len, a[i] * n0);
+		v = bn_mulw_add_words(&a[i], n, n_len, a[i] * n0);
 		bn_addw_addw(v, a[i + n_len], carry, &carry, &a[i + n_len]);
 	}
 

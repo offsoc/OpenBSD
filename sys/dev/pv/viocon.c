@@ -1,4 +1,4 @@
-/*	$OpenBSD: viocon.c,v 1.17 2025/01/16 10:33:27 sf Exp $	*/
+/*	$OpenBSD: viocon.c,v 1.19 2025/11/03 09:36:39 jan Exp $	*/
 
 /*
  * Copyright (c) 2013-2015 Stefan Fritsch <sf@sfritsch.de>
@@ -144,7 +144,7 @@ const struct cfattach viocon_ca = {
 };
 
 struct cfdriver viocon_cd = {
-	NULL, "viocon", DV_TTY
+	NULL, "viocon", DV_TTY, CD_COCOVM
 };
 
 static inline struct viocon_softc *
@@ -173,6 +173,7 @@ viocon_attach(struct device *parent, struct device *self, void *aux)
 {
 	struct viocon_softc *sc = (struct viocon_softc *)self;
 	struct virtio_softc *vsc = (struct virtio_softc *)parent;
+	struct virtio_attach_args *va = aux;
 	int maxports = 1;
 
 	if (vsc->sc_child)

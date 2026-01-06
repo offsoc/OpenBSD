@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_pmemrange.c,v 1.77 2025/02/19 11:10:54 mpi Exp $	*/
+/*	$OpenBSD: uvm_pmemrange.c,v 1.80 2026/01/05 20:57:30 beck Exp $	*/
 
 /*
  * Copyright (c) 2024 Martin Pieuchot <mpi@openbsd.org>
@@ -1186,7 +1186,11 @@ fail:
 
 		if (!(nowait_pma.pm_flags & UVM_PMA_LINKED)) {
 			nowait_pma.pm_flags = UVM_PMA_LINKED;
-			TAILQ_INSERT_TAIL(&uvm.pmr_control.allocs, pma, pmq);
+			/*
+			 * Ensure this is processed first by the page daemon
+			 * to avoid starvation behind non-constrained requests.
+			 */
+			TAILQ_INSERT_HEAD(&uvm.pmr_control.allocs, pma, pmq);
 			wakeup(&uvm.pagedaemon);
 		}
 	}
@@ -2239,7 +2243,7 @@ uvm_pmr_cache_alloc(struct uvm_pmr_cache_item *upci)
 	int flags = UVM_PLA_NOWAIT|UVM_PLA_NOWAKE;
 	int npages = UVM_PMR_CACHEMAGSZ;
 
-	splassert(IPL_VM);
+	splassert(IPL_BIO);
 	KASSERT(upci->upci_npages == 0);
 
 	TAILQ_INIT(&pgl);
@@ -2264,7 +2268,11 @@ uvm_pmr_cache_get(int flags)
 	struct vm_page *pg;
 	int s;
 
-	s = splvm();
+	/*
+	 * XXX The buffer flipper (incorrectly?) allocates & frees pages
+	 * (from uvm_pagerealloc_multi()) from interrupt context!
+	 */
+	s = splbio();
 	upci = &upc->upc_magz[upc->upc_actv];
 	if (upci->upci_npages == 0) {
 		unsigned int prev;
@@ -2301,7 +2309,7 @@ uvm_pmr_cache_free(struct uvm_pmr_cache_item *upci)
 	struct pglist pgl;
 	unsigned int i;
 
-	splassert(IPL_VM);
+	splassert(IPL_BIO);
 
 	TAILQ_INIT(&pgl);
 	for (i = 0; i < upci->upci_npages; i++)
@@ -2334,7 +2342,15 @@ uvm_pmr_cache_put(struct vm_page *pg)
 		return;
 	}
 
-	s = splvm();
+	KASSERT(pg->wire_count == 0);
+	KASSERT(pg->uanon == (void*)0xdeadbeef || pg->uanon == NULL);
+	KASSERT(pg->uobject == (void*)0xdeadbeef || pg->uobject == NULL);
+
+	/*
+	 * XXX The buffer flipper (incorrectly?) allocates & frees pages
+	 * (from uvm_pagerealloc_multi()) from interrupt context!
+	 */
+	s = splbio();
 	upci = &upc->upc_magz[upc->upc_actv];
 	if (upci->upci_npages >= UVM_PMR_CACHEMAGSZ) {
 		unsigned int prev;
@@ -2362,7 +2378,11 @@ uvm_pmr_cache_drain(void)
 	unsigned int freed = 0;
 	int s;
 
-	s = splvm();
+	/*
+	 * XXX The buffer flipper (incorrectly?) allocates & frees pages
+	 * (from uvm_pagerealloc_multi()) from interrupt context!
+	 */
+	s = splbio();
 	freed += uvm_pmr_cache_free(&upc->upc_magz[0]);
 	freed += uvm_pmr_cache_free(&upc->upc_magz[1]);
 	splx(s);

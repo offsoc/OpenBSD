@@ -1,4 +1,4 @@
-/* $OpenBSD: window-copy.c,v 1.372 2025/04/03 11:51:27 nicm Exp $ */
+/* $OpenBSD: window-copy.c,v 1.380 2025/12/25 18:05:15 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -234,7 +234,6 @@ struct window_copy_mode_data {
 
 	struct screen	*backing;
 	int		 backing_written; /* backing display started */
-	struct screen	*writing;
 	struct input_ctx *ictx;
 
 	int		 viewmode;	/* view mode entered */
@@ -492,8 +491,6 @@ window_copy_view_init(struct window_mode_entry *wme,
 
 	data->backing = xmalloc(sizeof *data->backing);
 	screen_init(data->backing, sx, screen_size_y(base), UINT_MAX);
-	data->writing = xmalloc(sizeof *data->writing);
-	screen_init(data->writing, sx, screen_size_y(base), 0);
 	data->ictx = input_init(NULL, NULL, NULL);
 	data->mx = data->cx;
 	data->my = screen_hsize(data->backing) + data->cy - data->oy;
@@ -513,10 +510,6 @@ window_copy_free(struct window_mode_entry *wme)
 	free(data->searchstr);
 	free(data->jumpchar);
 
-	if (data->writing != NULL) {
-		screen_free(data->writing);
-		free(data->writing);
-	}
 	if (data->ictx != NULL)
 		input_free(data->ictx);
 	screen_free(data->backing);
@@ -553,21 +546,10 @@ window_copy_vadd(struct window_pane *wp, int parse, const char *fmt, va_list ap)
 	struct window_mode_entry	*wme = TAILQ_FIRST(&wp->modes);
 	struct window_copy_mode_data	*data = wme->data;
 	struct screen			*backing = data->backing;
-	struct screen			*writing = data->writing;
-	struct screen_write_ctx	 	 writing_ctx, backing_ctx, ctx;
+	struct screen_write_ctx	 	 backing_ctx, ctx;
 	struct grid_cell		 gc;
 	u_int				 old_hsize, old_cy;
-	u_int				 sx = screen_size_x(backing);
 	char				*text;
-
-	if (parse) {
-		vasprintf(&text, fmt, ap);
-		screen_write_start(&writing_ctx, writing);
-		screen_write_reset(&writing_ctx);
-		input_parse_screen(data->ictx, writing, window_copy_init_ctx_cb,
-		    data, text, strlen(text));
-		free(text);
-	}
 
 	old_hsize = screen_hsize(data->backing);
 	screen_write_start(&backing_ctx, backing);
@@ -581,9 +563,12 @@ window_copy_vadd(struct window_pane *wp, int parse, const char *fmt, va_list ap)
 	} else
 		data->backing_written = 1;
 	old_cy = backing->cy;
-	if (parse)
-		screen_write_fast_copy(&backing_ctx, writing, 0, 0, sx, 1);
-	else {
+	if (parse) {
+		vasprintf(&text, fmt, ap);
+		input_parse_screen(data->ictx, backing, window_copy_init_ctx_cb,
+		    data, text, strlen(text));
+		free(text);
+	} else {
 		memcpy(&gc, &grid_default_cell, sizeof gc);
 		screen_write_vnputs(&backing_ctx, 0, &gc, fmt, ap);
 	}
@@ -642,7 +627,7 @@ window_copy_scroll1(struct window_mode_entry *wme, struct window_pane *wp,
 		new_slider_y = sb_top - wp->yoff + (sb_height - slider_height);
 	} else {
 		/* Slider is somewhere in the middle. */
-		new_slider_y = my - wp->yoff - sl_mpos + 1;
+		new_slider_y = my - wp->yoff - sl_mpos;
 	}
 
 	if (TAILQ_FIRST(&wp->modes) == NULL ||
@@ -969,6 +954,18 @@ window_copy_formats(struct window_mode_entry *wme, struct format_tree *ft)
 	} else {
 		format_add(ft, "selection_active", "0");
 		format_add(ft, "selection_present", "0");
+	}
+
+	switch (data->selflag) {
+	case SEL_CHAR:
+		format_add(ft, "selection_mode", "char");
+		break;
+	case SEL_WORD:
+		format_add(ft, "selection_mode", "word");
+		break;
+	case SEL_LINE:
+		format_add(ft, "selection_mode", "line");
+		break;
 	}
 
 	format_add(ft, "search_present", "%d", data->searchmark != NULL);
@@ -1494,6 +1491,20 @@ window_copy_cmd_scroll_middle(struct window_copy_cmd_state *cs)
 	return (window_copy_cmd_scroll_to(cs, mid_value));
 }
 
+/* Scroll the pane to the mouse in the scrollbar. */
+static enum window_copy_cmd_action
+window_copy_cmd_scroll_to_mouse(struct window_copy_cmd_state *cs)
+{
+	struct window_mode_entry	*wme = cs->wme;
+	struct window_pane		*wp = wme->wp;
+	struct client			*c = cs->c;
+	struct mouse_event		*m = cs->m;
+	int				 scroll_exit = args_has(cs->wargs, 'e');
+
+	window_copy_scroll(wp, c->tty.mouse_slider_mpos, m->y, scroll_exit);
+	return (WINDOW_COPY_CMD_NOTHING);
+}
+
 /* Scroll line containing the cursor to the top. */
 static enum window_copy_cmd_action
 window_copy_cmd_scroll_top(struct window_copy_cmd_state *cs)
@@ -1510,6 +1521,28 @@ window_copy_cmd_cursor_up(struct window_copy_cmd_state *cs)
 	for (; np != 0; np--)
 		window_copy_cursor_up(wme, 0);
 	return (WINDOW_COPY_CMD_NOTHING);
+}
+
+static enum window_copy_cmd_action
+window_copy_cmd_centre_vertical(struct window_copy_cmd_state *cs)
+{
+	struct window_mode_entry	*wme = cs->wme;
+	struct window_copy_mode_data	*data = wme->data;
+
+	window_copy_update_cursor(wme, data->cx,  wme->wp->sy / 2);
+	window_copy_update_selection(wme, 1, 0);
+	return (WINDOW_COPY_CMD_REDRAW);
+}
+
+static enum window_copy_cmd_action
+window_copy_cmd_centre_horizontal(struct window_copy_cmd_state *cs)
+{
+	struct window_mode_entry	*wme = cs->wme;
+	struct window_copy_mode_data	*data = wme->data;
+
+	window_copy_update_cursor(wme, wme->wp->sx / 2, data->cy);
+	window_copy_update_selection(wme, 1, 0);
+	return (WINDOW_COPY_CMD_REDRAW);
 }
 
 static enum window_copy_cmd_action
@@ -1964,6 +1997,24 @@ window_copy_cmd_other_end(struct window_copy_cmd_state *cs)
 }
 
 static enum window_copy_cmd_action
+window_copy_cmd_selection_mode(struct window_copy_cmd_state *cs)
+{
+	struct window_mode_entry	*wme = cs->wme;
+	struct options			*so = cs->s->options;
+	struct window_copy_mode_data	*data = wme->data;
+	const char			*s = args_string(cs->wargs, 0);
+
+	if (s == NULL || strcasecmp(s, "char") == 0 || strcasecmp(s, "c") == 0)
+		data->selflag = SEL_CHAR;
+	else if (strcasecmp(s, "word") == 0 || strcasecmp(s, "w") == 0) {
+		data->separators = options_get_string(so, "word-separators");
+		data->selflag = SEL_WORD;
+	} else if (strcasecmp(s, "line") == 0 || strcasecmp(s, "l") == 0)
+		data->selflag = SEL_LINE;
+	return (WINDOW_COPY_CMD_NOTHING);
+}
+
+static enum window_copy_cmd_action
 window_copy_cmd_page_down(struct window_copy_cmd_state *cs)
 {
 	struct window_mode_entry	*wme = cs->wme;
@@ -2179,7 +2230,7 @@ static enum window_copy_cmd_action
 window_copy_cmd_select_word(struct window_copy_cmd_state *cs)
 {
 	struct window_mode_entry	*wme = cs->wme;
-	struct options			*session_options = cs->s->options;
+	struct options			*so = cs->s->options;
 	struct window_copy_mode_data	*data = wme->data;
 	u_int				 px, py, nextx, nexty;
 
@@ -2189,8 +2240,7 @@ window_copy_cmd_select_word(struct window_copy_cmd_state *cs)
 	data->dx = data->cx;
 	data->dy = screen_hsize(data->backing) + data->cy - data->oy;
 
-	data->separators = options_get_string(session_options,
-	    "word-separators");
+	data->separators = options_get_string(so, "word-separators");
 	window_copy_cursor_previous_word(wme, data->separators, 0);
 	px = data->cx;
 	py = screen_hsize(data->backing) + data->cy - data->oy;
@@ -2800,6 +2850,16 @@ static const struct {
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
 	  .f = window_copy_cmd_cursor_up
 	},
+	{ .command = "cursor-centre-vertical",
+	  .args = { "", 0, 0, NULL },
+	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
+	  .f = window_copy_cmd_centre_vertical,
+	},
+	{ .command = "cursor-centre-horizontal",
+	  .args = { "", 0, 0, NULL },
+	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
+	  .f = window_copy_cmd_centre_horizontal,
+	},
 	{ .command = "end-of-line",
 	  .args = { "", 0, 0, NULL },
 	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
@@ -3010,6 +3070,11 @@ static const struct {
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_scroll_middle
 	},
+	{ .command = "scroll-to-mouse",
+	  .args = { "e", 0, 0, NULL },
+	  .clear = WINDOW_COPY_CMD_CLEAR_EMACS_ONLY,
+	  .f = window_copy_cmd_scroll_to_mouse
+	},
 	{ .command = "scroll-top",
 	  .args = { "", 0, 0, NULL },
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
@@ -3069,6 +3134,11 @@ static const struct {
 	  .args = { "", 0, 0, NULL },
 	  .clear = WINDOW_COPY_CMD_CLEAR_ALWAYS,
 	  .f = window_copy_cmd_select_word
+	},
+	{ .command = "selection-mode",
+	  .args = { "", 0, 1, NULL },
+	  .clear = 0,
+	  .f = window_copy_cmd_selection_mode
 	},
 	{ .command = "set-mark",
 	  .args = { "", 0, 0, NULL },
@@ -4887,6 +4957,8 @@ window_copy_copy_buffer(struct window_mode_entry *wme, const char *prefix,
 
 	if (set_paste)
 		paste_add(prefix, buf, len);
+	else
+		free(buf);
 }
 
 static void *
@@ -4911,9 +4983,11 @@ static void
 window_copy_pipe(struct window_mode_entry *wme, struct session *s,
     const char *cmd)
 {
+	void	*buf;
 	size_t	len;
 
-	window_copy_pipe_run(wme, s, cmd, &len);
+	buf = window_copy_pipe_run(wme, s, cmd, &len);
+	free (buf);
 }
 
 static void
@@ -4924,9 +4998,10 @@ window_copy_copy_pipe(struct window_mode_entry *wme, struct session *s,
 	size_t	 len;
 
 	buf = window_copy_pipe_run(wme, s, cmd, &len);
-	if (buf != NULL)
+	if (buf != NULL) {
 		window_copy_copy_buffer(wme, prefix, buf, len, set_paste,
 		    set_clip);
+	}
 }
 
 static void
@@ -4937,9 +5012,10 @@ window_copy_copy_selection(struct window_mode_entry *wme, const char *prefix,
 	size_t	 len;
 
 	buf = window_copy_get_selection(wme, &len);
-	if (buf != NULL)
+	if (buf != NULL) {
 		window_copy_copy_buffer(wme, prefix, buf, len, set_paste,
 		    set_clip);
+	}
 }
 
 static void

@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.299 2025/05/21 04:11:57 mlarkin Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.306 2025/11/24 17:20:40 sf Exp $	*/
 /*	$NetBSD: machdep.c,v 1.3 2003/05/07 22:58:18 fvdl Exp $	*/
 
 /*-
@@ -100,6 +100,8 @@
 #include <machine/mpbiosvar.h>
 #include <machine/kcore.h>
 #include <machine/tss.h>
+#include <machine/ghcb.h>
+#include <machine/kexec.h>
 
 #include <dev/isa/isareg.h>
 #include <dev/ic/i8042reg.h>
@@ -491,6 +493,7 @@ bios_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 extern int tsc_is_invariant;
 extern int amd64_has_xcrypt;
 extern int need_retpoline;
+extern int cpu_sev_guestmode;
 
 const struct sysctl_bounded_args cpuctl_vars[] = {
 	{ CPU_LIDACTION, &lid_action, -1, 2 },
@@ -510,6 +513,7 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen, struct proc *p)
 {
 	extern uint64_t tsc_frequency;
+	char vmmode[16];
 	dev_t consdev;
 	dev_t dev;
 
@@ -565,6 +569,17 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 #endif
 	case CPU_TSCFREQ:
 		return (sysctl_rdquad(oldp, oldlenp, newp, tsc_frequency));
+	case CPU_VMMODE:
+		if (ISSET(cpu_ecxfeature, CPUIDECX_HV)) {
+			if (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED))
+				strlcpy(vmmode, "SEV-ES", sizeof(vmmode));
+			else if (ISSET(cpu_sev_guestmode, SEV_STAT_ENABLED))
+				strlcpy(vmmode, "SEV", sizeof(vmmode));
+			else
+				strlcpy(vmmode, "guest", sizeof(vmmode));
+		} else
+			strlcpy(vmmode, "host", sizeof(vmmode));
+		return sysctl_rdstring(oldp, oldlenp, newp, vmmode);
 	default:
 		return (sysctl_bounded_arr(cpuctl_vars, nitems(cpuctl_vars),
 		    name, namelen, oldp, oldlenp, newp, newlen));
@@ -578,7 +593,7 @@ maybe_enable_user_cet(struct proc *p)
 #ifndef SMALL_KERNEL
 	/* Enable indirect-branch tracking if present and not disabled */
 	if ((xsave_mask & XFEATURE_CET_U) &&
-	    (p->p_p->ps_flags & PS_NOBTCFI) == 0) {
+	    (p->p_p->ps_iflags & PSI_NOBTCFI) == 0) {
 		uint64_t msr = rdmsr(MSR_U_CET);
 		wrmsr(MSR_U_CET, msr | MSR_CET_ENDBR_EN | MSR_CET_NO_TRACK_EN);
 	}
@@ -1314,6 +1329,38 @@ cpu_init_idt(void)
 	lidt(&region);
 }
 
+uint64_t early_gdt[GDT_SIZE / 8];
+
+void
+cpu_init_early_vctrap(paddr_t addr)
+{
+	struct region_descriptor region;
+
+	extern void Xvctrap_early(void);
+
+	/* Setup temporary "early" longmode GDT, will be reset soon */
+	memset(early_gdt, 0, sizeof(early_gdt));
+	set_mem_segment(GDT_ADDR_MEM(early_gdt, GCODE_SEL), 0, 0xfffff,
+	    SDT_MEMERA, SEL_KPL, 1, 0, 1);
+	set_mem_segment(GDT_ADDR_MEM(early_gdt, GDATA_SEL), 0, 0xfffff,
+	    SDT_MEMRWA, SEL_KPL, 1, 0, 1);
+	setregion(&region, early_gdt, GDT_SIZE - 1);
+	lgdt(&region);
+
+	/* Setup temporary "early" longmode #VC entry, will be reset soon */
+	idt = early_idt;
+	memset((void *)idt, 0, NIDT * sizeof(idt[0]));
+	setgate(&idt[T_VC], Xvctrap_early, 0, SDT_SYS386IGT, SEL_KPL,
+	    GSEL(GCODE_SEL, SEL_KPL));
+	cpu_init_idt();
+
+	/* Tell the hypervisor about our GHCB. */
+	ghcb_paddr = addr;
+	ghcb_vaddr = addr + KERNBASE;
+	memset((void *)ghcb_vaddr, 0, 2 * PAGE_SIZE);
+	wrmsr(MSR_SEV_GHCB, ghcb_paddr);
+}
+
 void
 cpu_init_extents(void)
 {
@@ -1435,6 +1482,16 @@ init_x86_64(paddr_t first_avail)
 	uint64_t max_dm_size = ((uint64_t)512 * NUM_L4_SLOT_DIRECT) << 30;
 
 	/*
+	 * locore0 mapped 2 pages for use as GHCB before pmap is initialized.
+	 */
+	if (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED)) {
+		cpu_init_early_vctrap(first_avail);
+		first_avail += 2 * NBPG;
+	}
+	if (ISSET(cpu_sev_guestmode, SEV_STAT_ENABLED))
+		boothowto |= RB_COCOVM;
+
+	/*
 	 * locore0 mapped 3 pages for use before the pmap is initialized
 	 * starting at first_avail. These pages are currently used by
 	 * efifb to create early-use VAs for the framebuffer before efifb
@@ -1529,6 +1586,13 @@ init_x86_64(paddr_t first_avail)
 	if (avail_start < HIBERNATE_HIBALLOC_PAGE + PAGE_SIZE)
 		avail_start = HIBERNATE_HIBALLOC_PAGE + PAGE_SIZE;
 #endif /* HIBERNATE */
+
+#ifdef BOOT_KERNEL
+	if (avail_start < KEXEC_TRAMPOLINE + PAGE_SIZE)
+		avail_start = KEXEC_TRAMPOLINE + PAGE_SIZE;
+	if (avail_start < KEXEC_TRAMP_DATA + PAGE_SIZE)
+		avail_start = KEXEC_TRAMP_DATA + PAGE_SIZE;
+#endif
 
 	/*
 	 * We need to go through the BIOS memory map given, and

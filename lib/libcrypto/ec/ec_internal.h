@@ -1,4 +1,4 @@
-/*	$OpenBSD: ec_internal.h,v 1.1 2025/05/25 05:12:05 jsing Exp $	*/
+/*	$OpenBSD: ec_internal.h,v 1.3 2025/12/05 14:12:32 tb Exp $	*/
 /*
  * Copyright (c) 2024 Joel Sing <jsing@openbsd.org>
  *
@@ -24,7 +24,7 @@
 #define EC_FIELD_ELEMENT_MAX_BYTES \
     (EC_FIELD_ELEMENT_MAX_BITS + 7) / 8
 #define EC_FIELD_ELEMENT_MAX_WORDS \
-    ((EC_FIELD_ELEMENT_MAX_BYTES + BN_BYTES - 1) / BN_BYTES)
+    ((EC_FIELD_ELEMENT_MAX_BYTES + sizeof(BN_ULONG) - 1) / sizeof(BN_ULONG))
 
 typedef struct {
 	BN_ULONG w[EC_FIELD_ELEMENT_MAX_WORDS];
@@ -46,6 +46,8 @@ int ec_field_element_to_bn(const EC_FIELD_MODULUS *fm, const EC_FIELD_ELEMENT *f
     BIGNUM *bn, BN_CTX *ctx);
 
 void ec_field_element_copy(EC_FIELD_ELEMENT *dst, const EC_FIELD_ELEMENT *src);
+void ec_field_element_select(const EC_FIELD_MODULUS *fm, EC_FIELD_ELEMENT *r,
+    const EC_FIELD_ELEMENT *a, const EC_FIELD_ELEMENT *b, int conditional);
 
 int ec_field_element_equal(const EC_FIELD_MODULUS *fm, const EC_FIELD_ELEMENT *a,
     const EC_FIELD_ELEMENT *b);

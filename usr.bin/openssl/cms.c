@@ -1,4 +1,4 @@
-/* $OpenBSD: cms.c,v 1.37 2025/05/10 05:25:43 tb Exp $ */
+/* $OpenBSD: cms.c,v 1.40 2025/12/20 07:02:37 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project.
  */
@@ -89,12 +89,10 @@ static int cms_set_pkey_param(EVP_PKEY_CTX *pctx,
 #define SMIME_DATA_CREATE	(8 | SMIME_OP)
 #define SMIME_DIGEST_VERIFY	(9 | SMIME_IP)
 #define SMIME_DIGEST_CREATE	(10 | SMIME_OP)
-#define SMIME_UNCOMPRESS	(11 | SMIME_IP)
-#define SMIME_COMPRESS		(12 | SMIME_OP)
-#define SMIME_ENCRYPTED_DECRYPT	(13 | SMIME_IP)
-#define SMIME_ENCRYPTED_ENCRYPT	(14 | SMIME_OP)
-#define SMIME_SIGN_RECEIPT	(15 | SMIME_IP | SMIME_OP)
-#define SMIME_VERIFY_RECEIPT	(16 | SMIME_IP)
+#define SMIME_ENCRYPTED_DECRYPT	(11 | SMIME_IP)
+#define SMIME_ENCRYPTED_ENCRYPT	(12 | SMIME_OP)
+#define SMIME_SIGN_RECEIPT	(13 | SMIME_IP | SMIME_OP)
+#define SMIME_VERIFY_RECEIPT	(14 | SMIME_IP)
 
 int verify_err = 0;
 
@@ -493,7 +491,7 @@ static const struct option cms_options[] = {
 	},
 	{
 		.name = "aes256",
-		.desc = "Encrypt PEM output with CBC AES",
+		.desc = "Encrypt PEM output with CBC AES (default)",
 		.type = OPTION_ARGV_FUNC,
 		.opt.argvfunc = cms_opt_cipher,
 	},
@@ -527,7 +525,7 @@ static const struct option cms_options[] = {
 	},
 	{
 		.name = "des3",
-		.desc = "Encrypt with triple DES (default)",
+		.desc = "Encrypt with triple DES",
 		.type = OPTION_ARGV_FUNC,
 		.opt.argvfunc = cms_opt_cipher,
 	},
@@ -600,13 +598,6 @@ static const struct option cms_options[] = {
 		.type = OPTION_VALUE,
 		.opt.value = &cfg.operation,
 		.value = SMIME_CMSOUT,
-	},
-	{
-		.name = "compress",
-		.desc = "Create CMS CompressedData type",
-		.type = OPTION_VALUE,
-		.opt.value = &cfg.operation,
-		.value = SMIME_COMPRESS,
 	},
 	{
 		.name = "content",
@@ -998,13 +989,6 @@ static const struct option cms_options[] = {
 		.opt.arg = &cfg.to,
 	},
 	{
-		.name = "uncompress",
-		.desc = "Uncompress CMS CompressedData type",
-		.type = OPTION_VALUE,
-		.opt.value = &cfg.operation,
-		.value = SMIME_UNCOMPRESS,
-	},
-	{
 		.name = "verify",
 		.desc = "Verify signed message",
 		.type = OPTION_VALUE,
@@ -1138,7 +1122,7 @@ cms_usage(void)
 	    "    -camellia192 | -camellia256 | -des | -des3 |\n"
 	    "    -rc2-40 | -rc2-64 | -rc2-128] [-CAfile file]\n"
 	    "    [-CApath directory] [-CRLfile file] [-binary]\n"
-	    "    [-certfile file] [-certsout file] [-cmsout] [-compress]\n"
+	    "    [-certfile file] [-certsout file] [-cmsout]\n"
 	    "    [-content file] [-crlfeol] [-data_create] [-data_out]\n"
 	    "    [-debug_decrypt] [-decrypt] [-digest_create] [-digest_verify]\n"
 	    "    [-econtent_type type] [-encrypt] [-EncryptedData_decrypt]\n"
@@ -1156,7 +1140,7 @@ cms_usage(void)
 	    "    [-receipt_request_to addr] [-recip file] [-resign]\n"
 	    "    [-secretkey key] [-secretkeyid id] [-sign] [-sign_receipt]\n"
 	    "    [-signer file] [-stream | -indef | -noindef] [-subject s]\n"
-	    "    [-text] [-to addr] [-uncompress] [-verify]\n"
+	    "    [-text] [-to addr] [-verify]\n"
 	    "    [-verify_receipt file] [-verify_retcode] [cert.pem ...]\n\n");
 
 	options_usage(cms_options);
@@ -1309,14 +1293,8 @@ cms_main(int argc, char **argv)
 	}
 
 	if (cfg.operation == SMIME_ENCRYPT) {
-		if (cfg.cipher == NULL) {
-#ifndef OPENSSL_NO_DES
-			cfg.cipher = EVP_des_ede3_cbc();
-#else
-			BIO_printf(bio_err, "No cipher selected\n");
-			goto end;
-#endif
-		}
+		if (cfg.cipher == NULL)
+			cfg.cipher = EVP_aes_256_cbc();
 		if (cfg.secret_key != NULL &&
 		    cfg.secret_keyid == NULL) {
 			BIO_printf(bio_err, "No secret key id\n");
@@ -1488,8 +1466,6 @@ cms_main(int argc, char **argv)
 	} else if (cfg.operation == SMIME_DIGEST_CREATE) {
 		cms = CMS_digest_create(in, cfg.sign_md,
 		    cfg.flags);
-	} else if (cfg.operation == SMIME_COMPRESS) {
-		cms = CMS_compress(in, -1, cfg.flags);
 	} else if (cfg.operation == SMIME_ENCRYPT) {
 		int i;
 		cfg.flags |= CMS_PARTIAL;
@@ -1697,9 +1673,6 @@ cms_main(int argc, char **argv)
 	} else if (cfg.operation == SMIME_DATAOUT) {
 		if (!CMS_data(cms, out, cfg.flags))
 			goto end;
-	} else if (cfg.operation == SMIME_UNCOMPRESS) {
-		if (!CMS_uncompress(cms, indata, out, cfg.flags))
-			goto end;
 	} else if (cfg.operation == SMIME_DIGEST_VERIFY) {
 		if (CMS_digest_verify(cms, indata, out, cfg.flags) > 0)
 			BIO_printf(bio_err, "Verification successful\n");
@@ -1890,14 +1863,14 @@ receipt_request_print(BIO *out, CMS_ContentInfo *cms)
 			BIO_puts(bio_err, "  Receipt Request Parse Error\n");
 			ERR_print_errors(bio_err);
 		} else {
-			char *id;
+			const char *id;
 			int idlen;
 
 			CMS_ReceiptRequest_get0_values(rr, &scid, &allorfirst,
 			    &rlist, &rto);
 			BIO_puts(out, "  Signed Content ID:\n");
 			idlen = ASN1_STRING_length(scid);
-			id = (char *) ASN1_STRING_data(scid);
+			id = (const char *) ASN1_STRING_get0_data(scid);
 			BIO_dump_indent(out, id, idlen, 4);
 			BIO_puts(out, "  Receipts From");
 			if (rlist != NULL) {

@@ -1,4 +1,4 @@
-/* $OpenBSD: status.c,v 1.252 2025/05/12 10:34:13 nicm Exp $ */
+/* $OpenBSD: status.c,v 1.255 2025/12/22 08:41:01 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -264,14 +264,19 @@ status_line_size(struct client *c)
 }
 
 /* Get the prompt line number for client's session. 1 means at the bottom. */
-static u_int
+u_int
 status_prompt_line_at(struct client *c)
 {
 	struct session	*s = c->session;
+	u_int		 line, lines;
 
-	if (c->flags & (CLIENT_STATUSOFF|CLIENT_CONTROL))
-		return (1);
-	return (options_get_number(s->options, "message-line"));
+	lines = status_line_size(c);
+	if (lines == 0)
+		return (0);
+	line = options_get_number(s->options, "message-line");
+	if (line >= lines)
+		return (lines - 1);
+	return (line);
 }
 
 /* Get window at window list position. */
@@ -799,7 +804,10 @@ status_prompt_redraw(struct client *c)
 
 	n = options_get_number(s->options, "prompt-cursor-colour");
 	sl->active->default_ccolour = n;
-	n = options_get_number(s->options, "prompt-cursor-style");
+	if (c->prompt_mode == PROMPT_COMMAND)
+		n = options_get_number(s->options, "prompt-command-cursor-style");
+	else
+		n = options_get_number(s->options, "prompt-cursor-style");
 	screen_set_cursor_style(n, &sl->active->default_cstyle,
 	    &sl->active->default_mode);
 
@@ -931,6 +939,8 @@ status_prompt_translate_key(struct client *c, key_code key, key_code *new_key)
 			return (1);
 		case '\033': /* Escape */
 			c->prompt_mode = PROMPT_COMMAND;
+			if (c->prompt_index != 0)
+				c->prompt_index--;
 			c->flags |= CLIENT_REDRAWSTATUS;
 			return (0);
 		}
@@ -956,9 +966,10 @@ status_prompt_translate_key(struct client *c, key_code key, key_code *new_key)
 		*new_key = 'u'|KEYC_CTRL;
 		return (1);
 	case 'i':
-	case '\033': /* Escape */
 		c->prompt_mode = PROMPT_ENTRY;
 		c->flags |= CLIENT_REDRAWSTATUS;
+		return (0);
+	case '\033': /* Escape */
 		return (0);
 	}
 

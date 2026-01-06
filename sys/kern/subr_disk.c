@@ -1,4 +1,4 @@
-/*	$OpenBSD: subr_disk.c,v 1.273 2024/10/30 06:16:27 jsg Exp $	*/
+/*	$OpenBSD: subr_disk.c,v 1.284 2025/11/17 14:27:43 jsg Exp $	*/
 /*	$NetBSD: subr_disk.c,v 1.17 1996/03/16 23:17:08 christos Exp $	*/
 
 /*
@@ -169,9 +169,7 @@ checkdisklabel(dev_t dev, void *rlp, struct disklabel *lp, u_int64_t boundstart,
     u_int64_t boundend)
 {
 	struct disklabel *dlp = rlp;
-	struct __partitionv0 *v0pp;
 	struct partition *pp;
-	const char *blkname;
 	u_int64_t disksize;
 	int error = 0;
 	int i;
@@ -186,6 +184,8 @@ checkdisklabel(dev_t dev, void *rlp, struct disklabel *lp, u_int64_t boundstart,
 		error = ENOSPC;	/* disk too small */
 	else if (dkcksum(dlp) != 0)
 		error = EINVAL;	/* incorrect checksum */
+	else if (dlp->d_version == 0)
+		error = EINVAL;	/* version too old to understand */
 
 	if (error) {
 		u_int16_t *start, *end, sum = 0;
@@ -240,13 +240,8 @@ checkdisklabel(dev_t dev, void *rlp, struct disklabel *lp, u_int64_t boundstart,
 			pp = &dlp->d_partitions[i];
 			pp->p_size = swap32(pp->p_size);
 			pp->p_offset = swap32(pp->p_offset);
-			if (dlp->d_version == 0) {
-				v0pp = (struct __partitionv0 *)pp;
-				v0pp->p_fsize = swap32(v0pp->p_fsize);
-			} else {
-				pp->p_offseth = swap16(pp->p_offseth);
-				pp->p_sizeh = swap16(pp->p_sizeh);
-			}
+			pp->p_offseth = swap16(pp->p_offseth);
+			pp->p_sizeh = swap16(pp->p_sizeh);
 			pp->p_cpg = swap16(pp->p_cpg);
 		}
 
@@ -262,26 +257,6 @@ checkdisklabel(dev_t dev, void *rlp, struct disklabel *lp, u_int64_t boundstart,
 
 	if (lp != dlp)
 		*lp = *dlp;
-
-	if (lp->d_version == 0) {
-		blkname = findblkname(major(dev));
-		if (blkname == NULL)
-			blkname = findblkname(major(chrtoblk(dev)));
-		printf("%s%d has legacy label, please rewrite using "
-		    "disklabel(8)\n", blkname, DISKUNIT(dev));
-
-		lp->d_version = 1;
-		lp->d_secperunith = 0;
-
-		v0pp = (struct __partitionv0 *)lp->d_partitions;
-		pp = lp->d_partitions;
-		for (i = 0; i < lp->d_npartitions; i++, pp++, v0pp++) {
-			pp->p_fragblock = DISKLABELV1_FFS_FRAGBLOCK(v0pp->
-			    p_fsize, v0pp->p_frag);
-			pp->p_offseth = 0;
-			pp->p_sizeh = 0;
-		}
-	}
 
 #ifdef DEBUG
 	if (DL_GETDSIZE(lp) != disksize)
@@ -328,8 +303,7 @@ readdoslabel(struct buf *bp, void (*strat)(struct buf *), struct disklabel *lp,
     daddr_t *partoffp, int spoofonly)
 {
 	uint8_t			 dosbb[DEV_BSIZE];
-	struct disklabel	 nlp;
-	struct disklabel	*rlp;
+	struct disklabel	*nlp, *rlp;
 	daddr_t			 partoff;
 	int			 error;
 
@@ -359,19 +333,22 @@ readdoslabel(struct buf *bp, void (*strat)(struct buf *), struct disklabel *lp,
 	}
 	memcpy(dosbb, bp->b_data, sizeof(dosbb));
 
-	nlp = *lp;
-	memset(nlp.d_partitions, 0, sizeof(nlp.d_partitions));
-	nlp.d_partitions[RAW_PART] = lp->d_partitions[RAW_PART];
-	nlp.d_magic = 0;
+	nlp = malloc(sizeof(*nlp), M_DEVBUF, M_WAITOK);
+	*nlp = *lp;
+	memset(nlp->d_partitions, 0, sizeof(nlp->d_partitions));
+	nlp->d_partitions[RAW_PART] = lp->d_partitions[RAW_PART];
+	nlp->d_magic = 0;
 
-	error = spoofgpt(bp, strat, dosbb, &nlp, &partoff);
-	if (error)
+	error = spoofgpt(bp, strat, dosbb, nlp, &partoff);
+	if (error) {
+		free(nlp, M_DEVBUF, sizeof(*nlp));
 		return error;
-	if (nlp.d_magic != DISKMAGIC)
-		spoofmbr(bp, strat, dosbb, &nlp, &partoff);
-	if (nlp.d_magic != DISKMAGIC)
-		spooffat(dosbb, &nlp, &partoff);
-	if (nlp.d_magic != DISKMAGIC) {
+	}
+	if (nlp->d_magic != DISKMAGIC)
+		spoofmbr(bp, strat, dosbb, nlp, &partoff);
+	if (nlp->d_magic != DISKMAGIC)
+		spooffat(dosbb, nlp, &partoff);
+	if (nlp->d_magic != DISKMAGIC) {
 		DPRINTF("readdoslabel: N/A -- label partition @ "
 		    "daddr_t 0 (default)\n");
 		partoff = 0;
@@ -386,16 +363,20 @@ readdoslabel(struct buf *bp, void (*strat)(struct buf *), struct disklabel *lp,
 		if (partoff == -1) {
 			DPRINTF("readdoslabel return: %s, ENXIO, lp "
 			    "unchanged, *partoffp unchanged\n", devname);
+			free(nlp, M_DEVBUF, sizeof(*nlp));
 			return ENXIO;
 		}
 		*partoffp = partoff;
 		DPRINTF("readdoslabel return: %s, 0, lp unchanged, "
 		    "*partoffp set to %lld\n", devname, *partoffp);
+		free(nlp, M_DEVBUF, sizeof(*nlp));
 		return 0;
 	}
 
-	nlp.d_magic = lp->d_magic;
-	*lp = nlp;
+	nlp->d_magic = lp->d_magic;
+	*lp = *nlp;
+	free(nlp, M_DEVBUF, sizeof(*nlp));
+
 	lp->d_checksum = 0;
 	lp->d_checksum = dkcksum(lp);
 
@@ -542,51 +523,58 @@ gpt_get_parts(struct buf *bp, void (*strat)(struct buf *), struct disklabel *lp,
 	return 0;
 }
 
+/* LE format! */
+#define GPT_UUID_UNUSED \
+    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+#define GPT_UUID_MICROSOFT_BASIC_DATA \
+    { 0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, \
+      0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7 }
+#define GPT_UUID_CHROMEOS_ROOTFS \
+    { 0x02, 0xe2, 0xb8, 0x3c, 0x7e, 0x3b, 0xdd, 0x47, \
+      0x8a, 0x3c, 0x7f, 0xf2, 0xa1, 0x3c, 0xfc, 0xec }
+#define GPT_UUID_LINUX_FILES \
+    { 0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, \
+      0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4 }
+#define GPT_UUID_MAC_OS_X_HFS \
+    { 0x00, 0x53, 0x46, 0x48, 0x00, 0x00, 0xaa, 0x11,\
+      0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac }
+#define GPT_UUID_BIOS_BOOT \
+    { 0x48, 0x61, 0x68, 0x21, 0x49, 0x64, 0x6f, 0x6e, \
+      0x74, 0x4e, 0x65, 0x65, 0x64, 0x45, 0x46, 0x49 }
+
+/* XXX Temporary LE versions needed until MI GPT boot code is adjusted. */
+#define GPT_LEUUID_EFI_SYSTEM \
+    { 0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, \
+      0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b }
+#define GPT_LEUUID_OPENBSD \
+    { 0xa0, 0xc7, 0x4c, 0x82, 0xa8, 0x36, 0xe3, 0x11, \
+      0x89, 0x0a, 0x95, 0x25, 0x19, 0xad, 0x3f, 0x61 }
+
 int
 gpt_get_fstype(const struct uuid *uuid_part)
 {
-	static int init = 0;
-	static struct uuid uuid_openbsd, uuid_msdos, uuid_chromefs,
-	    uuid_linux, uuid_hfs, uuid_unused, uuid_efi_system, uuid_bios_boot;
-	static const uint8_t gpt_uuid_openbsd[] = GPT_UUID_OPENBSD;
-	static const uint8_t gpt_uuid_msdos[] = GPT_UUID_MSDOS;
-	static const uint8_t gpt_uuid_chromerootfs[] = GPT_UUID_CHROMEROOTFS;
-	static const uint8_t gpt_uuid_linux[] = GPT_UUID_LINUX;
-	static const uint8_t gpt_uuid_hfs[] = GPT_UUID_APPLE_HFS;
-	static const uint8_t gpt_uuid_unused[] = GPT_UUID_UNUSED;
-	static const uint8_t gpt_uuid_efi_system[] = GPT_UUID_EFI_SYSTEM;
-	static const uint8_t gpt_uuid_bios_boot[] = GPT_UUID_BIOS_BOOT;
+	unsigned int		i;
+	struct partfs {
+		uint8_t gptype[16];
+		int fstype;
+	} knownfs[] = {
+		{ GPT_UUID_UNUSED,		FS_UNUSED },
+		{ GPT_LEUUID_OPENBSD,		FS_BSDFFS },
+		{ GPT_UUID_MICROSOFT_BASIC_DATA,FS_MSDOS  },
+		{ GPT_UUID_CHROMEOS_ROOTFS,	FS_EXT2FS },
+		{ GPT_UUID_LINUX_FILES,		FS_EXT2FS },
+		{ GPT_UUID_MAC_OS_X_HFS,	FS_HFS	  },
+		{ GPT_LEUUID_EFI_SYSTEM,	FS_MSDOS  },
+		{ GPT_UUID_BIOS_BOOT,		FS_BOOT   }
+	};
 
-	if (init == 0) {
-		uuid_dec_be(gpt_uuid_openbsd, &uuid_openbsd);
-		uuid_dec_be(gpt_uuid_msdos, &uuid_msdos);
-		uuid_dec_be(gpt_uuid_chromerootfs, &uuid_chromefs);
-		uuid_dec_be(gpt_uuid_linux, &uuid_linux);
-		uuid_dec_be(gpt_uuid_hfs, &uuid_hfs);
-		uuid_dec_be(gpt_uuid_unused, &uuid_unused);
-		uuid_dec_be(gpt_uuid_efi_system, &uuid_efi_system);
-		uuid_dec_be(gpt_uuid_bios_boot, &uuid_bios_boot);
-		init = 1;
+	for (i = 0; i < nitems(knownfs); i++) {
+		if (!memcmp(uuid_part, knownfs[i].gptype, sizeof(struct uuid)))
+		    return knownfs[i].fstype;
 	}
 
-	if (!memcmp(uuid_part, &uuid_unused, sizeof(struct uuid)))
-		return FS_UNUSED;
-	else if (!memcmp(uuid_part, &uuid_openbsd, sizeof(struct uuid)))
-		return FS_BSDFFS;
-	else if (!memcmp(uuid_part, &uuid_msdos, sizeof(struct uuid)))
-		return FS_MSDOS;
-	else if (!memcmp(uuid_part, &uuid_chromefs, sizeof(struct uuid)))
-		return FS_EXT2FS;
-	else if (!memcmp(uuid_part, &uuid_linux, sizeof(struct uuid)))
-		return FS_EXT2FS;
-	else if (!memcmp(uuid_part, &uuid_hfs, sizeof(struct uuid)))
-		return FS_HFS;
-	else if (!memcmp(uuid_part, &uuid_efi_system, sizeof(struct uuid)))
-		return FS_MSDOS;
-	else if (!memcmp(uuid_part, &uuid_bios_boot, sizeof(struct uuid)))
-		return FS_BOOT;
-	else
-		return FS_OTHER;
+	return FS_OTHER;
 }
 
 int
@@ -595,7 +583,6 @@ spoofgpt(struct buf *bp, void (*strat)(struct buf *), const uint8_t *dosbb,
 {
 	struct dos_partition	 dp[NDOSPART];
 	struct gpt_header	 gh;
-	struct uuid		 gptype;
 	struct gpt_partition	*gp;
 	struct partition	*pp;
 	uint64_t		 lbaend, lbastart, labelsec;
@@ -642,9 +629,12 @@ spoofgpt(struct buf *bp, void (*strat)(struct buf *), const uint8_t *dosbb,
 	partoff = DL_SECTOBLK(lp, lbastart);
 	obsdfound = 0;
 	for (i = 0; i < partnum; i++) {
-		if (letoh64(gp[i].gp_attrs) & GPTPARTATTR_REQUIRED) {
-			DPRINTF("spoofgpt: Skipping partition %u (REQUIRED)\n",
-			    i);
+		fstype = gpt_get_fstype(&gp[i].gp_type);
+		if (fstype == FS_UNUSED)
+			continue;
+		if (fstype == FS_OTHER) {
+			DPRINTF("spoofgpt: Skipping partition %u "
+			    "(unknown filesystem)\n", i);
 			continue;
 		}
 
@@ -656,8 +646,6 @@ spoofgpt(struct buf *bp, void (*strat)(struct buf *), const uint8_t *dosbb,
 		if (start > end)
 			continue;
 
-		uuid_dec_le(&gp[i].gp_type, &gptype);
-		fstype = gpt_get_fstype(&gptype);
 		if (obsdfound && fstype == FS_BSDFFS)
 			continue;
 
@@ -875,7 +863,7 @@ spooffat(const uint8_t *dosbb, struct disklabel *lp, daddr_t *partoffp)
  * Check new disk label for sensibility before setting it.
  */
 int
-setdisklabel(struct disklabel *olp, struct disklabel *nlp, u_int openmask)
+setdisklabel(struct disklabel *olp, struct disklabel *nlp, u_int64_t openmask)
 {
 	struct partition *opp, *npp;
 	struct disk *dk;
@@ -901,7 +889,7 @@ setdisklabel(struct disklabel *olp, struct disklabel *nlp, u_int openmask)
 	for (i = 0; i < MAXPARTITIONS; i++) {
 		opp = &olp->d_partitions[i];
 		npp = &nlp->d_partitions[i];
-		if ((openmask & (1 << i)) &&
+		if ((openmask & (1ULL << i)) &&
 		    (DL_GETPOFFSET(npp) != DL_GETPOFFSET(opp) ||
 		    DL_GETPSIZE(npp) < DL_GETPSIZE(opp)))
 			return (EBUSY);
@@ -1007,7 +995,7 @@ diskerr(struct buf *bp, char *dname, char *what, int pri, int blkdone,
 {
 	int unit = DISKUNIT(bp->b_dev), part = DISKPART(bp->b_dev);
 	int (*pr)(const char *, ...) __attribute__((__format__(__kprintf__,1,2)));
-	char partname = 'a' + part;
+	char partname = DL_PARTNUM2NAME(part);
 	daddr_t sn;
 
 	if (pri != LOG_PRINTF) {
@@ -1130,7 +1118,7 @@ disk_attach_callback(void *xdat)
 {
 	struct disk_attach_task *dat = xdat;
 	struct disk *dk = dat->dk;
-	struct disklabel dl;
+	struct disklabel *dl;
 	char errbuf[100];
 
 	free(dat, M_TEMP, sizeof(*dat));
@@ -1139,9 +1127,10 @@ disk_attach_callback(void *xdat)
 		goto done;
 
 	/* Read disklabel. */
-	if (disk_readlabel(&dl, dk->dk_devno, errbuf, sizeof(errbuf)) == NULL) {
-		enqueue_randomness(dl.d_checksum);
-	}
+	dl = malloc(sizeof(*dl), M_DEVBUF, M_WAITOK);
+	if (disk_readlabel(dl, dk->dk_devno, errbuf, sizeof(errbuf)) == NULL)
+		enqueue_randomness(dl->d_checksum);
+	free(dl, M_DEVBUF, sizeof(*dl));
 
 done:
 	dk->dk_flags |= DKF_OPENED;
@@ -1177,8 +1166,6 @@ disk_detach(struct disk *diskp)
 int
 disk_openpart(struct disk *dk, int part, int fmt, int haslabel)
 {
-	KASSERT(part >= 0 && part < MAXPARTITIONS);
-
 	/* Unless opening the raw partition, check that the partition exists. */
 	if (part != RAW_PART && (!haslabel ||
 	    part >= dk->dk_label->d_npartitions ||
@@ -1188,10 +1175,10 @@ disk_openpart(struct disk *dk, int part, int fmt, int haslabel)
 	/* Ensure the partition doesn't get changed under our feet. */
 	switch (fmt) {
 	case S_IFCHR:
-		dk->dk_copenmask |= (1 << part);
+		dk->dk_copenmask |= (1ULL << part);
 		break;
 	case S_IFBLK:
-		dk->dk_bopenmask |= (1 << part);
+		dk->dk_bopenmask |= (1ULL << part);
 		break;
 	}
 	dk->dk_openmask = dk->dk_copenmask | dk->dk_bopenmask;
@@ -1202,14 +1189,12 @@ disk_openpart(struct disk *dk, int part, int fmt, int haslabel)
 void
 disk_closepart(struct disk *dk, int part, int fmt)
 {
-	KASSERT(part >= 0 && part < MAXPARTITIONS);
-
 	switch (fmt) {
 	case S_IFCHR:
-		dk->dk_copenmask &= ~(1 << part);
+		dk->dk_copenmask &= ~(1ULL << part);
 		break;
 	case S_IFBLK:
-		dk->dk_bopenmask &= ~(1 << part);
+		dk->dk_bopenmask &= ~(1ULL << part);
 		break;
 	}
 	dk->dk_openmask = dk->dk_copenmask | dk->dk_bopenmask;
@@ -1310,16 +1295,17 @@ dk_mountroot(void)
 	char errbuf[100];
 	int part = DISKPART(rootdev);
 	int (*mountrootfn)(void);
-	struct disklabel dl;
+	struct disklabel *dl;
 	char *error;
 
-	error = disk_readlabel(&dl, rootdev, errbuf, sizeof(errbuf));
+	dl = malloc(sizeof(*dl), M_DEVBUF, M_WAITOK);
+	error = disk_readlabel(dl, rootdev, errbuf, sizeof(errbuf));
 	if (error)
 		panic("%s", error);
 
-	if (DL_GETPSIZE(&dl.d_partitions[part]) == 0)
+	if (DL_GETPSIZE(&dl->d_partitions[part]) == 0)
 		panic("root filesystem has size 0");
-	switch (dl.d_partitions[part].p_fstype) {
+	switch (dl->d_partitions[part].p_fstype) {
 #ifdef EXT2FS
 	case FS_EXT2FS:
 		{
@@ -1350,14 +1336,16 @@ dk_mountroot(void)
 		extern int ffs_mountroot(void);
 
 		printf("filesystem type %d not known.. assuming ffs\n",
-		    dl.d_partitions[part].p_fstype);
+		    dl->d_partitions[part].p_fstype);
 		mountrootfn = ffs_mountroot;
 		}
 #else
 		panic("disk 0x%x filesystem type %d not known",
-		    rootdev, dl.d_partitions[part].p_fstype);
+		    rootdev, dl->d_partitions[part].p_fstype);
 #endif
 	}
+	free(dl, M_DEVBUF, sizeof(*dl));
+
 	return (*mountrootfn)();
 }
 
@@ -1391,10 +1379,11 @@ parsedisk(char *str, int len, int defpart, dev_t *devp)
 	if (len == 0)
 		return (NULL);
 	c = str[len-1];
-	if (c >= 'a' && (c - 'a') < MAXPARTITIONS) {
-		part = c - 'a';
-		len -= 1;
-	}
+	part = DL_PARTNAME2NUM(c);
+	if (part == -1 || part >= MAXPARTITIONS) {
+		part = defpart;
+	} else
+		len -=1;
 
 	TAILQ_FOREACH(dv, &alldevs, dv_list) {
 		if (dv->dv_class == DV_DISK &&
@@ -1488,7 +1477,7 @@ setroot(struct device *bootdv, int part, int exitflags)
 			if (bootdv != NULL) {
 				printf(" (default %s", bootdv->dv_xname);
 				if (bootdv->dv_class == DV_DISK)
-					printf("%c", 'a' + part);
+					printf("%c", DL_PARTNUM2NAME(part));
 				printf(")");
 			}
 			printf(": ");
@@ -1501,6 +1490,7 @@ setroot(struct device *bootdv, int part, int exitflags)
 				reboot(exitflags);
 			if (len == 0 && bootdv != NULL) {
 				strlcpy(buf, bootdv->dv_xname, sizeof buf);
+				//strlcat(buf, DL_PARTNUM2NAME(part), sizeof buf);
 				len = strlen(buf);
 			}
 			if (len > 0 && buf[len - 1] == '*') {
@@ -1615,7 +1605,7 @@ gotswap:
 		unit = DISKUNIT(rootdev);
 		part = DISKPART(rootdev);
 		snprintf(buf, sizeof buf, "%s%d%c",
-		    findblkname(majdev), unit, 'a' + part);
+		    findblkname(majdev), unit, DL_PARTNUM2NAME(part));
 		rootdv = parsedisk(buf, strlen(buf), 0, &nrootdev);
 		if (rootdv == NULL)
 			panic("root device (%s) not found", buf);
@@ -1645,10 +1635,10 @@ gotswap:
 		return;
 	}
 
-	printf("root on %s%c", rootdv->dv_xname, 'a' + part);
+	printf("root on %s%c", rootdv->dv_xname, DL_PARTNUM2NAME(part));
 
 	if (dk && dk->dk_device == rootdv)
-		printf(" (%s.%c)", duid_format(rootduid), 'a' + part);
+		printf(" (%s.%c)", duid_format(rootduid), DL_PARTNUM2NAME(part));
 
 	/*
 	 * Make the swap partition on the root drive the primary swap.
@@ -1672,11 +1662,10 @@ gotswap:
 	}
 	if (swdevt[0] != NODEV)
 		printf(" swap on %s%d%c", findblkname(major(swdevt[0])),
-		    DISKUNIT(swdevt[0]),
-		    'a' + DISKPART(swdevt[0]));
+		    DISKUNIT(swdevt[0]), DL_PARTNUM2NAME(DISKPART(swdevt[0])));
 	if (dumpdev != NODEV)
 		printf(" dump on %s%d%c", findblkname(major(dumpdev)),
-		    DISKUNIT(dumpdev), 'a' + DISKPART(dumpdev));
+		    DISKUNIT(dumpdev), DL_PARTNUM2NAME(DISKPART(dumpdev)));
 	printf("\n");
 }
 
@@ -1759,7 +1748,7 @@ disk_map(const char *path, char *mappath, int size, int flags)
 	struct disk *dk, *mdk;
 	u_char uid[8];
 	char c, part;
-	int i;
+	int i, partno;
 
 	/*
 	 * Attempt to map a request for a disklabel UID to the correct device.
@@ -1781,12 +1770,14 @@ disk_map(const char *path, char *mappath, int size, int flags)
 		return -1;
 
 	/* Get partition. */
-	if (flags & DM_OPENPART)
-		part = 'a' + RAW_PART;
-	else
+	if (flags & DM_OPENPART) {
+		partno = RAW_PART;
+		part = DL_PARTNUM2NAME(partno);
+	} else {
 		part = path[17];
-
-	if (part < 'a' || part >= 'a' + MAXPARTITIONS)
+		partno = DL_PARTNAME2NUM(part);
+	}
+	if (partno == -1)
 		return -1;
 
 	/* Derive label UID. */

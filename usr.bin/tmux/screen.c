@@ -1,4 +1,4 @@
-/* $OpenBSD: screen.c,v 1.89 2025/05/12 09:17:42 nicm Exp $ */
+/* $OpenBSD: screen.c,v 1.92 2026/01/04 08:05:14 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -577,9 +577,12 @@ screen_select_cell(struct screen *s, struct grid_cell *dst,
 	if (COLOUR_DEFAULT(dst->bg))
 		dst->bg = src->bg;
 	utf8_copy(&dst->data, &src->data);
-	dst->attr = dst->attr & ~GRID_ATTR_CHARSET;
-	dst->attr |= src->attr & GRID_ATTR_CHARSET;
 	dst->flags = src->flags;
+
+	if (dst->attr & GRID_ATTR_NOATTR)
+		dst->attr |= (src->attr & GRID_ATTR_CHARSET);
+	else
+		dst->attr |= src->attr;
 }
 
 /* Reflow wrapped lines. */
@@ -736,6 +739,8 @@ screen_mode_to_string(int mode)
 		strlcat(tmp, "KEYS_EXTENDED,", sizeof tmp);
 	if (mode & MODE_KEYS_EXTENDED_2)
 		strlcat(tmp, "KEYS_EXTENDED_2,", sizeof tmp);
+	if (mode & MODE_THEME_UPDATES)
+		strlcat(tmp, "THEME_UPDATES,", sizeof tmp);
 	tmp[strlen(tmp) - 1] = '\0';
 	return (tmp);
 }

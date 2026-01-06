@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_gre.c,v 1.186 2025/05/14 02:00:18 dlg Exp $ */
+/*	$OpenBSD: if_gre.c,v 1.192 2025/11/21 04:44:26 dlg Exp $ */
 /*	$NetBSD: if_gre.c,v 1.9 1999/10/25 19:18:11 drochner Exp $ */
 
 /*
@@ -52,7 +52,6 @@
 #include <sys/queue.h>
 #include <sys/tree.h>
 #include <sys/pool.h>
-#include <sys/rwlock.h>
 
 #include <crypto/siphash.h>
 
@@ -555,7 +554,6 @@ struct gre_h_erspan {
 #define ERSPAN_II_EN_ISL		0x1
 #define ERSPAN_II_EN_VLAN		0x2
 #define ERSPAN_II_EN_PRESERVED		0x3
-#define ERSPAN_II_EN_PRESERVED		0x3
 #define ERSPAN_II_T			(0x1 << 10)
 #define ERSPAN_II_SESSION_ID_SHIFT	0
 #define ERSPAN_II_SESSION_ID_MASK	0x3ff /* 10 bits */
@@ -572,6 +570,7 @@ struct erspan_softc {
 	struct arpcom		sc_ac;
 	uint32_t		sc_seq;
 	caddr_t			sc_bpf;
+	caddr_t			sc_bpf_raw;
 };
 
 RBT_HEAD(erspan_tree, erspan_softc);
@@ -659,7 +658,7 @@ gre_clone_create(struct if_clone *ifc, int unit)
 	ifp->if_ioctl = gre_ioctl;
 	ifp->if_rtrequest = p2p_rtrequest;
 
-	sc->sc_tunnel.t_ttl = ip_defttl;
+	sc->sc_tunnel.t_ttl = atomic_load_int(&ip_defttl);
 	sc->sc_tunnel.t_txhprio = IF_HDRPRIO_PAYLOAD;
 	sc->sc_tunnel.t_rxhprio = IF_HDRPRIO_PACKET;
 	sc->sc_tunnel.t_df = htons(0);
@@ -730,7 +729,7 @@ mgre_clone_create(struct if_clone *ifc, int unit)
 	ifp->if_start = mgre_start;
 	ifp->if_ioctl = mgre_ioctl;
 
-	sc->sc_tunnel.t_ttl = ip_defttl;
+	sc->sc_tunnel.t_ttl = atomic_load_int(&ip_defttl);
 	sc->sc_tunnel.t_txhprio = IF_HDRPRIO_PAYLOAD;
 	sc->sc_tunnel.t_rxhprio = IF_HDRPRIO_PACKET;
 	sc->sc_tunnel.t_df = htons(0);
@@ -784,7 +783,7 @@ egre_clone_create(struct if_clone *ifc, int unit)
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
 	ether_fakeaddr(ifp);
 
-	sc->sc_tunnel.t_ttl = ip_defttl;
+	sc->sc_tunnel.t_ttl = atomic_load_int(&ip_defttl);
 	sc->sc_tunnel.t_txhprio = 0;
 	sc->sc_tunnel.t_rxhprio = IF_HDRPRIO_PACKET;
 	sc->sc_tunnel.t_df = htons(0);
@@ -919,7 +918,7 @@ eoip_clone_create(struct if_clone *ifc, int unit)
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
 	ether_fakeaddr(ifp);
 
-	sc->sc_tunnel.t_ttl = ip_defttl;
+	sc->sc_tunnel.t_ttl = atomic_load_int(&ip_defttl);
 	sc->sc_tunnel.t_txhprio = 0;
 	sc->sc_tunnel.t_rxhprio = IF_HDRPRIO_PACKET;
 	sc->sc_tunnel.t_df = htons(0);
@@ -1461,7 +1460,7 @@ nvgre_input(const struct gre_tunnel *key, struct mbuf *m, int hlen,
 
 	eh = mtod(m, struct ether_header *);
 	etherbridge_map_ea(&sc->sc_eb, (void *)&key->t_dst,
-	    (struct ether_addr *)eh->ether_shost);
+	    0, 0, (struct ether_addr *)eh->ether_shost);
 
 	SET(m->m_pkthdr.csum_flags, M_FLOWID);
 	m->m_pkthdr.ph_flowid = bemtoh32(&key->t_key) & ~GRE_KEY_ENTROPY;
@@ -3098,7 +3097,8 @@ gre_keepalive_send(void *arg)
 	SipHash24_Update(&ctx, &gk->gk_random, sizeof(gk->gk_random));
 	SipHash24_Final(gk->gk_digest, &ctx);
 
-	ttl = sc->sc_tunnel.t_ttl == -1 ? ip_defttl : sc->sc_tunnel.t_ttl;
+	ttl = sc->sc_tunnel.t_ttl == -1 ?
+	    atomic_load_int(&ip_defttl) : sc->sc_tunnel.t_ttl;
 
 	m->m_pkthdr.pf.prio = sc->sc_if.if_llprio;
 	tos = gre_l3_tos(&sc->sc_tunnel, m, IFQ_PRIO2TOS(m->m_pkthdr.pf.prio));
@@ -3711,13 +3711,13 @@ nvgre_add_addr(struct nvgre_softc *sc, const struct ifbareq *ifba)
 	}
 
 	return (etherbridge_add_addr(&sc->sc_eb, &endpoint,
-	    &ifba->ifba_dst, type));
+	    0, 0, &ifba->ifba_dst, type));
 }
 
 static int
 nvgre_del_addr(struct nvgre_softc *sc, const struct ifbareq *ifba)
 {
-	return (etherbridge_del_addr(&sc->sc_eb, &ifba->ifba_dst));
+	return (etherbridge_del_addr(&sc->sc_eb, 0, &ifba->ifba_dst));
 }
 
 static void
@@ -3753,7 +3753,7 @@ nvgre_start(struct ifnet *ifp)
 
 			smr_read_enter();
 			endpoint = etherbridge_resolve_ea(&sc->sc_eb,
-			    (struct ether_addr *)eh->ether_dhost);
+			    0, (struct ether_addr *)eh->ether_dhost);
 			if (endpoint == NULL) {
 				/* "flood" to unknown hosts */
 				endpoint = &tunnel->t_dst;
@@ -4461,7 +4461,7 @@ erspan_clone_create(struct if_clone *ifc, int unit)
 	ether_fakeaddr(ifp);
 
 	sc->sc_tunnel.t_key = ~0;
-	sc->sc_tunnel.t_ttl = ip_defttl;
+	sc->sc_tunnel.t_ttl = atomic_load_int(&ip_defttl);
 	sc->sc_tunnel.t_txhprio = IF_HDRPRIO_PACKET; /* XXX */
 	sc->sc_tunnel.t_rxhprio = IF_HDRPRIO_PAYLOAD;
 	sc->sc_tunnel.t_df = htons(0);
@@ -4473,6 +4473,7 @@ erspan_clone_create(struct if_clone *ifc, int unit)
 #if NBPFILTER > 0
 	/* attach after Ethernet */
 	bpfattach(&sc->sc_bpf, ifp, DLT_LOOP, sizeof(uint32_t));
+	bpfattach(&sc->sc_bpf_raw, ifp, DLT_RAW, 0);
 #endif
 
 	return (0);
@@ -4876,6 +4877,9 @@ erspan_start(struct ifnet *ifp)
 			bpf_mtap_af(if_bpf, sc->sc_tunnel.t_af, m,
 			    BPF_DIRECTION_OUT);
 		}
+		if_bpf = sc->sc_bpf_raw;
+		if (if_bpf)
+			bpf_mtap(if_bpf, m, BPF_DIRECTION_OUT);
 #endif
 		if (gre_ip_output(&sc->sc_tunnel, m) != 0) {
 			ifp->if_oerrors++;
@@ -4998,6 +5002,11 @@ erspan_input(struct gre_tunnel *key, struct mbuf *m, int iphlen,
 	if_bpf = sc->sc_bpf;
 	if (if_bpf) {
 		if (bpf_mtap_af(if_bpf, key->t_af, m, BPF_DIRECTION_IN))
+			input = 0;
+	}
+	if_bpf = sc->sc_bpf_raw;
+	if (if_bpf) {
+		if (bpf_mtap(if_bpf, m, BPF_DIRECTION_IN))
 			input = 0;
 	}
 #endif

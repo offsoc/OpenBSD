@@ -1,4 +1,4 @@
-/*	$OpenBSD: init_main.c,v 1.328 2025/01/01 07:44:54 jsg Exp $	*/
+/*	$OpenBSD: init_main.c,v 1.331 2026/01/01 07:00:57 jsg Exp $	*/
 /*	$NetBSD: init_main.c,v 1.84.4.1 1996/06/02 09:08:06 mrg Exp $	*/
 
 /*
@@ -106,7 +106,7 @@ extern void stoeplitz_init(void);
 const char	copyright[] =
 "Copyright (c) 1982, 1986, 1989, 1991, 1993\n"
 "\tThe Regents of the University of California.  All rights reserved.\n"
-"Copyright (c) 1995-2025 OpenBSD. All rights reserved.  https://www.OpenBSD.org\n";
+"Copyright (c) 1995-2026 OpenBSD. All rights reserved.  https://www.OpenBSD.org\n";
 
 /* Components of the first process -- never freed. */
 struct	session session0;
@@ -314,7 +314,7 @@ main(void *framep)
 	(void)chgproccnt(0, 1);
 
 	/* Initialize run queues */
-	sched_init_runqueues();
+	sched_init();
 	sleep_queue_init();
 	clockqueue_init(&curcpu()->ci_queue);
 	sched_init_cpu(curcpu());
@@ -328,6 +328,7 @@ main(void *framep)
 
 	/* Initialize the interface/address trees */
 	ifinit();
+	softnet_init();
 
 	/* Lock the kernel on behalf of proc0. */
 	KERNEL_LOCK();
@@ -345,6 +346,9 @@ main(void *framep)
 
 	/* Per CPU memory allocation */
 	percpu_init();
+
+	/* Reduce softnet threads to number of CPU */
+	softnet_percpu();
 
 	/* Initialize the file systems. */
 #if defined(NFSSERVER) || defined(NFSCLIENT)

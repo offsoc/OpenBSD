@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_qwx_pci.c,v 1.24 2025/03/28 13:55:27 kevlo Exp $	*/
+/*	$OpenBSD: if_qwx_pci.c,v 1.30 2025/12/01 16:57:36 stsp Exp $	*/
 
 /*
  * Copyright 2023 Stefan Sperling <stsp@openbsd.org>
@@ -1074,9 +1074,7 @@ unsupported_wcn6855_soc:
 
 	/* Set device capabilities. */
 	ic->ic_caps =
-#if 0
 	    IEEE80211_C_QOS | IEEE80211_C_TX_AMPDU | /* A-MPDU */
-#endif
 	    IEEE80211_C_ADDBA_OFFLOAD | /* device sends ADDBA/DELBA frames */
 	    IEEE80211_C_WEP |		/* WEP */
 	    IEEE80211_C_RSN |		/* WPA/RSN */
@@ -1086,11 +1084,23 @@ unsupported_wcn6855_soc:
 	    IEEE80211_C_MONITOR |	/* monitor mode supported */
 #endif
 	    IEEE80211_C_SHSLOT |	/* short slot time supported */
-	    IEEE80211_C_SHPREAMBLE;	/* short preamble supported */
+	    IEEE80211_C_SHPREAMBLE |	/* short preamble supported */
+	    IEEE80211_C_MFP;		/* management frame protection */
 
 	ic->ic_sup_rates[IEEE80211_MODE_11A] = ieee80211_std_rateset_11a;
 	ic->ic_sup_rates[IEEE80211_MODE_11B] = ieee80211_std_rateset_11b;
 	ic->ic_sup_rates[IEEE80211_MODE_11G] = ieee80211_std_rateset_11g;
+
+	ic->ic_htcaps = IEEE80211_HTCAP_SGI20 | IEEE80211_HTCAP_AMSDU7935;
+	ic->ic_htcaps |=
+	    (IEEE80211_HTCAP_SMPS_DIS << IEEE80211_HTCAP_SMPS_SHIFT);
+	ic->ic_htxcaps = 0;
+	ic->ic_txbfcaps = 0;
+	ic->ic_aselcaps = 0;
+	ic->ic_ampdu_params = (IEEE80211_AMPDU_PARAM_SS_NONE | 0x3 /* 64k */);
+
+	memset(ic->ic_sup_mcs, 0, sizeof(ic->ic_sup_mcs));
+	ic->ic_sup_mcs[0] = 0xff;		/* MCS 0-7 */
 
 	/* IBSS channel undefined for now. */
 	ic->ic_ibss_chan = &ic->ic_channels[1];
@@ -1119,6 +1129,12 @@ unsupported_wcn6855_soc:
 	ic->ic_updateedca = qwx_updateedca;
 	ic->ic_updatedtim = qwx_updatedtim;
 #endif
+	ic->ic_ampdu_rx_start = qwx_ampdu_rx_start;
+	ic->ic_ampdu_rx_stop = qwx_ampdu_rx_stop;
+	ic->ic_ampdu_tx_start = qwx_ampdu_tx_start;
+	ic->ic_ampdu_tx_stop = NULL;
+	ic->ic_bgscan_start = qwx_bgscan;
+
 	/*
 	 * We cannot read the MAC address without loading the
 	 * firmware from disk. Postpone until mountroot is done.
@@ -3003,15 +3019,15 @@ qwx_mhi_fw_load_handler(struct qwx_pci_softc *psc)
 	u_char *data;
 	size_t len;
 
+	ret = snprintf(amss_path, sizeof(amss_path), "%s-%s-%s",
+	    ATH11K_FW_DIR, sc->hw_params.fw.dir, ATH11K_AMSS_FILE);
+	if (ret < 0 || ret >= sizeof(amss_path))
+		return ENOSPC;
+
 	if (sc->fw_img[QWX_FW_AMSS].data) {
 		data = sc->fw_img[QWX_FW_AMSS].data;
 		len = sc->fw_img[QWX_FW_AMSS].size;
 	} else {
-		ret = snprintf(amss_path, sizeof(amss_path), "%s-%s-%s",
-		    ATH11K_FW_DIR, sc->hw_params.fw.dir, ATH11K_AMSS_FILE);
-		if (ret < 0 || ret >= sizeof(amss_path))
-			return ENOSPC;
-
 		ret = loadfirmware(amss_path, &data, &len);
 		if (ret) {
 			printf("%s: could not read %s (error %d)\n",

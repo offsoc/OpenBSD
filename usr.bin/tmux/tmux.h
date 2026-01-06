@@ -1,4 +1,4 @@
-/* $OpenBSD: tmux.h,v 1.1263 2025/05/22 08:01:29 nicm Exp $ */
+/* $OpenBSD: tmux.h,v 1.1281 2026/01/06 10:17:29 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -53,6 +53,8 @@ struct format_tree;
 struct hyperlinks_uri;
 struct hyperlinks;
 struct input_ctx;
+struct input_request;
+struct input_requests;
 struct job;
 struct menu_data;
 struct mode_tree_data;
@@ -641,6 +643,7 @@ enum tty_code_code {
 #define MODE_CURSOR_BLINKING_SET 0x20000
 #define MODE_KEYS_EXTENDED_2 0x40000
 #define MODE_THEME_UPDATES 0x80000
+#define MODE_SYNC 0x100000
 
 #define ALL_MODES 0xffffff
 #define ALL_MOUSE_MODES (MODE_MOUSE_STANDARD|MODE_MOUSE_BUTTON|MODE_MOUSE_ALL)
@@ -677,6 +680,14 @@ enum utf8_state {
 	UTF8_ERROR
 };
 
+/* State for processing of Korean characters. */
+enum hanguljamo_state {
+	HANGULJAMO_STATE_NOT_HANGULJAMO,
+	HANGULJAMO_STATE_CHOSEONG,
+	HANGULJAMO_STATE_COMPOSABLE,
+	HANGULJAMO_STATE_NOT_COMPOSABLE
+};
+
 /* Colour flags. */
 #define COLOUR_FLAG_256 0x01000000
 #define COLOUR_FLAG_RGB 0x02000000
@@ -708,6 +719,7 @@ struct colour_palette {
 #define GRID_ATTR_UNDERSCORE_4 0x800
 #define GRID_ATTR_UNDERSCORE_5 0x1000
 #define GRID_ATTR_OVERLINE 0x2000
+#define GRID_ATTR_NOATTR 0x4000
 
 /* All underscore attributes. */
 #define GRID_ATTR_ALL_UNDERSCORE \
@@ -986,7 +998,8 @@ enum pane_lines {
 	PANE_LINES_DOUBLE,
 	PANE_LINES_HEAVY,
 	PANE_LINES_SIMPLE,
-	PANE_LINES_NUMBER
+	PANE_LINES_NUMBER,
+	PANE_LINES_SPACES
 };
 
 /* Pane border indicator option. */
@@ -1083,6 +1096,28 @@ struct window_mode_entry {
 	TAILQ_ENTRY(window_mode_entry)	 entry;
 };
 
+/* Type of request to client. */
+enum input_request_type {
+	INPUT_REQUEST_PALETTE,
+	INPUT_REQUEST_CLIPBOARD,
+	INPUT_REQUEST_QUEUE
+};
+
+/* Palette request reply data. */
+struct input_request_palette_data {
+	int	idx;
+	int	c;
+};
+
+/* Clipboard request reply data. */
+struct input_request_clipboard_data {
+	char	*buf;
+	size_t	 len;
+};
+
+/* Request sent to client on behalf of pane. */
+TAILQ_HEAD(input_requests, input_request);
+
 /* Offsets into pane buffer. */
 struct window_pane_offset {
 	size_t	used;
@@ -1156,6 +1191,7 @@ struct window_pane {
 
 	struct window_pane_resizes resize_queue;
 	struct event	 resize_timer;
+	struct event	 sync_timer;
 
 	struct input_ctx *ictx;
 
@@ -1529,11 +1565,13 @@ struct tty {
 #define TTY_OPENED 0x20
 #define TTY_OSC52QUERY 0x40
 #define TTY_BLOCK 0x80
-#define TTY_HAVEDA 0x100 /* Primary DA. */
+#define TTY_HAVEDA 0x100
 #define TTY_HAVEXDA 0x200
 #define TTY_SYNCING 0x400
-#define TTY_HAVEDA2 0x800 /* Secondary DA. */
+#define TTY_HAVEDA2 0x800
 #define TTY_WINSIZEQUERY 0x1000
+#define TTY_WAITFG 0x2000
+#define TTY_WAITBG 0x4000
 #define TTY_ALL_REQUEST_FLAGS \
 	(TTY_HAVEDA|TTY_HAVEDA2|TTY_HAVEXDA)
 	int		 flags;
@@ -1909,6 +1947,8 @@ struct client {
 	struct status_line	 status;
 	enum client_theme	 theme;
 
+	struct input_requests	 input_requests;
+
 #define CLIENT_TERMINAL 0x1
 #define CLIENT_LOGIN 0x2
 #define CLIENT_EXIT 0x4
@@ -1944,7 +1984,7 @@ struct client {
 #define CLIENT_CONTROL_PAUSEAFTER 0x100000000ULL
 #define CLIENT_CONTROL_WAITEXIT 0x200000000ULL
 #define CLIENT_WINDOWSIZECHANGED 0x400000000ULL
-#define CLIENT_CLIPBOARDBUFFER 0x800000000ULL
+/* 0x800000000ULL unused */
 #define CLIENT_BRACKETPASTING 0x1000000000ULL
 #define CLIENT_ASSUMEPASTING 0x2000000000ULL
 #define CLIENT_REDRAWSCROLLBARS 0x4000000000ULL
@@ -2256,6 +2296,7 @@ char		*paste_make_sample(struct paste_buffer *);
 #define FORMAT_FORCE 0x2
 #define FORMAT_NOJOBS 0x4
 #define FORMAT_VERBOSE 0x8
+#define FORMAT_LAST 0x10
 #define FORMAT_NONE 0
 #define FORMAT_PANE 0x80000000U
 #define FORMAT_WINDOW 0x40000000U
@@ -2462,7 +2503,7 @@ void	tty_set_size(struct tty *, u_int, u_int, u_int, u_int);
 void	tty_invalidate(struct tty *);
 void	tty_start_tty(struct tty *);
 void	tty_send_requests(struct tty *);
-void	tty_repeat_requests(struct tty *);
+void	tty_repeat_requests(struct tty *, int);
 void	tty_stop_tty(struct tty *);
 void	tty_set_title(struct tty *, const char *);
 void	tty_set_path(struct tty *, const char *);
@@ -2636,7 +2677,8 @@ const struct cmd_entry *cmd_get_entry(struct cmd *);
 struct args	*cmd_get_args(struct cmd *);
 u_int		 cmd_get_group(struct cmd *);
 void		 cmd_get_source(struct cmd *, const char **, u_int *);
-struct cmd	*cmd_parse(struct args_value *, u_int, const char *, u_int,
+int		 cmd_get_parse_flags(struct cmd *);
+struct cmd	*cmd_parse(struct args_value *, u_int, const char *, u_int, int,
 		     char **);
 struct cmd	*cmd_copy(struct cmd *, int, char **);
 void		 cmd_free(struct cmd *);
@@ -2647,6 +2689,8 @@ void		 cmd_list_append(struct cmd_list *, struct cmd *);
 void		 cmd_list_append_all(struct cmd_list *, struct cmd_list *);
 void		 cmd_list_move(struct cmd_list *, struct cmd_list *);
 void		 cmd_list_free(struct cmd_list *);
+#define CMD_LIST_PRINT_ESCAPED 0x1
+#define CMD_LIST_PRINT_NO_GROUPS 0x2
 char		*cmd_list_print(const struct cmd_list *, int);
 struct cmd	*cmd_list_first(struct cmd_list *);
 struct cmd	*cmd_list_next(struct cmd *);
@@ -2866,6 +2910,7 @@ extern u_int	  status_prompt_hsize[];
 void	 status_timer_start(struct client *);
 void	 status_timer_start_all(void);
 void	 status_update_cache(struct session *);
+u_int	 status_prompt_line_at(struct client *);
 int	 status_at_line(struct client *);
 u_int	 status_line_size(struct client *);
 struct style_range *status_get_range(struct client *, u_int, u_int);
@@ -2910,6 +2955,8 @@ void	 input_parse_screen(struct input_ctx *, struct screen *,
 void	 input_reply_clipboard(struct bufferevent *, const char *, size_t,
 	     const char *);
 void	 input_set_buffer_size(size_t);
+void	 input_request_reply(struct client *, enum input_request_type, void *);
+void	 input_cancel_requests(struct client *);
 
 /* input-key.c */
 void	 input_key_build(void);
@@ -3056,6 +3103,8 @@ void	 screen_write_preview(struct screen_write_ctx *, struct screen *, u_int,
 void	 screen_write_backspace(struct screen_write_ctx *);
 void	 screen_write_mode_set(struct screen_write_ctx *, int);
 void	 screen_write_mode_clear(struct screen_write_ctx *, int);
+void	 screen_write_start_sync(struct window_pane *);
+void	 screen_write_stop_sync(struct window_pane *);
 void	 screen_write_cursorup(struct screen_write_ctx *, u_int);
 void	 screen_write_cursordown(struct screen_write_ctx *, u_int);
 void	 screen_write_cursorright(struct screen_write_ctx *, u_int);
@@ -3278,7 +3327,7 @@ typedef void (*mode_tree_build_cb)(void *, struct mode_tree_sort_criteria *,
 				   uint64_t *, const char *);
 typedef void (*mode_tree_draw_cb)(void *, void *, struct screen_write_ctx *,
 	     u_int, u_int);
-typedef int (*mode_tree_search_cb)(void *, void *, const char *);
+typedef int (*mode_tree_search_cb)(void *, void *, const char *, int);
 typedef void (*mode_tree_menu_cb)(void *, struct client *, key_code);
 typedef u_int (*mode_tree_height_cb)(void *, u_int);
 typedef key_code (*mode_tree_key_cb)(void *, void *, u_int);
@@ -3461,7 +3510,11 @@ int		 utf8_cstrhas(const char *, const struct utf8_data *);
 int		 utf8_has_zwj(const struct utf8_data *);
 int		 utf8_is_zwj(const struct utf8_data *);
 int		 utf8_is_vs(const struct utf8_data *);
-int		 utf8_is_modifier(const struct utf8_data *);
+int		 utf8_is_hangul_filler(const struct utf8_data *);
+int		 utf8_should_combine(const struct utf8_data *,
+		    const struct utf8_data *);
+enum hanguljamo_state hanguljamo_check_state(const struct utf8_data *,
+		    const struct utf8_data *);
 
 /* procname.c */
 char   *get_proc_name(int, char *);
@@ -3509,6 +3562,7 @@ int		 menu_key_cb(struct client *, void *, struct key_event *);
 #define POPUP_CLOSEEXIT 0x1
 #define POPUP_CLOSEEXITZERO 0x2
 #define POPUP_INTERNAL 0x4
+#define POPUP_CLOSEANYKEY 0x8
 typedef void (*popup_close_cb)(int, void *);
 typedef void (*popup_finish_edit_cb)(char *, size_t, void *);
 int		 popup_display(int, enum box_lines, struct cmdq_item *, u_int,
@@ -3518,6 +3572,9 @@ int		 popup_display(int, enum box_lines, struct cmdq_item *, u_int,
                     popup_close_cb, void *);
 int		 popup_editor(struct client *, const char *, size_t,
 		    popup_finish_edit_cb, void *);
+int		 popup_present(struct client *);
+int		 popup_modify(struct client *, const char *, const char *,
+		    const char *, enum box_lines, int);
 
 /* style.c */
 int		 style_parse(struct style *,const struct grid_cell *,

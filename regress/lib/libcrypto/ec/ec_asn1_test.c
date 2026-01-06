@@ -1,7 +1,7 @@
-/* $OpenBSD: ec_asn1_test.c,v 1.33 2025/05/04 05:00:03 tb Exp $ */
+/* $OpenBSD: ec_asn1_test.c,v 1.41 2025/12/07 11:39:00 tb Exp $ */
 /*
  * Copyright (c) 2017, 2021 Joel Sing <jsing@openbsd.org>
- * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
+ * Copyright (c) 2024, 2025 Theo Buehler <tb@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,12 +17,17 @@
  */
 
 #include <err.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <openssl/bio.h>
+#include <openssl/bn.h>
 #include <openssl/ec.h>
 #include <openssl/err.h>
 #include <openssl/objects.h>
+#include <openssl/sha.h>
 
 #include "ec_local.h"
 
@@ -730,6 +735,82 @@ static const struct curve secp256k1_m = {
 	.param_len = sizeof(ec_secp256k1_m_pkparameters_parameters),
 };
 
+/*
+ * From https://eips.ethereum.org/EIPS/eip-2539
+ */
+
+static const uint8_t ec_bls12_377_pkparameters_named_curve[] = {
+	0x06, 0x04, 0x29, 0x01, 0x01, 0x01,
+};
+
+static const uint8_t ec_bls12_377_pkparameters_parameters[] = {
+	0x30, 0x82, 0x01, 0x3d, 0x02, 0x01, 0x01, 0x30,
+	0x3b, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+	0x01, 0x01, 0x02, 0x30, 0x01, 0xae, 0x3a, 0x46,
+	0x17, 0xc5, 0x10, 0xea, 0xc6, 0x3b, 0x05, 0xc0,
+	0x6c, 0xa1, 0x49, 0x3b, 0x1a, 0x22, 0xd9, 0xf3,
+	0x00, 0xf5, 0x13, 0x8f, 0x1e, 0xf3, 0x62, 0x2f,
+	0xba, 0x09, 0x48, 0x00, 0x17, 0x0b, 0x5d, 0x44,
+	0x30, 0x00, 0x00, 0x00, 0x85, 0x08, 0xc0, 0x00,
+	0x00, 0x00, 0x00, 0x01, 0x30, 0x64, 0x04, 0x30,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x04, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x01, 0x04, 0x61, 0x04, 0x00, 0x88, 0x48,
+	0xde, 0xfe, 0x74, 0x0a, 0x67, 0xc8, 0xfc, 0x62,
+	0x25, 0xbf, 0x87, 0xff, 0x54, 0x85, 0x95, 0x1e,
+	0x2c, 0xaa, 0x9d, 0x41, 0xbb, 0x18, 0x82, 0x82,
+	0xc8, 0xbd, 0x37, 0xcb, 0x5c, 0xd5, 0x48, 0x15,
+	0x12, 0xff, 0xcd, 0x39, 0x4e, 0xea, 0xb9, 0xb1,
+	0x6e, 0xb2, 0x1b, 0xe9, 0xef, 0x01, 0x91, 0x4a,
+	0x69, 0xc5, 0x10, 0x2e, 0xff, 0x1f, 0x67, 0x4f,
+	0x5d, 0x30, 0xaf, 0xee, 0xc4, 0xbd, 0x7f, 0xb3,
+	0x48, 0xca, 0x3e, 0x52, 0xd9, 0x6d, 0x18, 0x2a,
+	0xd4, 0x4f, 0xb8, 0x23, 0x05, 0xc2, 0xfe, 0x3d,
+	0x36, 0x34, 0xa9, 0x59, 0x1a, 0xfd, 0x82, 0xde,
+	0x55, 0x55, 0x9c, 0x8e, 0xa6, 0x02, 0x20, 0x12,
+	0xab, 0x65, 0x5e, 0x9a, 0x2c, 0xa5, 0x56, 0x60,
+	0xb4, 0x4d, 0x1e, 0x5c, 0x37, 0xb0, 0x01, 0x59,
+	0xaa, 0x76, 0xfe, 0xd0, 0x00, 0x00, 0x01, 0x0a,
+	0x11, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
+	0x10, 0x17, 0x0b, 0x5d, 0x44, 0x30, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00,
+};
+
+static const struct curve bls12_377 = {
+	.descr = "BLS12-377",
+	.oid =	 "1.1.1.1.1", /* XXX */
+	.sn =	 "BLS12-377",
+	.p =	 "01ae3a46" "17c510ea" "c63b05c0" "6ca1493b"
+		 "1a22d9f3" "00f5138f" "1ef3622f" "ba094800"
+		 "170b5d44" "30000000" "8508c000" "00000001",
+	.a =     "0",
+	.b =     "1",
+	.x =	 "008848de" "fe740a67" "c8fc6225" "bf87ff54"
+		 "85951e2c" "aa9d41bb" "188282c8" "bd37cb5c"
+		 "d5481512" "ffcd394e" "eab9b16e" "b21be9ef",
+	.y =	 "01914a69" "c5102eff" "1f674f5d" "30afeec4"
+		 "bd7fb348" "ca3e52d9" "6d182ad4" "4fb82305"
+		 "c2fe3d36" "34a9591a" "fd82de55" "559c8ea6",
+	.order = "12ab655e" "9a2ca556" "60b44d1e" "5c37b001"
+		 "59aa76fe" "d0000001" "0a118000" "00000001",
+	.cofactor = "170b5d44" "30000000" "00000000" "00000000",
+	.named = ec_bls12_377_pkparameters_named_curve,
+	.named_len = sizeof(ec_bls12_377_pkparameters_named_curve),
+	.param = ec_bls12_377_pkparameters_parameters,
+	.param_len = sizeof(ec_bls12_377_pkparameters_parameters),
+};
+
 static EC_GROUP *
 ec_group_from_curve_method(const struct curve *curve, const EC_METHOD *method,
     BN_CTX *ctx)
@@ -1020,6 +1101,65 @@ ec_group_non_builtin_curves(void)
 	failed |= ec_group_non_builtin_curve(&secp256k1_m, EC_GFp_mont_method(), ctx);
 	failed |= ec_group_non_builtin_curve(&secp256k1_m, EC_GFp_simple_method(), ctx);
 
+	failed |= ec_group_non_builtin_curve(&bls12_377, EC_GFp_mont_method(), ctx);
+	failed |= ec_group_non_builtin_curve(&bls12_377, EC_GFp_simple_method(), ctx);
+
+	BN_CTX_free(ctx);
+
+	return failed;
+}
+
+static int
+ec_group_check_prime_order(EC_builtin_curve *curve, BN_CTX *ctx)
+{
+	EC_GROUP *group;
+	BIGNUM *order;
+	int rv;
+	int failed = 0;
+
+	if ((group = EC_GROUP_new_by_curve_name(curve->nid)) == NULL)
+		errx(1, "EC_GROUP_new_by_curve_name");
+
+	BN_CTX_start(ctx);
+
+	if ((order = BN_CTX_get(ctx)) == NULL)
+		errx(1, "order = BN_CTX_get()");
+
+	if (!EC_GROUP_get_order(group, order, ctx))
+		errx(1, "EC_GROUP_get_order");
+
+	if ((rv = BN_is_prime_ex(order, 0, ctx, NULL)) != 1) {
+		fprintf(stderr, "%s: nid %d: BN_is_prime_ex() returned %d, want 1\n",
+		    __func__, curve->nid, rv);
+		failed = 1;
+	}
+
+	BN_CTX_end(ctx);
+	EC_GROUP_free(group);
+
+	return failed;
+}
+
+static int
+ec_group_builtin_curves_have_prime_order(void)
+{
+	BN_CTX *ctx = NULL;
+	EC_builtin_curve *all_curves = NULL;
+	size_t curve_id, ncurves;
+	int failed = 0;
+
+	if ((ctx = BN_CTX_new()) == NULL)
+		errx(1, "BN_CTX_new");
+
+	ncurves = EC_get_builtin_curves(NULL, 0);
+	if ((all_curves = calloc(ncurves, sizeof(*all_curves))) == NULL)
+		err(1, "calloc builtin curves");
+	EC_get_builtin_curves(all_curves, ncurves);
+
+	for (curve_id = 0; curve_id < ncurves; curve_id++)
+		failed |= ec_group_check_prime_order(&all_curves[curve_id], ctx);
+
+	free(all_curves);
 	BN_CTX_free(ctx);
 
 	return failed;
@@ -2348,6 +2488,197 @@ ec_group_check_private_keys(void)
 	return failed;
 }
 
+static void
+ec_group_sha1_bignum(BIGNUM *out, const BIGNUM *in)
+{
+	char md[SHA_DIGEST_LENGTH];
+	unsigned char *bin;
+	size_t bin_len;
+
+	if (BN_num_bytes(in) <= 0)
+		errx(1, "%s: invalid bignum", __func__);
+
+	bin_len = BN_num_bytes(in);
+	if ((bin = calloc(1, bin_len)) == NULL)
+		err(1, "calloc");
+	if (BN_bn2bin(in, bin) <= 0)
+		errx(1, "BN_bn2bin");
+
+	SHA1(bin, bin_len, md);
+	free(bin);
+
+	if (BN_bin2bn(md, sizeof(md), out) == NULL)
+		errx(1, "BN_bin2bn");
+}
+
+static int
+ec_group_check_seed(const EC_builtin_curve *curve, BN_CTX *ctx)
+{
+	EC_GROUP *group = NULL;
+	BIGNUM *p, *a, *b, *pow2, *r, *seed_bn, *w;
+	const unsigned char *seed;
+	size_t seed_len;
+	int i, g, h, s, t;
+	int failed = 1;
+
+	if ((group = EC_GROUP_new_by_curve_name(curve->nid)) == NULL)
+		errx(1, "EC_GROUP_new_by_curve_name");
+
+	BN_CTX_start(ctx);
+
+	if ((p = BN_CTX_get(ctx)) == NULL)
+		errx(1, "p = BN_CTX_get()");
+	if ((a = BN_CTX_get(ctx)) == NULL)
+		errx(1, "a = BN_CTX_get()");
+	if ((b = BN_CTX_get(ctx)) == NULL)
+		errx(1, "b = BN_CTX_get()");
+	if ((r = BN_CTX_get(ctx)) == NULL)
+		errx(1, "r = BN_CTX_get()");
+	if ((pow2 = BN_CTX_get(ctx)) == NULL)
+		errx(1, "pow2 = BN_CTX_get()");
+	if ((seed_bn = BN_CTX_get(ctx)) == NULL)
+		errx(1, "seed_bn = BN_CTX_get()");
+	if ((w = BN_CTX_get(ctx)) == NULL)
+		errx(1, "w = BN_CTX_get()");
+
+	/*
+	 * If the curve has a seed, verify that its parameters a and b have
+	 * been selected using that seed, loosely following X9.62, F.3.4.b.
+	 * Otherwise there's nothing to do.
+	 */
+	if ((seed = EC_GROUP_get0_seed(group)) == NULL)
+		goto done;
+	seed_len = EC_GROUP_get_seed_len(group);
+
+	/*
+	 * This isn't a requirement but happens to be the case for NIST
+	 * curves - the only built-in curves that have a seed.
+	 */
+	if (seed_len != SHA_DIGEST_LENGTH) {
+		fprintf(stderr, "%s FAIL: unexpected seed length. "
+		    "want %d, got %zu\n", __func__, SHA_DIGEST_LENGTH, seed_len);
+		goto err;
+	}
+
+	/* Seed length in bits, per F.3.3.b. */
+	g = 8 * seed_len;
+
+	/*
+	 * Prepare to build the verifiably random element r of GFp by
+	 * concatenating the SHA-1 of modifications of the seed as a number.
+	 */
+	if (BN_bin2bn(seed, seed_len, seed_bn) == NULL)
+		errx(1, "BN_bin2bn");
+
+	if (!EC_GROUP_get_curve(group, p, a, b, ctx))
+		errx(1, "EC_GROUP_get_curve");
+
+	t = BN_num_bits(p);	/* bit length needed. */
+	s = (t - 1) / 160;	/* number of SHA-1 fitting in bit length. */
+	h = t - 160 * s;	/* remaining number of bits in r. */
+
+	/*
+	 * Steps 1 - 3: compute hash of the seed and take h - 1 rightmost bits.
+	 */
+
+	ec_group_sha1_bignum(r, seed_bn);
+	BN_zero(pow2);
+	if (!BN_set_bit(pow2, h - 1))
+		errx(1, "BN_set_bit");
+	if (!BN_mod(r, r, pow2, ctx))
+		errx(1, "BN_nnmod");
+
+	/*
+	 * Steps 4 - 6: for i from 1 to s do Wi = SHA-1(SEED + i mod 2^g).
+	 * With W0 = r as already computed, let r = W0 || W1 || ... || Ws.
+	 */
+
+	BN_zero(pow2);
+	if (!BN_set_bit(pow2, g))
+		errx(1, "BN_set_bit");
+
+	for (i = 0; i < s; i++) {
+		/*
+		 * This is a bit silly since the seed isn't going to have all
+		 * its bits set, so BN_add_word(seed_bn, 1) would do, but for
+		 * the sake of correctness...
+		 */
+		if (!BN_mod_add(seed_bn, seed_bn, BN_value_one(), pow2, ctx))
+			errx(1, "BN_mod_add");
+
+		ec_group_sha1_bignum(w, seed_bn);
+
+		if (!BN_lshift(r, r, 8 * SHA_DIGEST_LENGTH))
+			errx(1, "BN_lshift");
+		if (!BN_add(r, r, w))
+			errx(1, "BN_add");
+	}
+
+	/*
+	 * Step 7: check that r * b^2 == a^3 (mod p)
+	 */
+
+	/* Compute r = r * b^2 (mod p). */
+	if (!BN_mod_sqr(b, b, p, ctx))
+		errx(1, "BN_mod_sqr");
+	if (!BN_mod_mul(r, r, b, p, ctx))
+		errx(1, "BN_mod_mul");
+
+	/* Compute a = a^3 (mod p). */
+	if (!BN_mod_sqr(b, a, p, ctx))
+		errx(1, "BN_mod_sqr");
+	if (!BN_mod_mul(a, a, b, p, ctx))
+		errx(1, "BN_mod_mul");
+
+	/*
+	 * XXX - this assumes that a, b, p >= 0, so the results are in [0, p).
+	 * This is currently enforced in the EC code.
+	 */
+	if (BN_cmp(r, a) != 0) {
+		fprintf(stderr, "FAIL: %s verification failed for %s\nr * b^2:\t",
+		    __func__, curve->comment);
+		BN_print_fp(stderr, r);
+		fprintf(stderr, "\na^3:\t\t");
+		BN_print_fp(stderr, a);
+		fprintf(stderr, "\n");
+		goto err;
+	}
+
+ done:
+	failed = 0;
+
+ err:
+	BN_CTX_end(ctx);
+	EC_GROUP_free(group);
+
+	return failed;
+}
+
+static int
+ec_group_check_seeds(void)
+{
+	BN_CTX *ctx = NULL;
+	EC_builtin_curve *all_curves = NULL;
+	size_t curve_id, ncurves;
+	int failed = 0;
+
+	if ((ctx = BN_CTX_new()) == NULL)
+		errx(1, "BN_CTX_new");
+
+	ncurves = EC_get_builtin_curves(NULL, 0);
+	if ((all_curves = calloc(ncurves, sizeof(*all_curves))) == NULL)
+		err(1, "calloc builtin curves");
+	EC_get_builtin_curves(all_curves, ncurves);
+
+	for (curve_id = 0; curve_id < ncurves; curve_id++)
+		failed |= ec_group_check_seed(&all_curves[curve_id], ctx);
+
+	free(all_curves);
+	BN_CTX_free(ctx);
+
+	return failed;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2358,7 +2689,9 @@ main(int argc, char **argv)
 	failed |= ec_group_pkparameters_correct_padding_test();
 	failed |= ec_group_roundtrip_builtin_curves();
 	failed |= ec_group_non_builtin_curves();
+	failed |= ec_group_builtin_curves_have_prime_order();
 	failed |= ec_group_check_private_keys();
+	failed |= ec_group_check_seeds();
 
 	return failed;
 }

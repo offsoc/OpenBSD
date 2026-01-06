@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.45 2022/12/15 08:06:13 florian Exp $ */
+/*	$OpenBSD: parse.y,v 1.47 2025/09/16 15:06:02 sthen Exp $ */
 
 /*
  * Copyright (c) 2016 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -101,11 +101,13 @@ typedef struct {
 %}
 
 %token	AUTHORITY URL API ACCOUNT CONTACT
-%token	DOMAIN ALTERNATIVE NAME NAMES CERT FULL CHAIN KEY SIGN WITH CHALLENGEDIR
+%token	DOMAIN ALTERNATIVE NAME NAMES CERT FULL CHAIN KEY SIGN WITH
+%token	CHALLENGEDIR PROFILE
 %token	YES NO
 %token	INCLUDE
 %token	ERROR
 %token	RSA ECDSA
+%token	INSECURE
 %token	<v.string>	STRING
 %token	<v.number>	NUMBER
 %type	<v.string>	string
@@ -239,6 +241,9 @@ authorityoptsl	: API URL STRING {
 			if ((s = strdup($2)) == NULL)
 				err(EXIT_FAILURE, "strdup");
 			auth->contact = s;
+		}
+		| INSECURE {
+			auth->insecure = 1;
 		}
 		;
 
@@ -393,6 +398,16 @@ domainoptsl	: ALTERNATIVE NAMES '{' optnl altname_l '}'
 				err(EXIT_FAILURE, "strdup");
 			domain->challengedir = s;
 		}
+		| PROFILE STRING {
+			char *s;
+			if (domain->profile != NULL) {
+				yyerror("duplicate profile");
+				YYERROR;
+			}
+			if ((s = strdup($2)) == NULL)
+				err(EXIT_FAILURE, "strdup");
+			domain->profile = s;
+		}
 		;
 
 altname_l	: altname optcommanl altname_l
@@ -467,9 +482,11 @@ lookup(char *s)
 		{"ecdsa",		ECDSA},
 		{"full",		FULL},
 		{"include",		INCLUDE},
+		{"insecure",		INSECURE},
 		{"key",			KEY},
 		{"name",		NAME},
 		{"names",		NAMES},
+		{"profile",		PROFILE},
 		{"rsa",			RSA},
 		{"sign",		SIGN},
 		{"url",			URL},
@@ -1054,6 +1071,8 @@ print_config(struct acme_conf *xconf)
 		if (a->account != NULL)
 			printf("\taccount key \"%s\" %s\n", a->account,
 			    kt2txt(a->keytype));
+		if (a->insecure)
+			printf("\tinsecure\n");
 		printf("}\n\n");
 	}
 	TAILQ_FOREACH(d, &xconf->domain_list, entry) {
@@ -1081,6 +1100,8 @@ print_config(struct acme_conf *xconf)
 		if (d->fullchain != NULL)
 			printf("\tdomain full chain certificate \"%s\"\n",
 			    d->fullchain);
+		if (d->profile != NULL)
+			printf("\tprofile \"%s\"\n", d->profile);
 		if (d->auth != NULL)
 			printf("\tsign with \"%s\"\n", d->auth);
 		if (d->challengedir != NULL)

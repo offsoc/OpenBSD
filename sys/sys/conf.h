@@ -1,4 +1,4 @@
-/*	$OpenBSD: conf.h,v 1.166 2024/10/30 06:16:27 jsg Exp $	*/
+/*	$OpenBSD: conf.h,v 1.168 2025/09/08 17:25:46 helg Exp $	*/
 /*	$NetBSD: conf.h,v 1.33 1996/05/03 20:03:32 christos Exp $	*/
 
 /*-
@@ -453,7 +453,7 @@ extern struct cdevsw cdevsw[];
 /* open, close, read, write, ioctl */
 #define cdev_fuse_init(c,n) { \
 	dev_init(c,n,open), dev_init(c,n,close), dev_init(c,n,read), \
-	dev_init(c,n,write), dev_init(c,n,ioctl), \
+	dev_init(c,n,write), (dev_type_ioctl((*))) enodev, \
 	(dev_type_stop((*))) enodev, 0, \
 	(dev_type_mmap((*))) enodev, 0, D_CLONE, dev_init(c,n,kqfilter) }
 
@@ -520,7 +520,6 @@ extern const int chrtoblktbl[];
 extern const int nchrtoblktbl;
 
 struct bdevsw *bdevsw_lookup(dev_t);
-struct cdevsw *cdevsw_lookup(dev_t);
 dev_t	chrtoblk(dev_t);
 dev_t	blktochr(dev_t);
 int	iskmemdev(dev_t);

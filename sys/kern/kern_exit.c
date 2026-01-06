@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_exit.c,v 1.249 2025/05/24 06:49:16 deraadt Exp $	*/
+/*	$OpenBSD: kern_exit.c,v 1.252 2025/08/10 15:17:57 deraadt Exp $	*/
 /*	$NetBSD: kern_exit.c,v 1.39 1996/04/22 01:38:25 christos Exp $	*/
 
 /*
@@ -243,9 +243,22 @@ exit1(struct proc *p, int xexit, int xsig, int flags)
 		if (pr->ps_pptr->ps_sigacts->ps_sigflags & SAS_NOCLDWAIT)
 			atomic_setbits_int(&pr->ps_flags, PS_NOZOMBIE);
 
-#ifdef __HAVE_PMAP_PURGE
-		pmap_purge(p);
+		/* Teardown the virtual address space. */
+		if ((p->p_flag & P_SYSTEM) == 0) {
+			/*
+			 * exit1() might be called with a lock count
+			 * greater than one and we want to ensure the
+			 * costly operation of tearing down the VM space
+			 * is performed unlocked.
+			 * It is safe to release them all since exit1()
+			 * will not return.
+			 */
+#ifdef MULTIPROCESSOR
+			__mp_release_all(&kernel_lock);
 #endif
+			uvm_purge();
+			KERNEL_LOCK();
+		}
 	}
 
 	p->p_fd = NULL;		/* zap the thread's copy */
@@ -661,7 +674,7 @@ loop:
 		return (0);
 	}
 	sleep_setup(q->p_p, PWAIT | PCATCH, "wait");
-	if ((error = sleep_finish(0,
+	if ((error = sleep_finish(INFSLP,
 	    !ISSET(atomic_load_int(&q->p_p->ps_flags), PS_WAITEVENT))) != 0)
 		return (error);
 	goto loop;
@@ -723,7 +736,7 @@ sys_waitid(struct proc *q, void *v, register_t *retval)
 	struct sys_waitid_args /* {
 		syscallarg(idtype_t) idtype;
 		syscallarg(id_t) id;
-		syscallarg(siginfo_t) info;
+		syscallarg(siginfo_t *) info;
 		syscallarg(int) options;
 	} */ *uap = v;
 	siginfo_t info;

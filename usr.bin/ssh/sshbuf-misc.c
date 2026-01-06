@@ -1,4 +1,4 @@
-/*	$OpenBSD: sshbuf-misc.c,v 1.19 2025/05/21 06:43:48 djm Exp $	*/
+/*	$OpenBSD: sshbuf-misc.c,v 1.22 2025/09/04 00:32:31 djm Exp $	*/
 /*
  * Copyright (c) 2011 Damien Miller
  *
@@ -208,6 +208,9 @@ sshbuf_dtourlb64(const struct sshbuf *d, struct sshbuf *b64, int wrap)
 	struct sshbuf *b = NULL;
 	size_t i, l;
 
+	if (sshbuf_len(d) == 0)
+		return 0;
+
 	if ((b = sshbuf_new()) == NULL)
 		return SSH_ERR_ALLOC_FAIL;
 	/* Encode using regular base64; we'll transform it once done */
@@ -250,7 +253,7 @@ sshbuf_dup_string(struct sshbuf *buf)
 	size_t l = sshbuf_len(buf);
 	char *r;
 
-	if (s == NULL || l > SIZE_MAX)
+	if (s == NULL || l >= SIZE_MAX)
 		return NULL;
 	/* accept a nul only as the last character in the buffer */
 	if (l > 0 && (p = memchr(s, '\0', l)) != NULL) {
@@ -277,6 +280,20 @@ sshbuf_cmp(const struct sshbuf *b, size_t offset,
 	if (offset + len > sshbuf_len(b))
 		return SSH_ERR_MESSAGE_INCOMPLETE;
 	if (timingsafe_bcmp(sshbuf_ptr(b) + offset, s, len) != 0)
+		return SSH_ERR_INVALID_FORMAT;
+	return 0;
+}
+
+int
+sshbuf_equals(const struct sshbuf *a, const struct sshbuf *b)
+{
+	if (sshbuf_ptr(a) == NULL || sshbuf_ptr(b) == NULL)
+		return SSH_ERR_INTERNAL_ERROR;
+	if (sshbuf_len(a) != sshbuf_len(b))
+		return SSH_ERR_MESSAGE_INCOMPLETE;
+	if (sshbuf_len(a) == 0)
+		return 0;
+	if (memcmp(sshbuf_ptr(a), sshbuf_ptr(b), sshbuf_len(a)) != 0)
 		return SSH_ERR_INVALID_FORMAT;
 	return 0;
 }

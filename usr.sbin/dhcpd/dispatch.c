@@ -1,4 +1,4 @@
-/*	$OpenBSD: dispatch.c,v 1.48 2025/05/31 07:49:48 dlg Exp $ */
+/*	$OpenBSD: dispatch.c,v 1.52 2025/12/18 03:16:10 jsg Exp $ */
 
 /*
  * Copyright (c) 1995, 1996, 1997, 1998, 1999
@@ -67,7 +67,7 @@
 #include "log.h"
 #include "sync.h"
 
-extern int syncfd;
+extern int rdomain;
 
 struct interface_info *interfaces;
 struct protocol *protocols;
@@ -75,7 +75,6 @@ struct dhcpd_timeout *timeouts;
 static int interfaces_invalidated;
 
 static int interface_status(struct interface_info *ifinfo);
-int get_rdomain(char *);
 
 /* Use getifaddrs() to get a list of all the attached interfaces.
    For each interface that's of type INET and not the loopback interface,
@@ -83,14 +82,14 @@ int get_rdomain(char *);
    subnet it's on, and add it to the list of interfaces. */
 
 void
-discover_interfaces(int *rdomain)
+discover_interfaces(void)
 {
 	struct interface_info *tmp;
 	struct interface_info *last, *next;
 	struct subnet *subnet;
 	struct shared_network *share;
 	struct sockaddr_in foo;
-	int ir = 0, ird;
+	int ir;
 	struct ifreq *tif;
 	struct ifaddrs *ifap, *ifa;
 
@@ -101,11 +100,7 @@ discover_interfaces(int *rdomain)
 	 * If we already have a list of interfaces, the interfaces were
 	 * requested.
 	 */
-	if (interfaces != NULL)
-		ir = 1;
-	else
-		/* must specify an interface when rdomains are used */
-		*rdomain = 0;
+	ir = (interfaces != NULL);
 
 	/* Cycle through the list of interfaces looking for IP addresses. */
 	for (ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
@@ -127,15 +122,6 @@ discover_interfaces(int *rdomain)
 		if (tmp == NULL && ir)
 			continue;
 
-		ird = get_rdomain(ifa->ifa_name);
-		if (*rdomain == -1)
-			*rdomain = ird;
-		else if (*rdomain != ird && ir)
-			fatalx("Interface %s is not in rdomain %d",
-			    tmp->name, *rdomain);
-		else if (*rdomain != ird && !ir)
-			continue;
-
 		/* If there isn't already an interface by this name,
 		   allocate one. */
 		if (tmp == NULL) {
@@ -152,16 +138,19 @@ discover_interfaces(int *rdomain)
 		/* If we have the capability, extract link information
 		   and record it in a linked list. */
 		if (ifa->ifa_addr->sa_family == AF_LINK) {
-			struct sockaddr_dl *sdl =
-			    ((struct sockaddr_dl *)(ifa->ifa_addr));
+			struct if_data *ifi = ifa->ifa_data;
+			struct sockaddr_dl *sdl;
+
+			if (rdomain != ifi->ifi_rdomain)
+				continue;
+
+			sdl = (struct sockaddr_dl *)ifa->ifa_addr;
 			tmp->index = sdl->sdl_index;
 			tmp->hw_address.hlen = sdl->sdl_alen;
 			tmp->hw_address.htype = HTYPE_ETHER; /* XXX */
 			memcpy(tmp->hw_address.haddr,
 			    LLADDR(sdl), sdl->sdl_alen);
 		} else if (ifa->ifa_addr->sa_family == AF_INET) {
-			struct iaddr addr;
-
 			/* Get a pointer to the address... */
 			memcpy(&foo, ifa->ifa_addr, sizeof(foo));
 
@@ -184,54 +173,26 @@ discover_interfaces(int *rdomain)
 				tmp->ifp = tif;
 				tmp->primary_address = foo.sin_addr;
 			}
-
-			/* Grab the address... */
-			addr.len = 4;
-			memcpy(addr.iabuf, &foo.sin_addr.s_addr, addr.len);
-
-			/* If there's a registered subnet for this address,
-			   connect it together... */
-			if ((subnet = find_subnet(addr))) {
-				/* If this interface has multiple aliases
-				   on the same subnet, ignore all but the
-				   first we encounter. */
-				if (!subnet->interface) {
-					subnet->interface = tmp;
-					subnet->interface_address = addr;
-				} else if (subnet->interface != tmp) {
-					log_warnx("Multiple %s %s: %s %s",
-					    "interfaces match the",
-					    "same subnet",
-					    subnet->interface->name,
-					    tmp->name);
-				}
-				share = subnet->shared_network;
-				if (tmp->shared_network &&
-				    tmp->shared_network != share) {
-					log_warnx("Interface %s matches %s",
-					    tmp->name,
-					    "multiple shared networks");
-				} else {
-					tmp->shared_network = share;
-				}
-
-				if (!share->interface) {
-					share->interface = tmp;
-				} else if (share->interface != tmp) {
-					log_warnx("Multiple %s %s: %s %s",
-					    "interfaces match the",
-					    "same shared network",
-					    share->interface->name,
-					    tmp->name);
-				}
-			}
 		}
 	}
 
 	/* Discard interfaces we can't listen on. */
 	last = NULL;
 	for (tmp = interfaces; tmp; tmp = next) {
+		struct iaddr addr;
+
 		next = tmp->next;
+
+		if (tmp->index == 0) {
+			log_warnx("Can't listen on %s - wrong rdomain",
+			    tmp->name);
+			/* Remove tmp from the list of interfaces. */
+			if (!last)
+				interfaces = interfaces->next;
+			else
+				last->next = tmp->next;
+			continue;
+		}
 
 		if (!tmp->ifp) {
 			log_warnx("Can't listen on %s - it has no IP address.",
@@ -245,6 +206,47 @@ discover_interfaces(int *rdomain)
 		}
 
 		memcpy(&foo, &tmp->ifp->ifr_addr, sizeof tmp->ifp->ifr_addr);
+
+		/* Grab the address... */
+		addr.len = 4;
+		memcpy(addr.iabuf, &foo.sin_addr.s_addr, addr.len);
+
+		/* If there's a registered subnet for this address,
+		   connect it together... */
+		if ((subnet = find_subnet(addr))) {
+			/* If this interface has multiple aliases
+			   on the same subnet, ignore all but the
+			   first we encounter. */
+			if (!subnet->interface) {
+				subnet->interface = tmp;
+				subnet->interface_address = addr;
+			} else if (subnet->interface != tmp) {
+				log_warnx("Multiple %s %s: %s %s",
+				    "interfaces match the",
+				    "same subnet",
+				    subnet->interface->name,
+				    tmp->name);
+			}
+			share = subnet->shared_network;
+			if (tmp->shared_network &&
+			    tmp->shared_network != share) {
+				log_warnx("Interface %s matches %s",
+				    tmp->name,
+				    "multiple shared networks");
+			} else {
+				tmp->shared_network = share;
+			}
+
+			if (!share->interface) {
+				share->interface = tmp;
+			} else if (share->interface != tmp) {
+				log_warnx("Multiple %s %s: %s %s",
+				    "interfaces match the",
+				    "same shared network",
+				    share->interface->name,
+				    tmp->name);
+			}
+		}
 
 		if (!tmp->shared_network) {
 			log_warnx("Can't listen on %s - dhcpd.conf has no "
@@ -301,14 +303,13 @@ void
 dispatch(void)
 {
 	int nfds, i, to_msec;
-	struct protocol *l;
+	struct protocol *l, *next;
 	static struct pollfd *fds;
 	static int nfds_max;
 	time_t howlong;
+	int nifaces;
 
 	for (nfds = 0, l = protocols; l; l = l->next)
-		nfds++;
-	if (syncfd != -1)
 		nfds++;
 	if (nfds > nfds_max) {
 		fds = reallocarray(fds, nfds, sizeof(struct pollfd));
@@ -348,13 +349,15 @@ another:
 			to_msec = -1;
 
 		/* Set up the descriptors to be polled. */
+		nifaces = 0;
 		for (i = 0, l = protocols; l; l = l->next) {
 			if (l->handler == got_one) {
 				struct interface_info *ip = l->local;
 				if (ip->dead) {
 					l->pfd = -1;
 					continue;
-				}
+				} else
+					nifaces++;
 			}
 
 			fds[i].fd = l->fd;
@@ -362,14 +365,8 @@ another:
 			l->pfd = i++;
 		}
 
-		if (i == 0)
+		if (nifaces == 0)
 			fatalx("No live interfaces to poll on - exiting.");
-
-		if (syncfd != -1) {
-			/* add syncer */
-			fds[i].fd = syncfd;
-			fds[i].events = POLLIN;
-		}
 
 		/* Wait for a packet or a timeout... */
 		switch (poll(fds, nfds, to_msec)) {
@@ -382,7 +379,8 @@ another:
 		}
 		time(&cur_time);
 
-		for (l = protocols; l; l = l->next) {
+		for (l = protocols; l; l = next) {
+			next = l->next;
 			i = l->pfd;
 			if (i == -1)
 				continue;
@@ -390,8 +388,6 @@ another:
 			if (fds[i].revents & (POLLIN | POLLHUP))
 				l->handler(l);
 		}
-		if ((syncfd != -1) && (fds[i].revents & (POLLIN | POLLHUP)))
-			sync_recv();
 		interfaces_invalidated = 0;
 	}
 }
@@ -625,22 +621,4 @@ remove_protocol(struct protocol *proto)
 			free(p);
 		}
 	}
-}
-
-int
-get_rdomain(char *name)
-{
-	int rv = 0, s;
-	struct  ifreq ifr;
-
-	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
-		fatal("get_rdomain socket");
-
-	memset(&ifr, 0, sizeof(ifr));
-	strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
-	if (ioctl(s, SIOCGIFRDOMAIN, (caddr_t)&ifr) != -1)
-		rv = ifr.ifr_rdomainid;
-
-	close(s);
-	return rv;
 }

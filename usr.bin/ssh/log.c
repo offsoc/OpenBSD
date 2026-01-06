@@ -1,4 +1,4 @@
-/* $OpenBSD: log.c,v 1.64 2024/12/07 10:05:36 djm Exp $ */
+/* $OpenBSD: log.c,v 1.66 2025/11/17 05:24:42 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -367,7 +367,8 @@ do_log(LogLevel level, int force, const char *suffix, const char *fmt,
 		/* Avoid recursion */
 		tmp_handler = log_handler;
 		log_handler = NULL;
-		tmp_handler(level, force, fmtbuf, log_handler_ctx);
+		/* Note: this sends the raw (i.e. no strnvis) log message */
+		tmp_handler(level, force, msgbuf, log_handler_ctx);
 		log_handler = tmp_handler;
 	} else if (log_on_stderr) {
 		snprintf(msgbuf, sizeof msgbuf, "%s%s%.*s\r\n",
@@ -460,7 +461,7 @@ sshlogdirect(LogLevel level, int forced, const char *fmt, ...)
  * To prevent flipping in and out of rate-limiting, there is a hysteresis
  * timer that delays leaving the rate-limited state.
  *
- * While in the rate-limited state, events can be periodically allowed though
+ * While in the rate-limited state, events can be periodically allowed through
  * and the number of dropped events since the last log obtained.
  *
  * XXX a moving average rate of events might be a better approach here rather

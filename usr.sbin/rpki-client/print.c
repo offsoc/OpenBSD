@@ -1,4 +1,4 @@
-/*	$OpenBSD: print.c,v 1.60 2025/04/27 20:28:51 job Exp $ */
+/*	$OpenBSD: print.c,v 1.72 2025/12/30 09:04:09 job Exp $ */
 /*
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -426,7 +426,8 @@ crl_print(const struct crl *p)
 		rev = sk_X509_REVOKED_value(revlist, i);
 		serial = x509_convert_seqnum(__func__, "serial number",
 		    X509_REVOKED_get0_serialNumber(rev));
-		x509_get_time(X509_REVOKED_get0_revocationDate(rev), &t);
+		if (!x509_get_time(X509_REVOKED_get0_revocationDate(rev), &t))
+			errx(1, "x509_get_time() failed - malformed ASN.1?");
 		if (serial != NULL) {
 			if (outformats & FORMAT_JSON) {
 				json_do_object("cert", 1);
@@ -447,37 +448,36 @@ crl_print(const struct crl *p)
 }
 
 void
-mft_print(const X509 *x, const struct mft *p)
+mft_print(const struct cert *c, const struct mft *p)
 {
 	size_t i;
 	char *hash;
 
 	if (outformats & FORMAT_JSON) {
 		json_do_string("type", "manifest");
-		json_do_string("ski", p->ski);
-		x509_print(x);
-		json_do_string("aki", p->aki);
-		json_do_string("aia", p->aia);
-		json_do_string("sia", p->sia);
+		json_do_string("ski", c->ski);
+		x509_print(c->x509);
+		json_do_string("aki", c->aki);
+		json_do_string("aia", c->aia);
+		json_do_string("sia", c->signedobj);
 		json_do_string("manifest_number", p->seqnum);
-		if (p->signtime != 0)
-			json_do_int("signing_time", p->signtime);
+		json_do_int("signing_time", p->signtime);
 		json_do_int("valid_since", p->thisupdate);
 		json_do_int("valid_until", p->nextupdate);
 		if (p->expires)
 			json_do_int("expires", p->expires);
 	} else {
-		printf("Subject key identifier:   %s\n", pretty_key_id(p->ski));
-		printf("Authority key identifier: %s\n", pretty_key_id(p->aki));
-		x509_print(x);
-		printf("Authority info access:    %s\n", p->aia);
-		printf("Subject info access:      %s\n", p->sia);
+		printf("Subject key identifier:   %s\n", pretty_key_id(c->ski));
+		printf("Authority key identifier: %s\n", pretty_key_id(c->aki));
+		x509_print(c->x509);
+		printf("Authority info access:    %s\n", c->aia);
+		printf("Subject info access:      %s\n", c->signedobj);
 		printf("Manifest number:          %s\n", p->seqnum);
-		if (p->signtime != 0)
-			printf("Signing time:             %s\n",
-			    time2str(p->signtime));
-		printf("Manifest this update:     %s\n", time2str(p->thisupdate));
-		printf("Manifest next update:     %s\n", time2str(p->nextupdate));
+		printf("Signing time:             %s\n", time2str(p->signtime));
+		printf("Manifest this update:     %s\n",
+		    time2str(p->thisupdate));
+		printf("Manifest next update:     %s\n",
+		    time2str(p->nextupdate));
 		printf("Files and hashes:         ");
 	}
 
@@ -507,36 +507,33 @@ mft_print(const X509 *x, const struct mft *p)
 }
 
 void
-roa_print(const X509 *x, const struct roa *p)
+roa_print(const struct cert *c, const struct roa *p)
 {
 	char	 buf[128];
 	size_t	 i;
 
 	if (outformats & FORMAT_JSON) {
 		json_do_string("type", "roa");
-		json_do_string("ski", p->ski);
-		x509_print(x);
-		json_do_string("aki", p->aki);
-		json_do_string("aia", p->aia);
-		json_do_string("sia", p->sia);
-		if (p->signtime != 0)
-			json_do_int("signing_time", p->signtime);
-		json_do_int("valid_since", p->notbefore);
-		json_do_int("valid_until", p->notafter);
+		json_do_string("ski", c->ski);
+		x509_print(c->x509);
+		json_do_string("aki", c->aki);
+		json_do_string("aia", c->aia);
+		json_do_string("sia", c->signedobj);
+		json_do_int("signing_time", p->signtime);
+		json_do_int("valid_since", c->notbefore);
+		json_do_int("valid_until", c->notafter);
 		if (p->expires)
 			json_do_int("expires", p->expires);
 	} else {
-		printf("Subject key identifier:   %s\n", pretty_key_id(p->ski));
-		x509_print(x);
-		printf("Authority key identifier: %s\n", pretty_key_id(p->aki));
-		printf("Authority info access:    %s\n", p->aia);
-		printf("Subject info access:      %s\n", p->sia);
-		if (p->signtime != 0)
-			printf("Signing time:             %s\n",
-			    time2str(p->signtime));
+		printf("Subject key identifier:   %s\n", pretty_key_id(c->ski));
+		x509_print(c->x509);
+		printf("Authority key identifier: %s\n", pretty_key_id(c->aki));
+		printf("Authority info access:    %s\n", c->aia);
+		printf("Subject info access:      %s\n", c->signedobj);
+		printf("Signing time:             %s\n", time2str(p->signtime));
 		printf("ROA not before:           %s\n",
-		    time2str(p->notbefore));
-		printf("ROA not after:            %s\n", time2str(p->notafter));
+		    time2str(c->notbefore));
+		printf("ROA not after:            %s\n", time2str(c->notafter));
 		printf("asID:                     %u\n", p->asid);
 		printf("IP address blocks:        ");
 	}
@@ -563,37 +560,34 @@ roa_print(const X509 *x, const struct roa *p)
 }
 
 void
-spl_print(const X509 *x, const struct spl *s)
+spl_print(const struct cert *c, const struct spl *s)
 {
 	char	 buf[128];
 	size_t	 i;
 
 	if (outformats & FORMAT_JSON) {
 		json_do_string("type", "spl");
-		json_do_string("ski", s->ski);
-		x509_print(x);
-		json_do_string("aki", s->aki);
-		json_do_string("aia", s->aia);
-		json_do_string("sia", s->sia);
-		if (s->signtime != 0)
-			json_do_int("signing_time", s->signtime);
-		json_do_int("valid_since", s->notbefore);
-		json_do_int("valid_until", s->notafter);
+		json_do_string("ski", c->ski);
+		x509_print(c->x509);
+		json_do_string("aki", c->aki);
+		json_do_string("aia", c->aia);
+		json_do_string("sia", c->signedobj);
+		json_do_int("signing_time", s->signtime);
+		json_do_int("valid_since", c->notbefore);
+		json_do_int("valid_until", c->notafter);
 		if (s->expires)
 			json_do_int("expires", s->expires);
 		json_do_int("asid", s->asid);
 	} else {
-		printf("Subject key identifier:   %s\n", pretty_key_id(s->ski));
-		x509_print(x);
-		printf("Authority key identifier: %s\n", pretty_key_id(s->aki));
-		printf("Authority info access:    %s\n", s->aia);
-		printf("Subject info access:      %s\n", s->sia);
-		if (s->signtime != 0)
-			printf("Signing time:             %s\n",
-			    time2str(s->signtime));
+		printf("Subject key identifier:   %s\n", pretty_key_id(c->ski));
+		x509_print(c->x509);
+		printf("Authority key identifier: %s\n", pretty_key_id(c->aki));
+		printf("Authority info access:    %s\n", c->aia);
+		printf("Subject info access:      %s\n", c->signedobj);
+		printf("Signing time:             %s\n", time2str(s->signtime));
 		printf("SPL not before:           %s\n",
-		    time2str(s->notbefore));
-		printf("SPL not after:            %s\n", time2str(s->notafter));
+		    time2str(c->notbefore));
+		printf("SPL not after:            %s\n", time2str(c->notafter));
 		printf("asID:                     %u\n", s->asid);
 		printf("Originated IP Prefixes:   ");
 	}
@@ -617,68 +611,32 @@ spl_print(const X509 *x, const struct spl *s)
 }
 
 void
-gbr_print(const X509 *x, const struct gbr *p)
-{
-	if (outformats & FORMAT_JSON) {
-		json_do_string("type", "gbr");
-		json_do_string("ski", p->ski);
-		x509_print(x);
-		json_do_string("aki", p->aki);
-		json_do_string("aia", p->aia);
-		json_do_string("sia", p->sia);
-		if (p->signtime != 0)
-			json_do_int("signing_time", p->signtime);
-		json_do_int("valid_since", p->notbefore);
-		json_do_int("valid_until", p->notafter);
-		if (p->expires)
-			json_do_int("expires", p->expires);
-		json_do_string("vcard", p->vcard);
-	} else {
-		printf("Subject key identifier:   %s\n", pretty_key_id(p->ski));
-		x509_print(x);
-		printf("Authority key identifier: %s\n", pretty_key_id(p->aki));
-		printf("Authority info access:    %s\n", p->aia);
-		printf("Subject info access:      %s\n", p->sia);
-		if (p->signtime != 0)
-			printf("Signing time:             %s\n",
-			    time2str(p->signtime));
-		printf("GBR not before:           %s\n",
-		    time2str(p->notbefore));
-		printf("GBR not after:            %s\n", time2str(p->notafter));
-		printf("vcard:\n%s", p->vcard);
-	}
-}
-
-void
-rsc_print(const X509 *x, const struct rsc *p)
+rsc_print(const struct cert *c, const struct rsc *p)
 {
 	char	*hash;
 	size_t	 i;
 
 	if (outformats & FORMAT_JSON) {
 		json_do_string("type", "rsc");
-		json_do_string("ski", p->ski);
-		x509_print(x);
-		json_do_string("aki", p->aki);
-		json_do_string("aia", p->aia);
-		if (p->signtime != 0)
-			json_do_int("signing_time", p->signtime);
-		json_do_int("valid_since", p->notbefore);
-		json_do_int("valid_until", p->notafter);
+		json_do_string("ski", c->ski);
+		x509_print(c->x509);
+		json_do_string("aki", c->aki);
+		json_do_string("aia", c->aia);
+		json_do_int("signing_time", p->signtime);
+		json_do_int("valid_since", c->notbefore);
+		json_do_int("valid_until", c->notafter);
 		if (p->expires)
-			json_do_int("expires", p->expires);
+			json_do_int("expires", c->expires);
 		json_do_array("signed_with_resources");
 	} else {
-		printf("Subject key identifier:   %s\n", pretty_key_id(p->ski));
-		printf("Authority key identifier: %s\n", pretty_key_id(p->aki));
-		x509_print(x);
-		printf("Authority info access:    %s\n", p->aia);
-		if (p->signtime != 0)
-			printf("Signing time:             %s\n",
-			    time2str(p->signtime));
+		printf("Subject key identifier:   %s\n", pretty_key_id(c->ski));
+		printf("Authority key identifier: %s\n", pretty_key_id(c->aki));
+		x509_print(c->x509);
+		printf("Authority info access:    %s\n", c->aia);
+		printf("Signing time:             %s\n", time2str(p->signtime));
 		printf("RSC not before:           %s\n",
-		    time2str(p->notbefore));
-		printf("RSC not after:            %s\n", time2str(p->notafter));
+		    time2str(c->notbefore));
+		printf("RSC not after:            %s\n", time2str(c->notafter));
 		printf("Signed with resources:    ");
 	}
 
@@ -719,37 +677,34 @@ rsc_print(const X509 *x, const struct rsc *p)
 }
 
 void
-aspa_print(const X509 *x, const struct aspa *p)
+aspa_print(const struct cert *c, const struct aspa *p)
 {
 	size_t	i;
 
 	if (outformats & FORMAT_JSON) {
 		json_do_string("type", "aspa");
-		json_do_string("ski", p->ski);
-		x509_print(x);
-		json_do_string("aki", p->aki);
-		json_do_string("aia", p->aia);
-		json_do_string("sia", p->sia);
-		if (p->signtime != 0)
-			json_do_int("signing_time", p->signtime);
-		json_do_int("valid_since", p->notbefore);
-		json_do_int("valid_until", p->notafter);
+		json_do_string("ski", c->ski);
+		x509_print(c->x509);
+		json_do_string("aki", c->aki);
+		json_do_string("aia", c->aia);
+		json_do_string("sia", c->signedobj);
+		json_do_int("signing_time", p->signtime);
+		json_do_int("valid_since", c->notbefore);
+		json_do_int("valid_until", c->notafter);
 		if (p->expires)
 			json_do_int("expires", p->expires);
 		json_do_uint("customer_asid", p->custasid);
 		json_do_array("providers");
 	} else {
-		printf("Subject key identifier:   %s\n", pretty_key_id(p->ski));
-		x509_print(x);
-		printf("Authority key identifier: %s\n", pretty_key_id(p->aki));
-		printf("Authority info access:    %s\n", p->aia);
-		printf("Subject info access:      %s\n", p->sia);
-		if (p->signtime != 0)
-			printf("Signing time:             %s\n",
-			    time2str(p->signtime));
+		printf("Subject key identifier:   %s\n", pretty_key_id(c->ski));
+		x509_print(c->x509);
+		printf("Authority key identifier: %s\n", pretty_key_id(c->aki));
+		printf("Authority info access:    %s\n", c->aia);
+		printf("Subject info access:      %s\n", c->signedobj);
+		printf("Signing time:             %s\n", time2str(p->signtime));
 		printf("ASPA not before:          %s\n",
-		    time2str(p->notbefore));
-		printf("ASPA not after:           %s\n", time2str(p->notafter));
+		    time2str(c->notbefore));
+		printf("ASPA not after:           %s\n", time2str(c->notafter));
 		printf("Customer ASID:            %u\n", p->custasid);
 		printf("Providers:                ");
 	}
@@ -810,34 +765,31 @@ takey_print(char *name, const struct takey *t)
 }
 
 void
-tak_print(const X509 *x, const struct tak *p)
+tak_print(const struct cert *c, const struct tak *p)
 {
 	if (outformats & FORMAT_JSON) {
 		json_do_string("type", "tak");
-		json_do_string("ski", p->ski);
-		x509_print(x);
-		json_do_string("aki", p->aki);
-		json_do_string("aia", p->aia);
-		json_do_string("sia", p->sia);
-		if (p->signtime != 0)
-			json_do_int("signing_time", p->signtime);
-		json_do_int("valid_since", p->notbefore);
-		json_do_int("valid_until", p->notafter);
+		json_do_string("ski", c->ski);
+		x509_print(c->x509);
+		json_do_string("aki", c->aki);
+		json_do_string("aia", c->aia);
+		json_do_string("sia", c->signedobj);
+		json_do_int("signing_time", p->signtime);
+		json_do_int("valid_since", c->notbefore);
+		json_do_int("valid_until", c->notafter);
 		if (p->expires)
 			json_do_int("expires", p->expires);
 		json_do_array("takeys");
 	} else {
-		printf("Subject key identifier:   %s\n", pretty_key_id(p->ski));
-		x509_print(x);
-		printf("Authority key identifier: %s\n", pretty_key_id(p->aki));
-		printf("Authority info access:    %s\n", p->aia);
-		printf("Subject info access:      %s\n", p->sia);
-		if (p->signtime != 0)
-			printf("Signing time:             %s\n",
-			    time2str(p->signtime));
+		printf("Subject key identifier:   %s\n", pretty_key_id(c->ski));
+		x509_print(c->x509);
+		printf("Authority key identifier: %s\n", pretty_key_id(c->aki));
+		printf("Authority info access:    %s\n", c->aia);
+		printf("Subject info access:      %s\n", c->signedobj);
+		printf("Signing time:             %s\n", time2str(p->signtime));
 		printf("TAK not before:           %s\n",
-		    time2str(p->notbefore));
-		printf("TAK not after:            %s\n", time2str(p->notafter));
+		    time2str(c->notbefore));
+		printf("TAK not after:            %s\n", time2str(c->notafter));
 	}
 
 	takey_print("current", p->current);
@@ -851,35 +803,32 @@ tak_print(const X509 *x, const struct tak *p)
 }
 
 void
-geofeed_print(const X509 *x, const struct geofeed *p)
+geofeed_print(const struct cert *c, const struct geofeed *p)
 {
 	char	 buf[128];
 	size_t	 i;
 
 	if (outformats & FORMAT_JSON) {
 		json_do_string("type", "geofeed");
-		json_do_string("ski", p->ski);
-		x509_print(x);
-		json_do_string("aki", p->aki);
-		json_do_string("aia", p->aia);
-		if (p->signtime != 0)
-			json_do_int("signing_time", p->signtime);
-		json_do_int("valid_since", p->notbefore);
-		json_do_int("valid_until", p->notafter);
+		json_do_string("ski", c->ski);
+		x509_print(c->x509);
+		json_do_string("aki", c->aki);
+		json_do_string("aia", c->aia);
+		json_do_int("signing_time", p->signtime);
+		json_do_int("valid_since", c->notbefore);
+		json_do_int("valid_until", c->notafter);
 		if (p->expires)
 			json_do_int("expires", p->expires);
 		json_do_array("records");
 	} else {
-		printf("Subject key identifier:   %s\n", pretty_key_id(p->ski));
-		x509_print(x);
-		printf("Authority key identifier: %s\n", pretty_key_id(p->aki));
-		printf("Authority info access:    %s\n", p->aia);
-		if (p->signtime != 0)
-			printf("Signing time:             %s\n",
-			    time2str(p->signtime));
+		printf("Subject key identifier:   %s\n", pretty_key_id(c->ski));
+		x509_print(c->x509);
+		printf("Authority key identifier: %s\n", pretty_key_id(c->aki));
+		printf("Authority info access:    %s\n", c->aia);
+		printf("Signing time:             %s\n", time2str(p->signtime));
 		printf("Geofeed not before:       %s\n",
-		    time2str(p->notbefore));
-		printf("Geofeed not after:        %s\n", time2str(p->notafter));
+		    time2str(c->notbefore));
+		printf("Geofeed not after:        %s\n", time2str(c->notafter));
 		printf("Geofeed CSV records:      ");
 	}
 
@@ -903,4 +852,263 @@ geofeed_print(const X509 *x, const struct geofeed *p)
 
 	if (outformats & FORMAT_JSON)
 		json_do_end();
+}
+
+static void
+print_ccr_mftstate(struct ccr *ccr)
+{
+	char *aki, *hash, *ski;
+	struct ccr_mft *ccr_mft;
+	struct ccr_mft_sub_ski *sub;
+
+	if (outformats & FORMAT_JSON) {
+		json_do_object("manifest_state", 0);
+		json_do_int("most_recent_update", ccr->most_recent_update);
+		json_do_string("hash", ccr->mfts_hash);
+		json_do_array("mft_instances");
+	} else {
+		printf("Manifest state hash:      %s\n", ccr->mfts_hash);
+		printf("Manifest last update:     %s\n",
+		    time2str(ccr->most_recent_update));
+		printf("Manifest instances:\n");
+	}
+
+	RB_FOREACH(ccr_mft, ccr_mft_tree, &ccr->mfts) {
+		if (base64_encode(ccr_mft->hash, SHA256_DIGEST_LENGTH, &hash)
+		    == -1)
+			errx(1, "base64_encode");
+		aki = hex_encode(ccr_mft->aki, SHA_DIGEST_LENGTH);
+
+		if (outformats & FORMAT_JSON) {
+			json_do_object("mft_instance", 1);
+
+			json_do_string("hash", hash);
+			json_do_uint("size", ccr_mft->size);
+			json_do_string("aki", aki);
+			json_do_string("seqnum", ccr_mft->seqnum);
+			json_do_int("thisupdate", ccr_mft->thisupdate);
+			json_do_string("sia", ccr_mft->sia);
+
+			json_do_array("subordinates");
+			SLIST_FOREACH(sub, &ccr_mft->subordinates, entry) {
+				ski = hex_encode(sub->ski, SHA_DIGEST_LENGTH);
+				json_do_string("ski", ski);
+				free(ski);
+				ski = NULL;
+			}
+			json_do_end(); /* subordinates */
+
+			json_do_end(); /* mft_instance */
+		} else {
+			int i;
+
+			printf("%26shash:%s size:%zu aki:%s seqnum:%s "
+			    "thisupdate:%lld sia:%s", "", hash,
+			    ccr_mft->size, aki, ccr_mft->seqnum,
+			    (long long)ccr_mft->thisupdate, ccr_mft->sia);
+
+			i = 0;
+			SLIST_FOREACH(sub, &ccr_mft->subordinates, entry) {
+				if (i++ == 0)
+					printf(" subordinates:");
+				else
+					printf(",");
+
+				ski = hex_encode(sub->ski, SHA_DIGEST_LENGTH);
+				printf("%s", ski);
+				free(ski);
+				ski = NULL;
+			}
+
+			printf("\n");
+		}
+
+		free(aki);
+		free(hash);
+	}
+	if (outformats & FORMAT_JSON) {
+		json_do_end(); /* mft_instances */
+		json_do_end(); /* manifest_state */
+	}
+}
+
+static void
+print_ccr_roastate(struct ccr *ccr)
+{
+	char buf[64];
+	struct vrp *vrp;
+
+	if (outformats & FORMAT_JSON) {
+		json_do_object("roapayload_state", 0);
+		json_do_string("hash", ccr->vrps_hash);
+		json_do_array("vrps");
+	} else {
+		printf("ROA payload state hash:   %s\n", ccr->vrps_hash);
+		printf("ROA payload entries:\n");
+	}
+
+	RB_FOREACH(vrp, ccr_vrp_tree, &ccr->vrps) {
+		ip_addr_print(&vrp->addr, vrp->afi, buf, sizeof(buf));
+
+		if (outformats & FORMAT_JSON) {
+			json_do_object("vrp", 1);
+			json_do_string("prefix", buf);
+			json_do_int("asn", vrp->asid);
+			if (vrp->maxlength)
+				json_do_int("maxlen", vrp->maxlength);
+			json_do_end();
+		} else {
+			printf("%26s%s", "", buf);
+			if (vrp->maxlength)
+				printf("-%hhu", vrp->maxlength);
+			printf(" AS %u\n", vrp->asid);
+		}
+
+	}
+	if (outformats & FORMAT_JSON) {
+		json_do_end();
+		json_do_end();
+	}
+}
+
+static void
+print_ccr_aspastate(struct ccr *ccr)
+{
+	struct vap *vap;
+	size_t i;
+
+	if (outformats & FORMAT_JSON) {
+		json_do_object("aspapayload_state", 0);
+		json_do_string("hash", ccr->vaps_hash);
+		json_do_array("vaps");
+	} else {
+		printf("ASPA payload state hash:  %s\n", ccr->vaps_hash);
+		printf("ASPA payload entries:\n");
+	}
+
+	RB_FOREACH(vap, vap_tree, &ccr->vaps) {
+		if (outformats & FORMAT_JSON) {
+			json_do_object("vap", 1);
+			json_do_uint("customer_asid", vap->custasid);
+			json_do_array("providers");
+		} else {
+			printf("%26s", "");
+			printf("customer: %d providers: ", vap->custasid);
+		}
+
+		for (i = 0; i < vap->num_providers; i++) {
+			if (outformats & FORMAT_JSON)
+				json_do_uint("provider", vap->providers[i]);
+			else {
+				if (i > 0)
+					printf(", ");
+				printf("%u", vap->providers[i]);
+			}
+		}
+		if (outformats & FORMAT_JSON) {
+			json_do_end();
+			json_do_end();
+		} else
+			printf("\n");
+	}
+
+	if (outformats & FORMAT_JSON) {
+		json_do_end();
+		json_do_end();
+	}
+}
+
+static void
+print_ccr_tastate(struct ccr *ccr)
+{
+	char *ski;
+	struct ccr_tas_ski *cts;
+	int i = 0;
+
+	if (outformats & FORMAT_JSON) {
+		json_do_object("trustanchor_state", 0);
+		json_do_string("hash", ccr->tas_hash);
+		json_do_array("skis");
+	} else {
+		printf("Trust anchor state hash:  %s\n", ccr->tas_hash);
+		printf("Trust anchor keyids:      ");
+	}
+
+	RB_FOREACH(cts, ccr_tas_tree, &ccr->tas) {
+		ski = hex_encode(cts->keyid, sizeof(cts->keyid));
+
+		if (outformats & FORMAT_JSON) {
+			json_do_string("ski", ski);
+		} else {
+			if (++i > 1)
+				printf(", ");
+			printf("%s", ski);
+		}
+
+		free(ski);
+	}
+
+	if (outformats & FORMAT_JSON) {
+		json_do_end();
+		json_do_end();
+	} else {
+		printf("\n");
+	}
+}
+
+static void
+print_ccr_rkstate(struct ccr *ccr)
+{
+	struct brk *brk;
+
+	if (outformats & FORMAT_JSON) {
+		json_do_object("routerkey_state", 0);
+		json_do_string("hash", ccr->brks_hash);
+		json_do_array("routerkeys");
+		RB_FOREACH(brk, brk_tree, &ccr->brks) {
+			json_do_object("brk", 0);
+			json_do_int("asn", brk->asid);
+			json_do_string("ski", brk->ski);
+			json_do_string("pubkey", brk->pubkey);
+			json_do_end(); /* brk */
+		}
+		json_do_end(); /* routerkeys */
+		json_do_end(); /* routerkey_state */
+	} else {
+		printf("Router key state hash:    %s\n", ccr->brks_hash);
+		printf("Router keys:\n");
+		RB_FOREACH(brk, brk_tree, &ccr->brks) {
+			printf("%26s", "");
+			printf("asid:%d ", brk->asid);
+			printf("ski:%s ", brk->ski);
+			printf("pubkey:%s\n", brk->pubkey);
+		}
+	}
+}
+
+void
+ccr_print(struct ccr *ccr)
+{
+	if (outformats & FORMAT_JSON) {
+		json_do_string("type", "ccr");
+		json_do_int("produced_at", ccr->producedat);
+	} else {
+		printf("CCR produced at:          %s\n",
+		    time2str(ccr->producedat));
+	}
+
+	if (ccr->mfts_hash != NULL)
+		print_ccr_mftstate(ccr);
+
+	if (ccr->vrps_hash != NULL)
+		print_ccr_roastate(ccr);
+
+	if (ccr->vaps_hash != NULL)
+		print_ccr_aspastate(ccr);
+
+	if (ccr->tas_hash != NULL)
+		print_ccr_tastate(ccr);
+
+	if (ccr->brks_hash != NULL)
+		print_ccr_rkstate(ccr);
 }

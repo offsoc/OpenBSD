@@ -1,4 +1,4 @@
-/*	$OpenBSD: systm.h,v 1.172 2025/05/24 06:49:16 deraadt Exp $	*/
+/*	$OpenBSD: systm.h,v 1.177 2025/07/28 05:08:35 dlg Exp $	*/
 /*	$NetBSD: systm.h,v 1.50 1996/06/09 04:55:09 briggs Exp $	*/
 
 /*-
@@ -106,6 +106,10 @@ extern dev_t swapdev;		/* swapping device */
 extern struct vnode *swapdev_vp;/* vnode equivalent to above */
 
 extern int nowake;		/* dead wakeup(9) channel */
+
+#ifdef MP_LOCKDEBUG
+extern long __mp_lock_spinout;
+#endif
 
 struct proc;
 struct process;
@@ -259,13 +263,19 @@ void	start_periodic_resettodr(void);
 void	stop_periodic_resettodr(void);
 
 void	sleep_setup(const volatile void *, int, const char *);
-int	sleep_finish(int, int);
+int	sleep_finish(uint64_t, int);
 void	sleep_queue_init(void);
 
 struct cond;
 void	cond_init(struct cond *);
 void	cond_wait(struct cond *, const char *);
-void	cond_signal(struct cond *);
+void	cond_signal_handler(void *);
+
+static inline void
+cond_signal(struct cond *c)
+{
+	cond_signal_handler(c);
+}
 
 #define	INFSLP	UINT64_MAX
 #define	MAXTSLP	(UINT64_MAX - 1)
@@ -383,6 +393,8 @@ void	consinit(void);
 void	cpu_startup(void);
 void	cpu_configure(void);
 void	diskconf(void);
+
+void	powerbutton_event(void);
 
 int nfs_mountroot(void);
 int dk_mountroot(void);

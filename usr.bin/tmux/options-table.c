@@ -1,4 +1,4 @@
-/* $OpenBSD: options-table.c,v 1.192 2025/05/22 07:49:24 nicm Exp $ */
+/* $OpenBSD: options-table.c,v 1.203 2025/12/25 18:07:00 nicm Exp $ */
 
 /*
  * Copyright (c) 2011 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -37,7 +37,7 @@ static const char *options_table_mode_keys_list[] = {
 	"emacs", "vi", NULL
 };
 static const char *options_table_clock_mode_style_list[] = {
-	"12", "24", NULL
+	"12", "24", "12-with-seconds", "24-with-seconds", NULL
 };
 static const char *options_table_status_list[] = {
 	"off", "on", "2", "3", "4", "5", NULL
@@ -77,13 +77,16 @@ static const char *options_table_pane_border_indicators_list[] = {
 	"off", "colour", "arrows", "both", NULL
 };
 static const char *options_table_pane_border_lines_list[] = {
-	"single", "double", "heavy", "simple", "number", NULL
+	"single", "double", "heavy", "simple", "number", "spaces", NULL
 };
 static const char *options_table_popup_border_lines_list[] = {
 	"single", "double", "heavy", "simple", "rounded", "padded", "none", NULL
 };
 static const char *options_table_set_clipboard_list[] = {
 	"off", "external", "on", NULL
+};
+static const char *options_table_get_clipboard_list[] = {
+	"off", "buffer", "request", "both", NULL
 };
 static const char *options_table_window_size_list[] = {
 	"largest", "smallest", "manual", "latest", NULL
@@ -139,7 +142,7 @@ static const char *options_table_allow_passthrough_list[] = {
 		"#{T:window-status-format}" \
 		"#[pop-default]" \
 		"#[norange default]" \
-		"#{?window_end_flag,,#{window-status-separator}}" \
+		"#{?loop_last_flag,,#{window-status-separator}}" \
 	"," \
 		"#[range=window|#{window_index} list=focus " \
 			"#{?#{!=:#{E:window-status-current-style},default}," \
@@ -166,7 +169,7 @@ static const char *options_table_allow_passthrough_list[] = {
 		"#{T:window-status-current-format}" \
 		"#[pop-default]" \
 		"#[norange list=on default]" \
-		"#{?window_end_flag,,#{window-status-separator}}" \
+		"#{?loop_last_flag,,#{window-status-separator}}" \
 	"}" \
 	"#[nolist align=right range=right #{E:status-right-style}]" \
 	"#[push-default]" \
@@ -174,10 +177,60 @@ static const char *options_table_allow_passthrough_list[] = {
 	"#[pop-default]" \
 	"#[norange default]"
 #define OPTIONS_TABLE_STATUS_FORMAT2 \
-	"#[align=centre]#{P:#{?pane_active,#[reverse],}" \
-	"#{pane_index}[#{pane_width}x#{pane_height}]#[default] }"
+	"#[align=left]#{R: ,#{n:#{session_name}}}P: " \
+	"#[norange default]" \
+	"#[list=on align=#{status-justify}]" \
+	"#[list=left-marker]<#[list=right-marker]>#[list=on]" \
+	"#{P:" \
+		"#[range=pane|#{pane_id} " \
+			"#{E:pane-status-style}" \
+		"]" \
+		"#[push-default]" \
+		"#P[#{pane_width}x#{pane_height}]" \
+		"#[pop-default]" \
+		"#[norange list=on default]  " \
+	"," \
+		"#[range=pane|#{pane_id} list=focus " \
+			"#{?#{!=:#{E:pane-status-current-style},default}," \
+				"#{E:pane-status-current-style}," \
+				"#{E:pane-status-style}" \
+			"}" \
+		"]" \
+		"#[push-default]" \
+		"#P[#{pane_width}x#{pane_height}]*" \
+		"#[pop-default]" \
+		"#[norange list=on default] " \
+	"}"
+#define OPTIONS_TABLE_STATUS_FORMAT3 \
+	"#[align=left]#{R: ,#{n:#{session_name}}}S: " \
+	"#[norange default]" \
+	"#[list=on align=#{status-justify}]" \
+	"#[list=left-marker]<#[list=right-marker]>#[list=on]" \
+	"#{S:" \
+		"#[range=session|#{session_id} " \
+			"#{E:session-status-style}" \
+		"]" \
+		"#[push-default]" \
+		"#S#{session_alert}" \
+		"#[pop-default]" \
+		"#[norange list=on default]  " \
+	"," \
+		"#[range=session|#{session_id} list=focus " \
+			"#{?#{!=:#{E:session-status-current-style},default}," \
+					"#{E:session-status-current-style}," \
+					"#{E:session-status-style}" \
+			"}" \
+		"]" \
+		"#[push-default]" \
+		"#S*#{session_alert}" \
+		"#[pop-default]" \
+		"#[norange list=on default] " \
+	"}"
 static const char *options_table_status_format_default[] = {
-	OPTIONS_TABLE_STATUS_FORMAT1, OPTIONS_TABLE_STATUS_FORMAT2, NULL
+	OPTIONS_TABLE_STATUS_FORMAT1,
+	OPTIONS_TABLE_STATUS_FORMAT2,
+	OPTIONS_TABLE_STATUS_FORMAT3,
+	NULL
 };
 
 /* Helpers for hook options. */
@@ -354,6 +407,18 @@ const struct options_table_entry options_table[] = {
 	  .scope = OPTIONS_TABLE_SERVER,
 	  .default_num = 0,
 	  .text = "Whether to send focus events to applications."
+	},
+
+	{ .name = "get-clipboard",
+	  .type = OPTIONS_TABLE_CHOICE,
+	  .scope = OPTIONS_TABLE_SERVER,
+	  .choices = options_table_get_clipboard_list,
+	  .default_num = 1,
+	  .text = "When an application requests the clipboard, whether to "
+	          "ignore the request ('off'); respond with the newest buffer "
+	          "('buffer'); request the clipboard from the most recently "
+	          "used terminal ('request'); or to request the clipboard, "
+	          "create a buffer, and send it to the application ('both')."
 	},
 
 	{ .name = "history-file",
@@ -598,6 +663,13 @@ const struct options_table_entry options_table[] = {
 	  .default_num = 750,
 	  .unit = "milliseconds",
 	  .text = "Time for which status line messages should appear."
+	},
+
+	{ .name = "focus-follows-mouse",
+	  .type = OPTIONS_TABLE_FLAG,
+	  .scope = OPTIONS_TABLE_SESSION,
+	  .default_num = 0,
+	  .text = "Whether moving the mouse into a pane selects it."
 	},
 
 	{ .name = "history-limit",
@@ -872,10 +944,29 @@ const struct options_table_entry options_table[] = {
 	  .text = "Style of the status line."
 	},
 
+	{ .name = "pane-status-current-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "default",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of the current pane in the status line."
+	},
+
+	{ .name = "pane-status-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "default",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of panes in the status line, except the current "
+		  "pane."
+	},
+
 	{ .name = "prompt-cursor-colour",
 	  .type = OPTIONS_TABLE_COLOUR,
 	  .scope = OPTIONS_TABLE_SESSION,
-	  .default_num = 6,
+	  .default_num = -1,
 	  .text = "Colour of the cursor when in the command prompt."
 	},
 
@@ -885,6 +976,34 @@ const struct options_table_entry options_table[] = {
 	  .choices = options_table_cursor_style_list,
 	  .default_num = 0,
 	  .text = "Style of the cursor when in the command prompt."
+	},
+
+	{ .name = "prompt-command-cursor-style",
+	  .type = OPTIONS_TABLE_CHOICE,
+	  .scope = OPTIONS_TABLE_SESSION,
+	  .choices = options_table_cursor_style_list,
+	  .default_num = 0,
+	  .text = "Style of the cursor in the command prompt when in command "
+		  "mode, if 'status-keys' is set to 'vi'."
+	},
+
+	{ .name = "session-status-current-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "default",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of the current session in the status line."
+	},
+
+	{ .name = "session-status-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "default",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of sessions in the status line, except the current "
+		  "session."
 	},
 
 	{ .name = "update-environment",
@@ -1053,7 +1172,7 @@ const struct options_table_entry options_table[] = {
 	{ .name = "copy-mode-position-style",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW,
-	  .default_str = "#{mode-style}",
+	  .default_str = "#{E:mode-style}",
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
 	  .text = "Style of position indicator in copy mode."
@@ -1062,7 +1181,7 @@ const struct options_table_entry options_table[] = {
 	{ .name = "copy-mode-selection-style",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW,
-	  .default_str = "#{mode-style}",
+	  .default_str = "#{E:mode-style}",
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
 	  .text = "Style of selection in copy mode."
@@ -1103,7 +1222,7 @@ const struct options_table_entry options_table[] = {
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW,
 	  .flags = OPTIONS_TABLE_IS_STYLE,
-	  .default_str = "bg=yellow,fg=black",
+	  .default_str = "noattr,bg=yellow,fg=black",
 	  .separator = ",",
 	  .text = "Style of indicators and highlighting in modes."
 	},
@@ -1305,6 +1424,16 @@ const struct options_table_entry options_table[] = {
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .default_num = 0,
 	  .text = "Whether typing should be sent to all panes simultaneously."
+	},
+
+	{ .name = "tiled-layout-max-columns",
+	  .type = OPTIONS_TABLE_NUMBER,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .minimum = 0,
+	  .maximum = USHRT_MAX,
+	  .default_num = 0,
+	  .text = "Maximum number of columns in the 'tiled' layout. "
+		  "A value of 0 means no limit."
 	},
 
 	{ .name = "window-active-style",

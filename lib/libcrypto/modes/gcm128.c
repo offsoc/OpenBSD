@@ -1,4 +1,4 @@
-/* $OpenBSD: gcm128.c,v 1.48 2025/05/24 07:51:21 jsing Exp $ */
+/* $OpenBSD: gcm128.c,v 1.54 2025/06/28 12:39:10 jsing Exp $ */
 /* ====================================================================
  * Copyright (c) 2010 The OpenSSL Project.  All rights reserved.
  *
@@ -55,7 +55,7 @@
 #include "crypto_internal.h"
 #include "modes_local.h"
 
-static void
+void
 gcm_init_4bit(u128 Htable[16], uint64_t H[2])
 {
 	u128 V;
@@ -77,36 +77,19 @@ gcm_init_4bit(u128 Htable[16], uint64_t H[2])
 	for (i = 2; i < 16; i <<= 1) {
 		u128 *Hi = Htable + i;
 		int   j;
-		for (V = *Hi, j = 1; j < i; ++j) {
+		for (V = *Hi, j = 1; j < i; j++) {
 			Hi[j].hi = V.hi ^ Htable[j].hi;
 			Hi[j].lo = V.lo ^ Htable[j].lo;
 		}
 	}
-
-#if defined(GHASH_ASM) && (defined(__arm__) || defined(__arm))
-	/*
-	 * ARM assembler expects specific dword order in Htable.
-	 */
-	{
-		int j;
-#if BYTE_ORDER == LITTLE_ENDIAN
-		for (j = 0; j < 16; ++j) {
-			V = Htable[j];
-			Htable[j].hi = V.lo;
-			Htable[j].lo = V.hi;
-		}
-#else /* BIG_ENDIAN */
-		for (j = 0; j < 16; ++j) {
-			V = Htable[j];
-			Htable[j].hi = V.lo << 32|V.lo >> 32;
-			Htable[j].lo = V.hi << 32|V.hi >> 32;
-		}
-#endif
-	}
-#endif
 }
 
-#ifndef GHASH_ASM
+#ifdef GHASH_ASM
+void gcm_gmult_4bit(uint64_t Xi[2], const u128 Htable[16]);
+void gcm_ghash_4bit(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
+    size_t len);
+
+#else
 static const uint16_t rem_4bit[16] = {
 	0x0000, 0x1c20, 0x3840, 0x2460, 0x7080, 0x6ca0, 0x48c0, 0x54e0,
 	0xe100, 0xfd20, 0xd940, 0xc560, 0x9180, 0x8da0, 0xa9c0, 0xb5e0,
@@ -153,13 +136,6 @@ gcm_gmult_4bit(uint64_t Xi[2], const u128 Htable[16])
 	Xi[1] = htobe64(Z.lo);
 }
 
-/*
- * Streamed gcm_mult_4bit, see CRYPTO_gcm128_[en|de]crypt for
- * details... Compiler-generated code doesn't seem to give any
- * performance improvement, at least not on x86[_64]. It's here
- * mostly as reference and a placeholder for possible future
- * non-trivial optimization[s]...
- */
 static void
 gcm_ghash_4bit(uint64_t Xi[2], const u128 Htable[16],
     const uint8_t *inp, size_t len)
@@ -206,22 +182,7 @@ gcm_ghash_4bit(uint64_t Xi[2], const u128 Htable[16],
 		Xi[1] = htobe64(Z.lo);
 	} while (inp += 16, len -= 16);
 }
-
-static inline void
-gcm_mul(GCM128_CONTEXT *ctx, uint64_t u[2])
-{
-	gcm_gmult_4bit(u, ctx->Htable);
-}
-
-static inline void
-gcm_ghash(GCM128_CONTEXT *ctx, const uint8_t *in, size_t len)
-{
-	gcm_ghash_4bit(ctx->Xi.u, ctx->Htable, in, len);
-}
-#else
-void gcm_gmult_4bit(uint64_t Xi[2], const u128 Htable[16]);
-void gcm_ghash_4bit(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
-    size_t len);
+#endif
 
 static inline void
 gcm_mul(GCM128_CONTEXT *ctx, uint64_t u[2])
@@ -234,37 +195,18 @@ gcm_ghash(GCM128_CONTEXT *ctx, const uint8_t *in, size_t len)
 {
 	ctx->ghash(ctx->Xi.u, ctx->Htable, in, len);
 }
-#endif
 
-#if	defined(GHASH_ASM) &&						\
-	(defined(__i386)	|| defined(__i386__)	||		\
-	 defined(__x86_64)	|| defined(__x86_64__)	||		\
-	 defined(_M_IX86)	|| defined(_M_AMD64)	|| defined(_M_X64))
-#include "x86_arch.h"
-#endif
+#ifdef HAVE_GCM128_INIT
+void gcm128_init(GCM128_CONTEXT *ctx);
 
-#if	defined(GHASH_ASM)
-# if	(defined(__i386)	|| defined(__i386__)	||		\
-	 defined(__x86_64)	|| defined(__x86_64__)	||		\
-	 defined(_M_IX86)	|| defined(_M_AMD64)	|| defined(_M_X64))
-#  define GHASH_ASM_X86_OR_64
-
-void gcm_init_clmul(u128 Htable[16], const uint64_t Xi[2]);
-void gcm_gmult_clmul(uint64_t Xi[2], const u128 Htable[16]);
-void gcm_ghash_clmul(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
-    size_t len);
-
-#  if	defined(__i386) || defined(__i386__) || defined(_M_IX86)
-#   define GHASH_ASM_X86
-void gcm_gmult_4bit_mmx(uint64_t Xi[2], const u128 Htable[16]);
-void gcm_ghash_4bit_mmx(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
-    size_t len);
-
-void gcm_gmult_4bit_x86(uint64_t Xi[2], const u128 Htable[16]);
-void gcm_ghash_4bit_x86(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
-    size_t len);
-#  endif
-# endif
+#else
+static void
+gcm128_init(GCM128_CONTEXT *ctx)
+{
+	gcm_init_4bit(ctx->Htable, ctx->H.u);
+	ctx->gmult = gcm_gmult_4bit;
+	ctx->ghash = gcm_ghash_4bit;
+}
 #endif
 
 void
@@ -280,39 +222,7 @@ CRYPTO_gcm128_init(GCM128_CONTEXT *ctx, void *key, block128_f block)
 	ctx->H.u[0] = be64toh(ctx->H.u[0]);
 	ctx->H.u[1] = be64toh(ctx->H.u[1]);
 
-# if	defined(GHASH_ASM_X86_OR_64)
-#  if	!defined(GHASH_ASM_X86) || defined(OPENSSL_IA32_SSE2)
-	/* check FXSR and PCLMULQDQ bits */
-	if ((crypto_cpu_caps_ia32() & (CPUCAP_MASK_FXSR | CPUCAP_MASK_PCLMUL)) ==
-	    (CPUCAP_MASK_FXSR | CPUCAP_MASK_PCLMUL)) {
-		gcm_init_clmul(ctx->Htable, ctx->H.u);
-		ctx->gmult = gcm_gmult_clmul;
-		ctx->ghash = gcm_ghash_clmul;
-		return;
-	}
-#  endif
-	gcm_init_4bit(ctx->Htable, ctx->H.u);
-#  if	defined(GHASH_ASM_X86)			/* x86 only */
-#   if	defined(OPENSSL_IA32_SSE2)
-	if (crypto_cpu_caps_ia32() & CPUCAP_MASK_SSE) {	/* check SSE bit */
-#   else
-	if (crypto_cpu_caps_ia32() & CPUCAP_MASK_MMX) {	/* check MMX bit */
-#   endif
-		ctx->gmult = gcm_gmult_4bit_mmx;
-		ctx->ghash = gcm_ghash_4bit_mmx;
-	} else {
-		ctx->gmult = gcm_gmult_4bit_x86;
-		ctx->ghash = gcm_ghash_4bit_x86;
-	}
-#  else
-	ctx->gmult = gcm_gmult_4bit;
-	ctx->ghash = gcm_ghash_4bit;
-#  endif
-# else
-	gcm_init_4bit(ctx->Htable, ctx->H.u);
-	ctx->gmult = gcm_gmult_4bit;
-	ctx->ghash = gcm_ghash_4bit;
-# endif
+	gcm128_init(ctx);
 }
 LCRYPTO_ALIAS(CRYPTO_gcm128_init);
 
@@ -360,14 +270,14 @@ CRYPTO_gcm128_setiv(GCM128_CONTEXT *ctx, const unsigned char *iv, size_t len)
 		uint64_t len0 = len;
 
 		while (len >= 16) {
-			for (i = 0; i < 16; ++i)
+			for (i = 0; i < 16; i++)
 				ctx->Yi.c[i] ^= iv[i];
 			gcm_mul(ctx, ctx->Yi.u);
 			iv += 16;
 			len -= 16;
 		}
-		if (len) {
-			for (i = 0; i < len; ++i)
+		if (len > 0) {
+			for (i = 0; i < len; i++)
 				ctx->Yi.c[i] ^= iv[i];
 			gcm_mul(ctx, ctx->Yi.u);
 		}
@@ -380,8 +290,7 @@ CRYPTO_gcm128_setiv(GCM128_CONTEXT *ctx, const unsigned char *iv, size_t len)
 	}
 
 	(*ctx->block)(ctx->Yi.c, ctx->EK0.c, ctx->key);
-	++ctr;
-	ctx->Yi.d[3] = htobe32(ctr);
+	ctx->Yi.d[3] = htobe32(++ctr);
 }
 LCRYPTO_ALIAS(CRYPTO_gcm128_setiv);
 
@@ -420,7 +329,7 @@ CRYPTO_gcm128_aad(GCM128_CONTEXT *ctx, const unsigned char *aad, size_t len)
 	}
 	if (len > 0) {
 		n = (unsigned int)len;
-		for (i = 0; i < len; ++i)
+		for (i = 0; i < len; i++)
 			ctx->Xi.c[i] ^= aad[i];
 	}
 	ctx->ares = n;
@@ -452,7 +361,7 @@ CRYPTO_gcm128_encrypt(GCM128_CONTEXT *ctx, const unsigned char *in,
 
 	n = ctx->mres;
 
-	for (i = 0; i < len; ++i) {
+	for (i = 0; i < len; i++) {
 		if (n == 0) {
 			ctx->block(ctx->Yi.c, ctx->EKi.c, ctx->key);
 			ctx->Yi.d[3] = htobe32(++ctr);
@@ -493,7 +402,7 @@ CRYPTO_gcm128_decrypt(GCM128_CONTEXT *ctx, const unsigned char *in,
 
 	n = ctx->mres;
 
-	for (i = 0; i < len; ++i) {
+	for (i = 0; i < len; i++) {
 		if (n == 0) {
 			ctx->block(ctx->Yi.c, ctx->EKi.c, ctx->key);
 			ctx->Yi.d[3] = htobe32(++ctr);

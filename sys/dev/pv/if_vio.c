@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_vio.c,v 1.70 2025/02/24 09:40:01 jan Exp $	*/
+/*	$OpenBSD: if_vio.c,v 1.74 2025/12/22 20:24:49 sf Exp $	*/
 
 /*
  * Copyright (c) 2012 Stefan Fritsch, Alexander Fiveg.
@@ -295,8 +295,6 @@ struct vio_softc {
 #define VIO_DMAMEM_SYNC(vsc, sc, p, size, flags)		\
 	bus_dmamap_sync((vsc)->sc_dmat, (sc)->sc_dma_map,	\
 	    VIO_DMAMEM_OFFSET((sc), (p)), (size), (flags))
-#define VIO_HAVE_MRG_RXBUF(sc)					\
-	((sc)->sc_hdr_size == sizeof(struct virtio_net_hdr))
 
 /* vioq N uses the rx/tx vq pair 2*N and 2*N + 1 */
 #define VIO_VQ2Q(sc, vq)	(&sc->sc_q[vq->vq_index/2])
@@ -382,7 +380,7 @@ const struct cfattach vio_ca = {
 };
 
 struct cfdriver vio_cd = {
-	NULL, "vio", DV_IFNET
+	NULL, "vio", DV_IFNET, CD_COCOVM
 };
 
 int
@@ -392,11 +390,13 @@ vio_alloc_dmamem(struct vio_softc *sc)
 	int nsegs;
 
 	if (bus_dmamap_create(vsc->sc_dmat, sc->sc_dma_size, 1,
-	    sc->sc_dma_size, 0, BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW,
+	    sc->sc_dma_size, 0,
+	    BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW | BUS_DMA_64BIT,
 	    &sc->sc_dma_map) != 0)
 		goto err;
 	if (bus_dmamem_alloc(vsc->sc_dmat, sc->sc_dma_size, 16, 0,
-	    &sc->sc_dma_seg, 1, &nsegs, BUS_DMA_NOWAIT | BUS_DMA_ZERO) != 0)
+	    &sc->sc_dma_seg, 1, &nsegs,
+	    BUS_DMA_NOWAIT | BUS_DMA_ZERO | BUS_DMA_64BIT) != 0)
 		goto destroy;
 	if (bus_dmamem_map(vsc->sc_dmat, &sc->sc_dma_seg, nsegs,
 	    sc->sc_dma_size, &sc->sc_dma_kva, BUS_DMA_NOWAIT) != 0)
@@ -542,7 +542,7 @@ vio_alloc_mem(struct vio_softc *sc, int tx_max_segments)
 			r = bus_dmamap_create(vsc->sc_dmat,
 			    sc->sc_rx_mbuf_size + sc->sc_hdr_size, 2,
 			    sc->sc_rx_mbuf_size, 0,
-			    BUS_DMA_NOWAIT|BUS_DMA_ALLOCNOW,
+			    BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW | BUS_DMA_64BIT,
 			    &vioq->viq_rxdmamaps[i]);
 			if (r != 0)
 				goto destroy;
@@ -551,7 +551,7 @@ vio_alloc_mem(struct vio_softc *sc, int tx_max_segments)
 		for (i = 0; i < txqsize; i++) {
 			r = bus_dmamap_create(vsc->sc_dmat, txsize,
 			    tx_max_segments, txsize, 0,
-			    BUS_DMA_NOWAIT|BUS_DMA_ALLOCNOW,
+			    BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW | BUS_DMA_64BIT,
 			    &vioq->viq_txdmamaps[i]);
 			if (r != 0)
 				goto destroy;
@@ -661,7 +661,7 @@ vio_attach(struct device *parent, struct device *self, void *aux)
 		vsc->sc_nvqs = 2 * i + 1;
 		i = MIN(i, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MAX);
 		sc->sc_intrmap = intrmap_create(&sc->sc_dev, i,
-		    va->va_nintr - 2, 0);
+		    MIN(va->va_nintr - 2, IF_MAX_VECTORS), 0);
 		sc->sc_nqueues = intrmap_count(sc->sc_intrmap);
 		printf(": %u queue%s", sc->sc_nqueues,
 		    sc->sc_nqueues > 1 ? "s" : "");
@@ -1396,7 +1396,9 @@ vio_populate_rx_mbufs(struct vio_softc *sc, struct vio_queue *vioq)
 	int r, done = 0;
 	u_int slots;
 	struct virtqueue *vq = vioq->viq_rxvq;
-	int mrg_rxbuf = VIO_HAVE_MRG_RXBUF(sc);
+	int no_split = virtio_has_feature(vsc, VIRTIO_NET_F_MRG_RXBUF) ||
+		virtio_has_feature(vsc, VIRTIO_F_VERSION_1) ||
+		virtio_has_feature(vsc, VIRTIO_F_ANY_LAYOUT);
 
 	MUTEX_ASSERT_LOCKED(&vioq->viq_rxmtx);
 	for (slots = if_rxr_get(&vioq->viq_rxring, vq->vq_num);
@@ -1416,7 +1418,7 @@ vio_populate_rx_mbufs(struct vio_softc *sc, struct vio_queue *vioq)
 			}
 		}
 		r = virtio_enqueue_reserve(vq, slot,
-		    vioq->viq_rxdmamaps[slot]->dm_nsegs + (mrg_rxbuf ? 0 : 1));
+		    vioq->viq_rxdmamaps[slot]->dm_nsegs + (no_split ? 0 : 1));
 		if (r != 0) {
 			vio_free_rx_mbuf(sc, vioq, slot);
 			break;
@@ -1424,13 +1426,13 @@ vio_populate_rx_mbufs(struct vio_softc *sc, struct vio_queue *vioq)
 		bus_dmamap_sync(vsc->sc_dmat, vioq->viq_rxdmamaps[slot], 0,
 		    vioq->viq_rxdmamaps[slot]->dm_mapsize,
 		    BUS_DMASYNC_PREREAD);
-		if (mrg_rxbuf) {
+		if (no_split) {
 			virtio_enqueue(vq, slot, vioq->viq_rxdmamaps[slot], 0);
 		} else {
 			/*
-			 * Buggy kvm wants a buffer of exactly the size of
-			 * the header in this case, so we have to split in
-			 * two.
+			 * Legacy devices without VIRTIO_F_ANY_LAYOUT want a
+			 * buffer of exactly the size of the header in this
+			 * case, so we have to split in two.
 			 */
 			virtio_enqueue_p(vq, slot, vioq->viq_rxdmamaps[slot],
 			    0, sc->sc_hdr_size, 0);
@@ -1524,7 +1526,7 @@ vio_rxeof(struct vio_queue *vioq)
 				    vioq->viq_ifiq->ifiq_idx;
 				SET(m->m_pkthdr.csum_flags, M_FLOWID);
 			}
-			if (VIO_HAVE_MRG_RXBUF(sc))
+			if (virtio_has_feature(vsc, VIRTIO_NET_F_MRG_RXBUF))
 				bufs_left = hdr->num_buffers - 1;
 			else
 				bufs_left = 0;

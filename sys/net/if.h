@@ -1,4 +1,4 @@
-/*	$OpenBSD: if.h,v 1.219 2025/05/09 03:12:36 dlg Exp $	*/
+/*	$OpenBSD: if.h,v 1.223 2025/12/09 03:33:06 dlg Exp $	*/
 /*	$NetBSD: if.h,v 1.23 1996/05/07 02:40:27 thorpej Exp $	*/
 
 /*
@@ -526,6 +526,9 @@ struct if_sffpage {
 #include <net/if_arp.h>
 
 #ifdef _KERNEL
+
+#define IF_MAX_VECTORS		8
+
 struct socket;
 struct ifnet;
 struct ifq_ops;
@@ -554,16 +557,21 @@ int	if_delgroup(struct ifnet *, const char *);
 void	if_group_routechange(const struct sockaddr *, const struct sockaddr *);
 struct	ifnet *if_unit(const char *);
 struct	ifnet *if_get(unsigned int);
+struct	ifnet *if_ref(struct ifnet *);
+struct	ifnet *if_get_smr(unsigned int);
 void	if_put(struct ifnet *);
 void	ifnewlladdr(struct ifnet *);
 void	if_congestion(void);
 int	if_congested(void);
 __dead void	unhandled_af(int);
 int	if_setlladdr(struct ifnet *, const uint8_t *);
+void	softnet_init(void);
+void	softnet_percpu(void);
+unsigned int
+	softnet_count(void);
 struct taskq *
 	net_tq(unsigned int);
 void	net_tq_barriers(const char *);
-int	net_sn_count(void);
 
 #endif /* _KERNEL */
 

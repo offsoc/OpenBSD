@@ -1,4 +1,4 @@
-/*	$OpenBSD: pmap.c,v 1.121 2024/06/26 01:40:49 jsg Exp $	*/
+/*	$OpenBSD: pmap.c,v 1.127 2025/12/14 12:37:22 kettenis Exp $	*/
 /*	$NetBSD: pmap.c,v 1.107 2001/08/31 16:47:41 eeh Exp $	*/
 /*
  * 
@@ -240,10 +240,11 @@ int	pmapdebug = 0;
  * physical addresses, of course.
  *
  */
-paddr_t *ctxbusy;	
+paddr_t *ctxbusy;
 int numctx;
 #define CTXENTRY	(sizeof(paddr_t))
 #define CTXSIZE		(numctx * CTXENTRY)
+struct mutex ctxmtx = MUTEX_INITIALIZER(IPL_HIGH);
 
 int pmap_get_page(paddr_t *, const char *, struct pmap *);
 void pmap_free_page(paddr_t, struct pmap *);
@@ -1522,56 +1523,6 @@ pmap_release(struct pmap *pm)
 	ctx_free(pm);
 }
 
-/*
- * Garbage collects the physical map system for
- * pages which are no longer used.
- * Success need not be guaranteed -- that is, there
- * may well be pages which are not referenced, but
- * others may be collected.
- * Called by the pageout daemon when pages are scarce.
- */
-void
-pmap_collect(struct pmap *pm)
-{
-	int i, j, k, n, m, s;
-	paddr_t *pdir, *ptbl;
-	/* This is a good place to scan the pmaps for page tables with
-	 * no valid mappings in them and free them. */
-	
-	/* NEVER GARBAGE COLLECT THE KERNEL PMAP */
-	if (pm == pmap_kernel())
-		return;
-
-	s = splvm();
-	for (i=0; i<STSZ; i++) {
-		if ((pdir = (paddr_t *)(u_long)ldxa((vaddr_t)&pm->pm_segs[i], ASI_PHYS_CACHED))) {
-			m = 0;
-			for (k=0; k<PDSZ; k++) {
-				if ((ptbl = (paddr_t *)(u_long)ldxa((vaddr_t)&pdir[k], ASI_PHYS_CACHED))) {
-					m++;
-					n = 0;
-					for (j=0; j<PTSZ; j++) {
-						int64_t data = ldxa((vaddr_t)&ptbl[j], ASI_PHYS_CACHED);
-						if (data&TLB_V)
-							n++;
-					}
-					if (!n) {
-						/* Free the damn thing */
-						stxa((paddr_t)(u_long)&pdir[k], ASI_PHYS_CACHED, 0);
-						pmap_free_page((paddr_t)ptbl, pm);
-					}
-				}
-			}
-			if (!m) {
-				/* Free the damn thing */
-				stxa((paddr_t)(u_long)&pm->pm_segs[i], ASI_PHYS_CACHED, 0);
-				pmap_free_page((paddr_t)pdir, pm);
-			}
-		}
-	}
-	splx(s);
-}
-
 void
 pmap_zero_page(struct vm_page *pg)
 {
@@ -1623,6 +1574,16 @@ pmap_activate(struct proc *p)
 void
 pmap_deactivate(struct proc *p)
 {
+}
+
+void
+pmap_purge(struct proc *p)
+{
+	/*
+	 * Write out the user windows before we tear down the userland
+	 * mappings.
+	 */
+	write_user_windows();
 }
 
 /*
@@ -2434,7 +2395,7 @@ void
 pmap_page_protect(struct vm_page *pg, vm_prot_t prot)
 {
 	paddr_t pa = VM_PAGE_TO_PHYS(pg);
-	pv_entry_t pv;
+	pv_entry_t pv, freepvs = NULL;
 	int64_t data, clear, set;
 
 	if (prot & PROT_WRITE)
@@ -2514,11 +2475,9 @@ pmap_page_protect(struct vm_page *pg, vm_prot_t prot)
 			}
 			atomic_dec_long(&pv->pv_pmap->pm_stats.resident_count);
 
-			/* free the pv */
 			firstpv->pv_next = pv->pv_next;
-			mtx_leave(&pg->mdpage.pvmtx);
-			pool_put(&pv_pool, pv);
-			mtx_enter(&pg->mdpage.pvmtx);
+			pv->pv_next = freepvs;
+			freepvs = pv;
 		}
 
 		pv = firstpv;
@@ -2548,6 +2507,11 @@ pmap_page_protect(struct vm_page *pg, vm_prot_t prot)
 		}
 		dcache_flush_page(pa);
 		mtx_leave(&pg->mdpage.pvmtx);
+
+		while ((pv = freepvs) != NULL) {
+			freepvs = pv->pv_next;
+			pool_put(&pv_pool, pv);
+		}
 	}
 	/* We should really only flush the pages we demapped. */
 }
@@ -2564,7 +2528,7 @@ pmap_page_protect(struct vm_page *pg, vm_prot_t prot)
 int
 ctx_alloc(struct pmap *pm)
 {
-	int s, cnum;
+	int cnum;
 	static int next = 0;
 
 	if (pm == pmap_kernel()) {
@@ -2573,7 +2537,8 @@ ctx_alloc(struct pmap *pm)
 #endif
 		return (0);
 	}
-	s = splvm();
+
+	mtx_enter(&ctxmtx);
 	cnum = next;
 	do {
 		/*
@@ -2585,6 +2550,7 @@ ctx_alloc(struct pmap *pm)
 	} while (ctxbusy[++cnum] != 0 && cnum != next);
 	if (cnum==0) cnum++; /* Never steal ctx 0 */
 	if (ctxbusy[cnum]) {
+#ifdef notyet
 		int i;
 		/* We gotta steal this context */
 		for (i = 0; i < TSBENTS; i++) {
@@ -2594,10 +2560,13 @@ ctx_alloc(struct pmap *pm)
 				tsb_immu[i].tag = TSB_TAG_INVALID;
 		}
 		tlb_flush_ctx(cnum);
+#else
+		panic("%s: stealing context", __func__);
+#endif
 	}
 	ctxbusy[cnum] = pm->pm_physaddr;
 	next = cnum;
-	splx(s);
+	mtx_leave(&ctxmtx);
 	pm->pm_ctx = cnum;
 	return cnum;
 }
@@ -2609,6 +2578,9 @@ void
 ctx_free(struct pmap *pm)
 {
 	int oldctx;
+#ifdef DIAGNOSTIC
+	int i;
+#endif
 	
 	oldctx = pm->pm_ctx;
 
@@ -2624,9 +2596,18 @@ ctx_free(struct pmap *pm)
 		       (void *)(u_long)pm->pm_physaddr);
 		db_enter();
 	}
+	for (i = 0; i < TSBENTS; i++) {
+		if (TSB_TAG_CTX(tsb_dmmu[i].tag) == oldctx ||
+		    TSB_TAG_CTX(tsb_immu[i].tag) == oldctx) {
+			printf("ctx_free: context %d still active\n", oldctx);
+			db_enter();
+		}
+	}
 #endif
 	/* We should verify it has not been stolen and reallocated... */
+	mtx_enter(&ctxmtx);
 	ctxbusy[oldctx] = 0;
+	mtx_leave(&ctxmtx);
 }
 
 /*

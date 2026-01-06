@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmmvar.h,v 1.114 2025/05/24 12:47:00 bluhm Exp $	*/
+/*	$OpenBSD: vmmvar.h,v 1.117 2025/09/17 18:37:44 sf Exp $	*/
 /*
  * Copyright (c) 2014 Mike Larkin <mlarkin@openbsd.org>
  *
@@ -20,6 +20,8 @@
  */
 #ifndef _MACHINE_VMMVAR_H_
 #define _MACHINE_VMMVAR_H_
+
+#ifndef _LOCORE
 
 #define VMM_HV_SIGNATURE 	"OpenBSDVMM58"
 
@@ -93,6 +95,8 @@
  */
 #define VMX_MAX_CR3_TARGETS			256
 #define VMX_VMCS_PA_CLEAR			0xFFFFFFFFFFFFFFFFUL
+
+#endif	/* ! _LOCORE */
 
 /*
  * SVM: Intercept codes (exit reasons)
@@ -261,6 +265,14 @@
 #define SVM_AVIC_NOACCEL			0x402
 #define SVM_VMEXIT_VMGEXIT			0x403
 #define SVM_VMEXIT_INVALID			-1
+
+/*
+ *  Additional VMEXIT codes used in SEV-ES/SNP in the GHCB
+ */
+#define SEV_VMGEXIT_MMIO_READ			0x80000001
+#define SEV_VMGEXIT_MMIO_WRITE			0x80000002
+
+#ifndef _LOCORE
 
 /*
  * Exception injection vectors (these correspond to the CPU exception types
@@ -1041,6 +1053,7 @@ int	svm_seves_enter_guest(uint64_t, vaddr_t, struct region_descriptor *);
 void	start_vmm_on_cpu(struct cpu_info *);
 void	stop_vmm_on_cpu(struct cpu_info *);
 void	vmclear_on_cpu(struct cpu_info *);
+int	vmm_probe_machdep(struct device *, void *, void *);
 void	vmm_attach_machdep(struct device *, struct device *, void *);
 void	vmm_activate_machdep(struct device *, int);
 int	vmmioctl_machdep(dev_t, u_long, caddr_t, int, struct proc *);
@@ -1056,5 +1069,7 @@ int	vcpu_reset_regs(struct vcpu *, struct vcpu_reg_state *);
 int	svm_get_vmsa_pa(uint32_t, uint32_t, uint64_t *);
 
 #endif /* _KERNEL */
+
+#endif	/* ! _LOCORE */
 
 #endif /* ! _MACHINE_VMMVAR_H_ */

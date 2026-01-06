@@ -1,4 +1,4 @@
-/*	$OpenBSD: mainbus.c,v 1.13 2024/11/18 05:32:39 jsg Exp $ */
+/*	$OpenBSD: mainbus.c,v 1.15 2025/11/25 21:52:47 kettenis Exp $ */
 
 /*
  * Copyright (c) 2016 Patrick Wildt <patrick@blueri.se>
@@ -70,6 +70,7 @@ struct machine_bus_dma_tag mainbus_dma_tag = {
 	_dmamap_unload,
 	_dmamap_sync,
 	_dmamem_alloc,
+	_dmamem_alloc_range,
 	_dmamem_free,
 	_dmamem_map,
 	_dmamem_unmap,
@@ -100,6 +101,9 @@ mainbus_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_dmat = &mainbus_dma_tag;
 	sc->sc_acells = OF_getpropint(OF_peer(0), "#address-cells", 1);
 	sc->sc_scells = OF_getpropint(OF_peer(0), "#size-cells", 1);
+
+	if (OF_getpropbool(sc->sc_node, "dma-noncoherent"))
+		sc->sc_dmat->_flags &= ~BUS_DMA_COHERENT;
 
 	len = OF_getprop(sc->sc_node, "model", prop, sizeof(prop));
 	if (len > 0) {
@@ -241,12 +245,12 @@ mainbus_attach_node(struct device *self, int node, cfmatch_t submatch)
 		OF_getpropintarray(node, "interrupts", fa.fa_intr, len);
 	}
 
-	if (OF_getproplen(node, "dma-noncoherent") >= 0) {
+	if (OF_getpropbool(node, "dma-noncoherent")) {
 		fa.fa_dmat = malloc(sizeof(*sc->sc_dmat),
 		    M_DEVBUF, M_WAITOK | M_ZERO);
 		memcpy(fa.fa_dmat, sc->sc_dmat, sizeof(*sc->sc_dmat));
 		fa.fa_dmat->_flags &= ~BUS_DMA_COHERENT;
-	} else if (OF_getproplen(node, "dma-coherent") >= 0) {
+	} else if (OF_getpropbool(node, "dma-coherent")) {
 		fa.fa_dmat = malloc(sizeof(*sc->sc_dmat),
 		    M_DEVBUF, M_WAITOK | M_ZERO);
 		memcpy(fa.fa_dmat, sc->sc_dmat, sizeof(*sc->sc_dmat));

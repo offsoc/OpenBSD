@@ -1,4 +1,4 @@
-/* $OpenBSD: acpi.c,v 1.448 2025/06/02 02:20:56 tedu Exp $ */
+/* $OpenBSD: acpi.c,v 1.456 2025/12/06 13:18:07 kettenis Exp $ */
 /*
  * Copyright (c) 2005 Thorsten Lockert <tholo@sigmasoft.com>
  * Copyright (c) 2005 Jordan Hargrave <jordan@openbsd.org>
@@ -47,6 +47,8 @@
 
 #include "wd.h"
 
+extern int cpu_suspended;
+
 #ifdef ACPI_DEBUG
 int	acpi_debug = 16;
 #endif
@@ -60,7 +62,6 @@ struct pool acpiwqpool;
 
 #define ACPIEN_RETRIES 15
 
-struct aml_node *acpi_pci_match(struct device *, struct pci_attach_args *);
 pcireg_t acpi_pci_min_powerstate(pci_chipset_tag_t, pcitag_t);
 void	 acpi_pci_set_powerstate(pci_chipset_tag_t, pcitag_t, int, int);
 int	acpi_pci_notify(struct aml_node *, int, void *);
@@ -182,7 +183,7 @@ struct acpi_softc *acpi_softc;
 extern struct aml_node aml_root;
 
 struct cfdriver acpi_cd = {
-	NULL, "acpi", DV_DULL
+	NULL, "acpi", DV_DULL, CD_COCOVM
 };
 
 uint8_t
@@ -547,6 +548,53 @@ acpi_getsta(struct acpi_softc *sc, struct aml_node *node)
 	return sta;
 }
 
+int
+acpi_storaged3enable(struct acpi_softc *sc, struct aml_node *node)
+{
+	struct aml_value dsd;
+	int i;
+
+	/* 5025030f-842f-4ab4-a561-99a5189762d0 */
+	static uint8_t prop_guid[] = {
+		0x0f, 0x03, 0x25, 0x50, 0x2f, 0x84, 0xb4, 0x4a,
+		0xa5, 0x61, 0x99, 0xa5, 0x18, 0x97, 0x62, 0xd0,
+	};
+
+	if (aml_evalname(sc, node, "_DSD", 0, NULL, &dsd))
+		return 0;
+
+	if (dsd.type != AML_OBJTYPE_PACKAGE || dsd.length != 2 ||
+	    dsd.v_package[0]->type != AML_OBJTYPE_BUFFER ||
+	    dsd.v_package[1]->type != AML_OBJTYPE_PACKAGE)
+		return 0;
+
+	/* Check UUID. */
+	if (dsd.v_package[0]->length != sizeof(prop_guid) ||
+	    memcmp(dsd.v_package[0]->v_buffer, prop_guid,
+	    sizeof(prop_guid)) != 0)
+		return 0;
+
+	/* Check properties. */
+	for (i = 0; i < dsd.v_package[1]->length; i++) {
+		struct aml_value *res = dsd.v_package[1]->v_package[i];
+		struct aml_value *val;
+
+		if (res->type != AML_OBJTYPE_PACKAGE || res->length != 2 ||
+		    res->v_package[0]->type != AML_OBJTYPE_STRING ||
+		    strcmp(res->v_package[0]->v_string, "StorageD3Enable") != 0)
+			continue;
+
+		val = res->v_package[1];
+		if (val->type == AML_OBJTYPE_OBJREF)
+			val = val->v_objref.ref;
+
+		if (val->type == AML_OBJTYPE_INTEGER)
+			return val->v_integer;
+	}
+
+	return 0;
+}
+
 /* Map ACPI device node to PCI */
 int
 acpi_getpci(struct aml_node *node, void *arg)
@@ -638,6 +686,7 @@ acpi_getpci(struct aml_node *node, void *arg)
 		pci->_s4w = val;
 	else
 		pci->_s4w = -1;
+	pci->d3cold = acpi_storaged3enable(sc, node);
 
 	/* Check if PCI device exists */
 	if (pci->dev > 0x1F || pci->fun > 7) {
@@ -796,6 +845,13 @@ acpi_pci_set_powerstate(pci_chipset_tag_t pc, pcitag_t tag, int state, int pre)
 		if (pr->p_state == state)
 			continue;
 
+		/*
+		 * If the device supports D3cold, ignore the Resource
+		 * for the D3 state.
+		 */
+		if (pr->p_res_state == ACPI_STATE_D3 && pdev->d3cold)
+			continue;
+
 		if (pre) {
 			/*
 			 * If a Resource is dependent on this device for
@@ -820,7 +876,6 @@ acpi_pci_set_powerstate(pci_chipset_tag_t pc, pcitag_t tag, int state, int pre)
 
 			pr->p_state = state;
 		}
-
 	}
 #endif /* NACPIPWRRES > 0 */
 
@@ -911,6 +966,7 @@ intr_enable:
 int
 acpi_gpio_event(void *arg)
 {
+	struct acpi_softc *sc = acpi_softc;
 	struct acpi_gpio_event *ev = arg;
 	struct acpi_gpio *gpio = ev->node->gpio;
 
@@ -918,8 +974,16 @@ acpi_gpio_event(void *arg)
 		if(gpio->intr_disable)
 			gpio->intr_disable(gpio->cookie, ev->pin);
 	}
+
+	if (cpu_suspended) {
+		cpu_suspended = 0;
+		sc->sc_wakegpe = -3;
+		sc->sc_wakegpio = ev->pin;
+	}
+
 	acpi_addtask(acpi_softc, acpi_gpio_event_task, ev, ev->pin);
 	acpi_wakeup(acpi_softc);
+
 	return 1;
 }
 
@@ -945,7 +1009,8 @@ acpi_gpio_parse_events(int crsidx, union acpi_resource *crs, void *arg)
 			ev->tflags = crs->lr_gpio.tflags;
 			ev->pin = pin;
 			gpio->intr_establish(gpio->cookie, pin,
-			    crs->lr_gpio.tflags, acpi_gpio_event, ev);
+			    crs->lr_gpio.tflags, IPL_BIO | IPL_WAKEUP,
+			    acpi_gpio_event, ev);
 		}
 		break;
 	default:
@@ -1997,12 +2062,6 @@ acpi_sleep_task(void *arg0, int sleepmode)
 
 #endif /* SMALL_KERNEL */
 
-int
-acpi_resuming(struct acpi_softc *sc)
-{
-	return (getuptime() < sc->sc_resume_time + 10);
-}
-
 void
 acpi_reset(void)
 {
@@ -2069,15 +2128,17 @@ acpi_pbtn_task(void *arg0, int dummy)
 	    en | ACPI_PM1_PWRBTN_EN);
 	splx(s);
 
+#ifdef SUSPEND
 	/* Ignore button events if we're resuming. */
-	if (acpi_resuming(sc))
+	if (resuming())
 		return;
+#endif	/* SUSPEND */
 
 	switch (pwr_action) {
 	case 0:
 		break;
 	case 1:
-		acpi_addtask(sc, acpi_powerdown_task, sc, 0);
+		powerbutton_event();
 		break;
 #ifndef SMALL_KERNEL
 	case 2:
@@ -2105,21 +2166,9 @@ acpi_sbtn_task(void *arg0, int dummy)
 	splx(s);
 }
 
-void
-acpi_powerdown_task(void *arg0, int dummy)
-{
-	extern int allowpowerdown;
-
-	if (allowpowerdown == 1) {
-		allowpowerdown = 0;
-		prsignal(initprocess, SIGUSR2);
-	}
-}
-
 int
 acpi_interrupt(void *arg)
 {
-	extern int cpu_suspended;
 	struct acpi_softc *sc = (struct acpi_softc *)arg;
 	uint32_t processed = 0, idx, jdx;
 	uint16_t sts, en;
@@ -2778,7 +2827,7 @@ acpi_create_thread(void *arg)
 		    DEVNAME(sc));
 }
 
-#if __arm64__
+#ifdef __arm64__
 int
 acpi_foundsectwo(struct aml_node *node, void *arg)
 {

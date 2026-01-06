@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 #
-# Copyright (c) 2021 Ingo Schwarze <schwarze@openbsd.org>
+# Copyright (c) 2021,2022,2023,2024,2025 Ingo Schwarze <schwarze@openbsd.org>
 #
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -25,10 +25,10 @@ my %internal = (
 	CHARTYPE_FIRST_ESC_2253 CHARTYPE_LAST_ESC_2253 CHARTYPE_PRINTABLESTRING
     )],
     bn => [qw(
-	BN_BITS BN_BITS4 BN_BYTES
-	BN_DEC_CONV BN_DEC_FMT1 BN_DEC_FMT2 BN_DEC_NUM BN_LLONG BN_LONG
-	BN_MASK2 BN_MASK2h BN_MASK2h1 BN_MASK2l
-	BN_TBIT BN_ULLONG
+	BN_BYTES BN_LLONG BN_ULLONG
+    )],
+    conf => [qw(
+	conf_st conf_method_st
     )],
     evp => [qw(
 	ASN1_PKEY_CTRL_CMS_ENVELOPE ASN1_PKEY_CTRL_CMS_RI_TYPE
@@ -55,7 +55,6 @@ my %obsolete = (
 	ASN1_dup ASN1_d2i_bio ASN1_d2i_bio_of ASN1_d2i_fp ASN1_d2i_fp_of
 	ASN1_i2d_bio ASN1_i2d_bio_of ASN1_i2d_bio_of_const
 	ASN1_i2d_fp ASN1_i2d_fp_of ASN1_i2d_fp_of_const
-	ASN1_LONG_UNDEF
 	BIT_STRING_BITNAME
 	V_ASN1_PRIMATIVE_TAG
 	X509_algor_st
@@ -68,9 +67,6 @@ my %obsolete = (
 	BIO_get_proxy_header BIO_get_url
 	BIO_set_filter_bio BIO_set_no_connect_return BIO_set_proxies
 	BIO_set_proxy_cb BIO_set_proxy_header BIO_set_url
-    )],
-    bn => [qw(
-	BN_HEX_FMT1 BN_HEX_FMT2 BN_MASK
     )],
     evp => [qw(
 	EVP_CIPH_FLAG_FIPS EVP_CIPH_FLAG_NON_FIPS_ALLOW
@@ -116,7 +112,7 @@ my %postponed = (
 
 my $MANW = 'man -M /usr/share/man -w';
 my $srcdir = '/usr/src/lib/libcrypto/man';
-my $hfile = '/usr/include/openssl';
+my $hfile = '/usr/include';
 
 my $in_cplusplus = 0;
 my $in_comment = 0;
@@ -133,6 +129,7 @@ if (defined $ARGV[0] && $ARGV[0] eq '-v') {
 	shift @ARGV;
 }
 $#ARGV == 0 or die "usage: $0 [-v] headername";
+$hfile .= "/openssl" unless $ARGV[0] eq 'tls';
 $hfile .= "/$ARGV[0].h";
 open my $in_fh, '<', $hfile or die "$hfile: $!";
 
@@ -236,6 +233,7 @@ try_again:
 	# Uninteresting lines.
 
 	if (/^\s*$/ ||
+	    /^DECLARE_LHASH_OF\(\w+\);$/ ||
 	    /^DECLARE_STACK_OF\(\w+\)$/ ||
 	    /^DECLARE_PKCS12_STACK_OF\(\w+\)$/ ||
 	    /^TYPEDEF_D2I2D_OF\(\w+\);$/ ||
@@ -288,7 +286,7 @@ try_again:
 			print "D- $line\n" if $verbose;
 			next;
 		}
-		if ($id =~ /^(?:ASN1|BIO|BN|EVP|X509(?:V3)?)_[FR]_\w+$/) {
+		if ($id =~ /^(?:ASN1|BIO|BN|CONF|EVP|X509(?:V3)?)_[FR]_\w+$/) {
 			print "D- $line\n" if $verbose;
 			next;
 		}

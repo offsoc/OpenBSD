@@ -1,4 +1,4 @@
-/* $OpenBSD: misc.c,v 1.200 2025/05/22 03:53:46 dtucker Exp $ */
+/* $OpenBSD: misc.c,v 1.211 2025/12/05 17:48:47 phessler Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  * Copyright (c) 2005-2020 Damien Miller.  All rights reserved.
@@ -81,10 +81,13 @@ rtrim(char *s)
 
 	if ((i = strlen(s)) == 0)
 		return;
-	for (i--; i > 0; i--) {
+	do {
+		i--;
 		if (isspace((unsigned char)s[i]))
 			s[i] = '\0';
-	}
+		else
+			break;
+	} while (i > 0);
 }
 
 /*
@@ -106,6 +109,34 @@ strprefix(const char *s, const char *prefix, int ignorecase)
 			return NULL;
 	}
 	return s + prefixlen;
+}
+
+/* Append string 's' to a NULL-terminated array of strings */
+void
+stringlist_append(char ***listp, const char *s)
+{
+	size_t i = 0;
+
+	if (*listp == NULL)
+		*listp = xcalloc(2, sizeof(**listp));
+	else {
+		for (i = 0; (*listp)[i] != NULL; i++)
+			; /* count */
+		*listp = xrecallocarray(*listp, i + 1, i + 2, sizeof(**listp));
+	}
+	(*listp)[i] = xstrdup(s);
+}
+
+void
+stringlist_free(char **list)
+{
+	size_t i = 0;
+
+	if (list == NULL)
+		return;
+	for (i = 0; list[i] != NULL; i++)
+		free(list[i]);
+	free(list);
 }
 
 /* set/unset filedescriptor to non-blocking */
@@ -258,6 +289,10 @@ set_sock_tos(int fd, int tos)
 {
 	int af;
 
+	if (tos < 0 || tos == INT_MAX) {
+		debug_f("invalid TOS %d", tos);
+		return;
+	}
 	switch ((af = get_sock_af(fd))) {
 	case -1:
 		/* assume not a socket */
@@ -439,7 +474,7 @@ strdelim_internal(char **s, int split_equals)
 }
 
 /*
- * Return next token in configuration line; splts on whitespace or a
+ * Return next token in configuration line; splits on whitespace or a
  * single '=' character.
  */
 char *
@@ -449,7 +484,7 @@ strdelim(char **s)
 }
 
 /*
- * Return next token in configuration line; splts on whitespace only.
+ * Return next token in configuration line; splits on whitespace only.
  */
 char *
 strdelimw(char **s)
@@ -473,6 +508,21 @@ pwcopy(struct passwd *pw)
 	copy->pw_dir = xstrdup(pw->pw_dir);
 	copy->pw_shell = xstrdup(pw->pw_shell);
 	return copy;
+}
+
+void
+pwfree(struct passwd *pw)
+{
+	if (pw == NULL)
+		return;
+	free(pw->pw_name);
+	freezero(pw->pw_passwd,
+	    pw->pw_passwd == NULL ? 0 : strlen(pw->pw_passwd));
+	free(pw->pw_gecos);
+	free(pw->pw_class);
+	free(pw->pw_dir);
+	free(pw->pw_shell);
+	freezero(pw, sizeof(*pw));
 }
 
 /*
@@ -526,24 +576,21 @@ a2tun(const char *s, int *remote)
 	return (tun);
 }
 
-#define SECONDS		1
+#define SECONDS		1.0
 #define MINUTES		(SECONDS * 60)
 #define HOURS		(MINUTES * 60)
 #define DAYS		(HOURS * 24)
 #define WEEKS		(DAYS * 7)
 
-static char *
-scandigits(char *s)
-{
-	while (isdigit((unsigned char)*s))
-		s++;
-	return s;
-}
-
 /*
- * Convert a time string into seconds; format is
- * a sequence of:
+ * Convert an interval/duration time string into seconds, which may include
+ * fractional seconds.
+ *
+ * The format is a sequence of:
  *      time[qualifier]
+ *
+ * This supports fractional values for the seconds value only. All other
+ * values must be integers.
  *
  * Valid time qualifiers are:
  *      <none>  seconds
@@ -554,44 +601,46 @@ scandigits(char *s)
  *      w|W     weeks
  *
  * Examples:
- *      90m     90 minutes
- *      1h30m   90 minutes
- *      2d      2 days
- *      1w      1 week
+ *      90m      90 minutes
+ *      1h30m    90 minutes
+ *      1.5s     1.5 seconds
+ *      2d       2 days
+ *      1w       1 week
  *
- * Return -1 if time string is invalid.
+ * Returns <0.0 if the time string is invalid.
  */
-int
-convtime(const char *s)
+double
+convtime_double(const char *s)
 {
-	int secs, total = 0, multiplier;
-	char *p, *os, *np, c = 0;
-	const char *errstr;
+	double val, total_sec = 0.0, multiplier;
+	const char *p, *start_p;
+	char *endp;
+	int seen_seconds = 0;
 
 	if (s == NULL || *s == '\0')
-		return -1;
-	p = os = strdup(s);	/* deal with const */
-	if (os == NULL)
-		return -1;
+		return -1.0;
 
-	while (*p) {
-		np = scandigits(p);
-		if (np) {
-			c = *np;
-			*np = '\0';
-		}
-		secs = (int)strtonum(p, 0, INT_MAX, &errstr);
-		if (errstr)
-			goto fail;
-		*np = c;
+	for (p = s; *p != '\0';) {
+		if (!isdigit((unsigned char)*p) && *p != '.')
+			return -1.0;
 
-		multiplier = 1;
-		switch (c) {
+		errno = 0;
+		if ((val = strtod(p, &endp)) < 0 || errno != 0 || p == endp)
+			return -1.0;
+		/* Allow only decimal forms */
+		if (p + strspn(p, "0123456789.") != endp)
+			return -1.0;
+		start_p = p;
+		p = endp;
+
+		switch (*p) {
 		case '\0':
-			np--;	/* back up */
-			break;
+			/* FALLTHROUGH */
 		case 's':
 		case 'S':
+			if (seen_seconds++)
+				return -1.0;
+			multiplier = SECONDS;
 			break;
 		case 'm':
 		case 'M':
@@ -610,23 +659,44 @@ convtime(const char *s)
 			multiplier = WEEKS;
 			break;
 		default:
-			goto fail;
+			return -1.0;
 		}
-		if (secs > INT_MAX / multiplier)
-			goto fail;
-		secs *= multiplier;
-		if  (total > INT_MAX - secs)
-			goto fail;
-		total += secs;
-		if (total < 0)
-			goto fail;
-		p = ++np;
+
+		/* Special handling if this was a decimal */
+		if (memchr(start_p, '.', endp - start_p) != NULL) {
+			/* Decimal point present */
+			if (multiplier > 1.0)
+				return -1.0; /* No fractionals for non-seconds */
+			/* For seconds, ensure digits follow */
+			if (!isdigit((unsigned char)*(endp - 1)))
+				return -1.0;
+		}
+
+		total_sec += val * multiplier;
+
+		if (*p != '\0')
+			p++;
 	}
-	free(os);
-	return total;
-fail:
-	free(os);
-	return -1;
+	return total_sec;
+}
+
+/*
+ * Same as convtime_double() above but fractional seconds are ignored.
+ * Return -1 if time string is invalid.
+ */
+int
+convtime(const char *s)
+{
+	double sec_val;
+
+	if ((sec_val = convtime_double(s)) < 0.0)
+		return -1;
+
+	/* Check for overflow into int */
+	if (sec_val < 0 || sec_val > INT_MAX)
+		return -1;
+
+	return (int)sec_val;
 }
 
 #define TF_BUFS	8
@@ -938,7 +1008,7 @@ urldecode(const char *src)
 	size_t srclen;
 
 	if ((srclen = strlen(src)) >= SIZE_MAX)
-		fatal_f("input too large");
+		return NULL;
 	ret = xmalloc(srclen + 1);
 	for (dst = ret; *src != '\0'; src++) {
 		switch (*src) {
@@ -946,9 +1016,10 @@ urldecode(const char *src)
 			*dst++ = ' ';
 			break;
 		case '%':
+			/* note: don't allow \0 characters */
 			if (!isxdigit((unsigned char)src[1]) ||
 			    !isxdigit((unsigned char)src[2]) ||
-			    (ch = hexchar(src + 1)) == -1) {
+			    (ch = hexchar(src + 1)) == -1 || ch == 0) {
 				free(ret);
 				return NULL;
 			}
@@ -1802,9 +1873,10 @@ static const struct {
 	{ "cs7", IPTOS_DSCP_CS7 },
 	{ "ef", IPTOS_DSCP_EF },
 	{ "le", IPTOS_DSCP_LE },
-	{ "lowdelay", IPTOS_LOWDELAY },
-	{ "throughput", IPTOS_THROUGHPUT },
-	{ "reliability", IPTOS_RELIABILITY },
+	{ "va",	IPTOS_DSCP_VA },
+	{ "lowdelay", INT_MIN },	/* deprecated */
+	{ "throughput", INT_MIN },	/* deprecated */
+	{ "reliability", INT_MIN },	/* deprecated */
 	{ NULL, -1 }
 };
 
@@ -2433,8 +2505,10 @@ format_absolute_time(uint64_t t, char *buf, size_t len)
 	time_t tt = t > SSH_TIME_T_MAX ? SSH_TIME_T_MAX : t;
 	struct tm tm;
 
-	localtime_r(&tt, &tm);
-	strftime(buf, len, "%Y-%m-%dT%H:%M:%S", &tm);
+	if (localtime_r(&tt, &tm) == NULL)
+		strlcpy(buf, "UNKNOWN-TIME", len);
+	else
+		strftime(buf, len, "%Y-%m-%dT%H:%M:%S", &tm);
 }
 
 /*

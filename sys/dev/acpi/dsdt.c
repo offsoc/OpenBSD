@@ -1,4 +1,4 @@
-/* $OpenBSD: dsdt.c,v 1.274 2025/03/22 18:14:37 kettenis Exp $ */
+/* $OpenBSD: dsdt.c,v 1.277 2025/12/19 13:40:03 kettenis Exp $ */
 /*
  * Copyright (c) 2005 Jordan Hargrave <jordan@openbsd.org>
  *
@@ -35,6 +35,8 @@
 #include <dev/acpi/dsdt.h>
 
 #include <dev/i2c/i2cvar.h>
+
+#include <dev/pci/ppbreg.h>
 
 #ifdef SMALL_KERNEL
 #undef ACPI_DEBUG
@@ -1753,6 +1755,7 @@ struct aml_scope *aml_pushscope(struct aml_scope *, struct aml_value *,
 struct aml_scope *aml_popscope(struct aml_scope *);
 
 void		aml_showstack(struct aml_scope *);
+struct aml_value *aml_tryconv(struct aml_value *, int, int);
 struct aml_value *aml_convert(struct aml_value *, int, int);
 
 int		aml_matchtest(int64_t, int64_t, int);
@@ -1766,6 +1769,8 @@ int		aml_ccrlen(int, union acpi_resource *, void *);
 
 void		aml_store(struct aml_scope *, struct aml_value *, int64_t,
     struct aml_value *);
+void		aml_rwfield(struct aml_value *, int, int, struct aml_value *,
+    int);
 
 /*
  * Reference Count functions
@@ -2022,7 +2027,7 @@ aml_hextoint(const char *str)
 }
 
 struct aml_value *
-aml_convert(struct aml_value *a, int ctype, int clen)
+aml_tryconv(struct aml_value *a, int ctype, int clen)
 {
 	struct aml_value *c = NULL;
 
@@ -2045,6 +2050,11 @@ aml_convert(struct aml_value *a, int ctype, int clen)
 			c = aml_allocvalue(AML_OBJTYPE_BUFFER, a->length,
 			    a->v_string);
 			break;
+		case AML_OBJTYPE_BUFFERFIELD:
+		case AML_OBJTYPE_FIELDUNIT:
+			c = aml_allocvalue(AML_OBJTYPE_BUFFER, 0, NULL);
+			aml_rwfield(a, 0, a->v_field.bitlen, c, ACPI_IOREAD);
+			break;
 		}
 		break;
 	case AML_OBJTYPE_INTEGER:
@@ -2061,6 +2071,13 @@ aml_convert(struct aml_value *a, int ctype, int clen)
 			break;
 		case AML_OBJTYPE_UNINITIALIZED:
 			c = aml_allocvalue(AML_OBJTYPE_INTEGER, 0, NULL);
+			break;
+		case AML_OBJTYPE_BUFFERFIELD:
+		case AML_OBJTYPE_FIELDUNIT:
+			if (a->v_field.bitlen > aml_intlen)
+				break;
+			c = aml_allocvalue(AML_OBJTYPE_INTEGER, 0, NULL);
+			aml_rwfield(a, 0, a->v_field.bitlen, c, ACPI_IOREAD);
 			break;
 		}
 		break;
@@ -2087,6 +2104,15 @@ aml_convert(struct aml_value *a, int ctype, int clen)
 		}
 		break;
 	}
+	return c;
+}
+
+struct aml_value *
+aml_convert(struct aml_value *a, int ctype, int clen)
+{
+	struct aml_value *c;
+
+	c = aml_tryconv(a, ctype, clen);
 	if (c == NULL) {
 #ifndef SMALL_KERNEL
 		aml_showvalue(a);
@@ -2099,7 +2125,25 @@ aml_convert(struct aml_value *a, int ctype, int clen)
 int
 aml_compare(struct aml_value *a1, struct aml_value *a2, int opcode)
 {
+	struct aml_value *cv;		/* value after conversion */
 	int rc = 0;
+
+	/*
+	 * Convert A1 to integer, string, or buffer.
+	 *
+	 * The possible conversions listed in Table 19.6 of the ACPI spec
+	 * imply that unless we already got one of the three supported types,
+	 * the conversion must be from field unit or buffer field. In both
+	 * cases, the rules (Table 19.7) state that we should convert to
+	 * integer if possible with buffer as a fallback.
+	 */
+	if (a1->type != AML_OBJTYPE_INTEGER && a1->type != AML_OBJTYPE_STRING
+	    && a1->type != AML_OBJTYPE_BUFFER) {
+		cv = aml_tryconv(a1, AML_OBJTYPE_INTEGER, -1);
+		if (cv == NULL)
+			cv = aml_convert(a1, AML_OBJTYPE_BUFFER, -1);
+		a1 = cv;
+	}
 
 	/* Convert A2 to type of A1 */
 	a2 = aml_convert(a2, a1->type, -1);
@@ -2126,6 +2170,14 @@ struct aml_value *
 aml_concat(struct aml_value *a1, struct aml_value *a2)
 {
 	struct aml_value *c = NULL;
+
+	/*
+	 * Make A1 an integer, string, or buffer. Unless we already got one
+	 * of these three types, convert to string.
+	 */
+	if (a1->type != AML_OBJTYPE_INTEGER && a1->type != AML_OBJTYPE_STRING
+	    && a1->type != AML_OBJTYPE_BUFFER)
+		a1 = aml_convert(a1, AML_OBJTYPE_STRING, -1);
 
 	/* Convert arg2 to type of arg1 */
 	a2 = aml_convert(a2, a1->type, -1);
@@ -2292,35 +2344,71 @@ void aml_rwgen(struct aml_value *, int, int, struct aml_value *, int, int);
 void aml_rwgpio(struct aml_value *, int, int, struct aml_value *, int, int);
 void aml_rwgsb(struct aml_value *, int, int, int, struct aml_value *, int, int);
 void aml_rwindexfield(struct aml_value *, struct aml_value *val, int);
-void aml_rwfield(struct aml_value *, int, int, struct aml_value *, int);
 
 /* Get PCI address for opregion objects */
 int
 aml_rdpciaddr(struct aml_node *pcidev, union amlpci_t *addr)
 {
+	struct aml_node *path[10] = { NULL };
+	pci_chipset_tag_t pc;
+	pcitag_t tag;
 	int64_t res;
+	int n, reg;
 
-	addr->bus = 0;
-	addr->seg = 0;
-	if (aml_evalinteger(acpi_softc, pcidev, "_ADR", 0, NULL, &res) == 0) {
-		addr->fun = res & 0xFFFF;
-		addr->dev = res >> 16;
+	/* invert */
+	n = 0;
+	for (;;) {
+		path[n] = pcidev;
+		pcidev = pcidev->parent;
+		if (pcidev == NULL || n == nitems(path) - 1)
+			break;
+		n++;
 	}
-	while (pcidev != NULL) {
-		/* HID device (PCI or PCIE root): eval _SEG and _BBN */
-		if (__aml_search(pcidev, "_HID", 0)) {
-			if (aml_evalinteger(acpi_softc, pcidev, "_SEG",
-			        0, NULL, &res) == 0) {
+
+	/* start from root */
+	addr->seg = 0;
+	for (; n >= 0; n--) {
+		if (aml_evalinteger(acpi_softc, path[n], "_ADR", 0, NULL,
+		    &res) == 0) {
+			addr->dev = res >> 16;
+			addr->fun = res & 0xFFFF;
+		} else if (__aml_search(path[n], "_HID", 0)) {
+			/* HID device (PCI or PCIE root): eval _SEG and _BBN */
+			if (aml_evalinteger(acpi_softc, path[n], "_SEG", 0,
+			    NULL, &res) == 0) {
 				addr->seg = res;
+				addr->bus = 0;
+				addr->dev = 0;
+				addr->fun = 0;
 			}
-			if (aml_evalinteger(acpi_softc, pcidev, "_BBN",
-			        0, NULL, &res) == 0) {
+			if (aml_evalinteger(acpi_softc, pcidev, "_BBN", 0, NULL,
+			    &res) == 0) {
 				addr->bus = res;
-				break;
+				addr->dev = 0;
+				addr->fun = 0;
 			}
 		}
-		pcidev = pcidev->parent;
+
+		if (n == 0)
+			break;
+
+		/* an intermediate device, if it's a bridge jump busses */
+		pc = pci_lookup_segment(ACPI_PCI_SEG(addr->addr),
+		    ACPI_PCI_BUS(addr->addr));
+		tag = pci_make_tag(pc, addr->bus, addr->dev, addr->fun);
+		reg = pci_conf_read(pc, tag, PCI_CLASS_REG);
+		if (PCI_CLASS(reg) == PCI_CLASS_BRIDGE &&
+		    PCI_SUBCLASS(reg) == PCI_SUBCLASS_BRIDGE_PCI) {
+			reg = pci_conf_read(pc, tag, PPB_REG_BUSINFO);
+			addr->bus = PPB_BUSINFO_SECONDARY(reg);
+			addr->dev = 0;
+			addr->fun = 0;
+		}
 	}
+
+	dnprintf(50, "%s: %s: addr 0x%llx\n", __func__, aml_nodename(pcidev),
+	    addr->addr);
+
 	return (0);
 }
 
@@ -3088,6 +3176,13 @@ aml_store(struct aml_scope *scope, struct aml_value *lhs , int64_t ival,
 		}
 		aml_copyvalue(node->value, rhs);
 		break;
+	case AML_OBJTYPE_OBJREF:
+		if (lhs->v_objref.type != AMLOP_PACKAGE) {
+			aml_die("Package expected");
+		}
+		aml_freevalue(lhs->v_objref.ref);
+		aml_copyvalue(lhs->v_objref.ref, rhs);
+		break;
 	case AML_OBJTYPE_METHOD:
 		/* Method override */
 		if (rhs->type != AML_OBJTYPE_INTEGER) {
@@ -3719,6 +3814,15 @@ struct aml_value *
 aml_gettgt(struct aml_value *val, int opcode)
 {
 	while (val && val->type == AML_OBJTYPE_OBJREF) {
+		/*
+		 * Stores into package elements need to be handled
+		 * differently than other stores.  Return the
+		 * corresponding object reference such that our caller
+		 * can still recognize them as such.
+		 */
+		if (opcode == AMLOP_STORE &&
+		    val->v_objref.type == AMLOP_PACKAGE)
+			return val;
 		val = val->v_objref.ref;
 	}
 	return val;
@@ -4113,8 +4217,9 @@ aml_parse(struct aml_scope *scope, int ret_type, const char *stype)
 				my_ret = opargs[0]->v_package[idx];
 				aml_addref(my_ret, "Index.Package");
 			} else {
-				my_ret = aml_allocvalue(AML_OBJTYPE_OBJREF, AMLOP_PACKAGE,
-				    opargs[0]->v_package[idx]);
+				my_ret = aml_allocvalue(AML_OBJTYPE_OBJREF,
+				    AMLOP_PACKAGE, opargs[0]->v_package[idx]);
+				my_ret->v_objref.index = idx;
 				aml_addref(my_ret->v_objref.ref,
 				    "Index.Package");
 			}

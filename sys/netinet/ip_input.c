@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_input.c,v 1.408 2025/05/20 18:40:09 mvs Exp $	*/
+/*	$OpenBSD: ip_input.c,v 1.426 2025/11/12 10:00:27 hshoexer Exp $	*/
 /*	$NetBSD: ip_input.c,v 1.30 1996/03/16 23:53:58 christos Exp $	*/
 
 /*
@@ -34,6 +34,7 @@
 
 #include "pf.h"
 #include "carp.h"
+#include "ether.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -42,7 +43,6 @@
 #include <sys/mutex.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 #include <sys/sysctl.h>
 #include <sys/pool.h>
 #include <sys/task.h>
@@ -86,38 +86,36 @@
 /*
  * Locks used to protect global variables in this file:
  *	I	immutable after creation
- *	a	atomic operations
  *	N	net lock
+ *	Q	ipq_mutex
+ *	a	atomic operations
  */
 
 /* values controllable via sysctl */
 int	ip_forwarding = 0;			/* [a] */
-int	ipmforwarding = 0;
-int	ipmultipath = 0;
+int	ipmforwarding = 0;			/* [a] */
+int	ipmultipath = 0;			/* [a] */
 int	ip_sendredirects = 1;			/* [a] */
 int	ip_dosourceroute = 0;			/* [a] */
-int	ip_defttl = IPDEFTTL;
-int	ip_mtudisc = 1;
-int	ip_mtudisc_timeout = IPMTUDISCTIMEOUT;
+int	ip_defttl = IPDEFTTL;			/* [a] */
+int	ip_mtudisc = 1;				/* [a] */
+int	ip_mtudisc_timeout = IPMTUDISCTIMEOUT;	/* [a] */
 int	ip_directedbcast = 0;			/* [a] */
 
-/* Protects `ipq' and `ip_frags'. */
 struct mutex	ipq_mutex = MUTEX_INITIALIZER(IPL_SOFTNET);
 
 /* IP reassembly queue */
-LIST_HEAD(, ipq) ipq;
+LIST_HEAD(, ipq) ipq;				/* [Q] */
 
 /* Keep track of memory used for reassembly */
-int	ip_maxqueue = 300;
-int	ip_frags = 0;
+int	ip_maxqueue = 300;			/* [a] */
+int	ip_frags = 0;				/* [Q] */
 
-const struct sysctl_bounded_args ipctl_vars_unlocked[] = {
+#ifndef SMALL_KERNEL
+const struct sysctl_bounded_args ipctl_vars[] = {
 	{ IPCTL_FORWARDING, &ip_forwarding, 0, 2 },
 	{ IPCTL_SENDREDIRECTS, &ip_sendredirects, 0, 1 },
 	{ IPCTL_DIRECTEDBCAST, &ip_directedbcast, 0, 1 },
-};
-
-const struct sysctl_bounded_args ipctl_vars[] = {
 #ifdef MROUTING
 	{ IPCTL_MRTPROTO, &ip_mrtproto, SYSCTL_INT_READONLY },
 #endif
@@ -131,6 +129,7 @@ const struct sysctl_bounded_args ipctl_vars[] = {
 	{ IPCTL_ARPTIMEOUT, &arpt_keep, 0, INT_MAX },
 	{ IPCTL_ARPDOWN, &arpt_down, 0, INT_MAX },
 };
+#endif /* SMALL_KERNEL */
 
 struct niqueue ipintrq = NIQUEUE_INITIALIZER(IPQ_MAXLEN, NETISR_IP);
 
@@ -154,7 +153,7 @@ int	in_ouraddr(struct mbuf *, struct ifnet *, struct route *, int);
 int		ip_fragcheck(struct mbuf **, int *);
 struct mbuf *	ip_reass(struct ipqent *, struct ipq *);
 void		ip_freef(struct ipq *);
-void		ip_flush(void);
+void		ip_flush(int);
 
 static void ip_send_dispatch(void *);
 static void ip_sendraw_dispatch(void *);
@@ -230,7 +229,9 @@ ip_init(void)
 	mq_init(&ipsend_mq, 64, IPL_SOFTNET);
 	mq_init(&ipsendraw_mq, 64, IPL_SOFTNET);
 
+#if NETHER > 0
 	arpinit();
+#endif
 #ifdef IPSEC
 	ipsec_init();
 #endif
@@ -528,7 +529,8 @@ ip_input_if(struct mbuf **mp, int *offp, int nxt, int af, struct ifnet *ifp,
 		m->m_flags |= M_MCAST;
 
 #ifdef MROUTING
-		if (ipmforwarding && ip_mrouter[ifp->if_rdomain]) {
+		if (atomic_load_int(&ipmforwarding) &&
+		    ip_mrouter[ifp->if_rdomain]) {
 			int error;
 
 			if (m->m_flags & M_EXT) {
@@ -696,9 +698,11 @@ ip_fragcheck(struct mbuf **mp, int *offp)
 		 * attempt reassembly; if it succeeds, proceed.
 		 */
 		if (mff || ip->ip_off) {
+			int ip_maxqueue_local = atomic_load_int(&ip_maxqueue);
+
 			ipstat_inc(ips_fragments);
-			if (ip_frags + 1 > ip_maxqueue) {
-				ip_flush();
+			if (ip_frags + 1 > ip_maxqueue_local) {
+				ip_flush(ip_maxqueue_local);
 				ipstat_inc(ips_rcvmemdrop);
 				goto bad;
 			}
@@ -787,7 +791,7 @@ ip_deliver(struct mbuf **mp, int *offp, int nxt, int af, int shared,
 
 #ifdef INET6
 		if (af == AF_INET6 &&
-		    ip6_hdrnestlimit && (++nest > ip6_hdrnestlimit)) {
+		    (++nest > atomic_load_int(&ip6_hdrnestlimit))) {
 			ip6stat_inc(ip6s_toomanyhdr);
 			goto bad;
 		}
@@ -1169,13 +1173,13 @@ ip_slowtimo(void)
  * Flush a bunch of datagram fragments, till we are down to 75%.
  */
 void
-ip_flush(void)
+ip_flush(int maxqueue)
 {
 	int max = 50;
 
 	MUTEX_ASSERT_LOCKED(&ipq_mutex);
 
-	while (!LIST_EMPTY(&ipq) && ip_frags > ip_maxqueue * 3 / 4 && --max) {
+	while (!LIST_EMPTY(&ipq) && ip_frags > maxqueue * 3 / 4 && --max) {
 		ipstat_inc(ips_fragdropped);
 		ip_freef(LIST_FIRST(&ipq));
 	}
@@ -1624,8 +1628,10 @@ ip_forward(struct mbuf *m, struct ifnet *ifp, struct route *ro, int flags)
 	    !ISSET(rt->rt_flags, RTF_DYNAMIC|RTF_MODIFIED) &&
 	    satosin(rt_key(rt))->sin_addr.s_addr != INADDR_ANY &&
 	    !ISSET(flags, IP_REDIRECT) &&
-	    atomic_load_int(&ip_sendredirects) &&
-	    !arpproxy(satosin(rt_key(rt))->sin_addr, rtableid)) {
+#if NETHER > 0
+	    !arpproxy(satosin(rt_key(rt))->sin_addr, rtableid) &&
+#endif
+	    atomic_load_int(&ip_sendredirects)) {
 		if ((ip->ip_src.s_addr & ifatoia(rt->rt_ifa)->ia_netmask) ==
 		    ifatoia(rt->rt_ifa)->ia_net) {
 		    if (rt->rt_flags & RTF_GATEWAY)
@@ -1720,11 +1726,13 @@ ip_forward(struct mbuf *m, struct ifnet *ifp, struct route *ro, int flags)
 		rtfree(ro->ro_rt);
 }
 
+#ifndef SMALL_KERNEL
+
 int
 ip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen)
 {
-	int oldval, error;
+	int oldval, newval, error;
 
 	/* Almost all sysctl names at this level are terminal. */
 	if (namelen != 1 && name[0] != IPCTL_IFQUEUE &&
@@ -1736,19 +1744,29 @@ ip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_securelevel_int(oldp, oldlenp, newp, newlen,
 		    &ip_dosourceroute));
 	case IPCTL_MTUDISC:
-		NET_LOCK();
-		error = sysctl_int(oldp, oldlenp, newp, newlen, &ip_mtudisc);
-		if (ip_mtudisc == 0)
-			rt_timer_queue_flush(&ip_mtudisc_timeout_q);
-		NET_UNLOCK();
-		return error;
-	case IPCTL_MTUDISCTIMEOUT:
-		NET_LOCK();
+		oldval = newval = atomic_load_int(&ip_mtudisc);
 		error = sysctl_int_bounded(oldp, oldlenp, newp, newlen,
-		    &ip_mtudisc_timeout, 0, INT_MAX);
-		rt_timer_queue_change(&ip_mtudisc_timeout_q,
-		    ip_mtudisc_timeout);
-		NET_UNLOCK();
+		    &newval, 0, 1);
+		if (error == 0 && oldval != newval &&
+		    oldval == atomic_cas_uint(&ip_mtudisc, oldval, newval) &&
+		    newval == 0) {
+			NET_LOCK();
+			rt_timer_queue_flush(&ip_mtudisc_timeout_q);
+			NET_UNLOCK();
+		}
+
+		return (error);
+	case IPCTL_MTUDISCTIMEOUT:
+		oldval = newval = atomic_load_int(&ip_mtudisc_timeout);
+		error = sysctl_int_bounded(oldp, oldlenp, newp, newlen,
+		    &newval, 0, INT_MAX);
+		if (error == 0 && oldval != newval) {
+			rw_enter_write(&sysctl_lock);
+			atomic_store_int(&ip_mtudisc_timeout, newval);
+			rt_timer_queue_change(&ip_mtudisc_timeout_q, newval);
+			rw_exit_write(&sysctl_lock);
+		}
+
 		return (error);
 #ifdef IPSEC
 	case IPCTL_ENCDEBUG:
@@ -1787,17 +1805,11 @@ ip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	case IPCTL_MRTMFC:
 		if (newp)
 			return (EPERM);
-		NET_LOCK();
-		error = mrt_sysctl_mfc(oldp, oldlenp);
-		NET_UNLOCK();
-		return (error);
+		return (mrt_sysctl_mfc(oldp, oldlenp));
 	case IPCTL_MRTVIF:
 		if (newp)
 			return (EPERM);
-		NET_LOCK();
-		error = mrt_sysctl_vif(oldp, oldlenp);
-		NET_UNLOCK();
-		return (error);
+		return (mrt_sysctl_vif(oldp, oldlenp));
 #else
 	case IPCTL_MRTPROTO:
 	case IPCTL_MRTSTATS:
@@ -1806,26 +1818,19 @@ ip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (EOPNOTSUPP);
 #endif
 	case IPCTL_MULTIPATH:
-		NET_LOCK();
-		oldval = ipmultipath;
+		oldval = newval = atomic_load_int(&ipmultipath);
 		error = sysctl_int_bounded(oldp, oldlenp, newp, newlen,
-		    &ipmultipath, 0, 1);
-		if (oldval != ipmultipath)
+		    &newval, 0, 1);
+		if (error == 0 && oldval != newval) {
+			atomic_store_int(&ipmultipath, newval);
+			membar_producer();
 			atomic_inc_long(&rtgeneration);
-		NET_UNLOCK();
+		}
+
 		return (error);
-	case IPCTL_FORWARDING:
-	case IPCTL_SENDREDIRECTS:
-	case IPCTL_DIRECTEDBCAST:
-		return (sysctl_bounded_arr(
-		    ipctl_vars_unlocked, nitems(ipctl_vars_unlocked),
-		    name, namelen, oldp, oldlenp, newp, newlen));
 	default:
-		NET_LOCK();
-		error = sysctl_bounded_arr(ipctl_vars, nitems(ipctl_vars),
-		    name, namelen, oldp, oldlenp, newp, newlen);
-		NET_UNLOCK();
-		return (error);
+		return (sysctl_bounded_arr(ipctl_vars, nitems(ipctl_vars),
+		    name, namelen, oldp, oldlenp, newp, newlen));
 	}
 	/* NOTREACHED */
 }
@@ -1847,6 +1852,7 @@ ip_sysctl_ipstat(void *oldp, size_t *oldlenp, void *newp)
 
 	return (sysctl_rdstruct(oldp, oldlenp, newp, &ipstat, sizeof(ipstat)));
 }
+#endif /* SMALL_KERNEL */
 
 void
 ip_savecontrol(struct inpcb *inp, struct mbuf **mp, struct ip *ip,

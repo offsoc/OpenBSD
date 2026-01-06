@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmctl.h,v 1.41 2025/05/31 00:38:56 dv Exp $	*/
+/*	$OpenBSD: vmctl.h,v 1.43 2025/06/27 05:23:46 jsg Exp $	*/
 
 /*
  * Copyright (c) 2015 Reyk Floeter <reyk@openbsd.org>
@@ -36,8 +36,6 @@ enum actions {
 	CMD_WAITFOR,
 	CMD_PAUSE,
 	CMD_UNPAUSE,
-	CMD_SEND,
-	CMD_RECEIVE,
 };
 
 struct ctl_command;
@@ -101,8 +99,6 @@ void	 pause_vm(uint32_t, const char *);
 int	 pause_vm_complete(struct imsg *, int *);
 void	 unpause_vm(uint32_t, const char *);
 int	 unpause_vm_complete(struct imsg *, int *);
-void	 send_vm(uint32_t, const char *);
-void	 vm_receive(uint32_t, const char *);
 int	 check_info_id(const char *, uint32_t);
 void	 get_info_vm(uint32_t, const char *, enum actions, unsigned int);
 int	 add_info(struct imsg *, int *);

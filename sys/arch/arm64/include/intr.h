@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.h,v 1.24 2025/04/25 12:48:48 mvs Exp $ */
+/*	$OpenBSD: intr.h,v 1.26 2025/12/15 01:39:32 dlg Exp $ */
 
 /*
  * Copyright (c) 2001-2004 Opsycon AB  (www.opsycon.se / www.opsycon.com)
@@ -43,7 +43,6 @@
 
 /* Interrupt priority `levels'; not mutually exclusive. */
 #define	IPL_NONE	0	/* nothing */
-#define	IPL_SOFT	1	/* soft interrupts */
 #define	IPL_SOFTCLOCK	2	/* soft clock interrupts */
 #define	IPL_SOFTNET	3	/* soft network interrupts */
 #define	IPL_SOFTTTY	4	/* soft terminal interrupts */
@@ -85,6 +84,8 @@
 #ifndef _LOCORE
 #include <sys/queue.h>
 
+#define SOFTINTR_XCALL		NSOFTINTR
+
 void	softintr(int);
 
 int	splraise(int);
@@ -117,7 +118,6 @@ extern struct arm_intr_func arm_intr_func;
 #define	spllower(cpl)		(arm_intr_func.lower(cpl))
 #define	splx(cpl)		(arm_intr_func.x(cpl))
 
-#define	splsoft()	splraise(IPL_SOFT)
 #define	splsoftclock()	splraise(IPL_SOFTCLOCK)
 #define	splsoftnet()	splraise(IPL_SOFTNET)
 #define	splsofttty()	splraise(IPL_SOFTTTY)
@@ -201,6 +201,12 @@ extern void (*intr_send_ipi_func)(struct cpu_info *, int);
 #define ARM_IPI_NOP	0
 #define ARM_IPI_DDB	1
 #define ARM_IPI_HALT	2
+#define ARM_IPI_XCALL	3
+
+/* kern_xcall calls this to dispatch xcalls */
+#define cpu_xcall_ipi(_ci) arm_send_ipi((_ci), ARM_IPI_XCALL)
+/* interrupt controllers call this to get cpu_xcall_dispatch run */
+#define arm_cpu_xcall_dispatch() softintr(SOFTINTR_XCALL)
 
 #ifdef DIAGNOSTIC
 /*

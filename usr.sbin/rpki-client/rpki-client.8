@@ -1,4 +1,4 @@
-.\"	$OpenBSD: rpki-client.8,v 1.121 2025/05/22 02:10:27 tb Exp $
+.\"	$OpenBSD: rpki-client.8,v 1.134 2025/12/02 12:21:39 job Exp $
 .\"
 .\" Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: May 22 2025 $
+.Dd $Mdocdate: December 2 2025 $
 .Dt RPKI-CLIENT 8
 .Os
 .Sh NAME
@@ -27,6 +27,8 @@
 .Op Fl d Ar cachedir
 .Op Fl e Ar rsync_prog
 .Op Fl H Ar fqdn
+.Op Fl P Ar posix-seconds
+.Op Fl p Ar threads
 .Op Fl S Ar skiplist
 .Op Fl s Ar timeout
 .Op Fl t Ar tal
@@ -114,13 +116,9 @@ and
 .Fl -address
 flags and connect with rsync-protocol locations.
 .It Fl f Ar
-Decode the
-.Em TAL
-or validate the
-.Em Signed Object
-in
+Attempt to decode and validate the RPKI object in
 .Ar file
-against the RPKI cache stored in
+using the cache stored in
 .Ar cachedir
 and print human-readable information about the object.
 If
@@ -132,6 +130,7 @@ and can be combined with
 .Fl j
 to emit a stream of
 .Em Concatenated JSON .
+This option is intended for debugging.
 .It Fl H Ar fqdn
 Create a shortlist and add
 .Ar fqdn
@@ -177,6 +176,11 @@ Specify the time for the evaluation in
 .Ar posix-seconds
 seconds from the unix epoch.
 This overrides the default of using the current system time.
+.It Fl p Ar threads
+Validate using the specified number of threads.
+The default is two.
+Has no effect in combination with
+.Fl f .
 .It Fl R
 Disable RRDP, synchronize only via RSYNC.
 .It Fl S Ar skiplist
@@ -316,6 +320,9 @@ is specified.
 cached repository data.
 .It Pa /var/db/rpki-client/openbgpd
 default roa-set output file.
+.It Pa /var/db/rpki-client/rpki.ccr
+DER-encoded canonical cache representation file.
+This facility is experimental and is still subject to change.
 .El
 .Sh EXIT STATUS
 .Ex -std
@@ -361,11 +368,6 @@ default roa-set output file.
 .Rs
 .%T Signed Object Template for the RPKI
 .%R RFC 6488
-.Re
-.Pp
-.Rs
-.%T The RPKI Ghostbusters Record
-.%R RFC 6493
 .Re
 .Pp
 .Rs
@@ -434,39 +436,44 @@ default roa-set output file.
 .Re
 .Pp
 .Rs
+.%T Handling of RPKI CRL Number Extensions
+.%R RFC 9829
+.Re
+.Pp
+.Rs
 .%T A Profile for Autonomous System Provider Authorization (ASPA)
 .%U https://datatracker.ietf.org/doc/html/draft-ietf-sidrops-aspa-profile
-.%D Jun, 2023
+.%D August, 2025
 .Re
 .Pp
 .Rs
 .%T Constraining RPKI Trust Anchors
 .%U https://datatracker.ietf.org/doc/html/draft-snijders-constraining-rpki-trust-anchors
-.%D September, 2023
+.%D May, 2025
 .Re
 .Pp
 .Rs
 .%T A profile for Signed Prefix Lists for Use in the RPKI
-.%U https://datatracker.ietf.org/doc/html/draft-ietf-sidrops-rpki-prefixlist-02
-.%D Jan, 2024
-.Re
-.Pp
-.Rs
-.%T Relying Party Handling of RPKI CRL Number Extensions
-.%U https://datatracker.ietf.org/doc/html/draft-ietf-sidrops-rpki-crl-numbers
-.%D May, 2024
+.%U https://datatracker.ietf.org/doc/html/draft-ietf-sidrops-rpki-prefixlist
+.%D March, 2025
 .Re
 .Pp
 .Rs
 .%T RPKI Manifest Number Handling
 .%U https://datatracker.ietf.org/doc/html/draft-ietf-sidrops-manifest-numbers
-.%D June, 2024
+.%D August, 2025
 .Re
 .Pp
 .Rs
 .%T Tiebreaking RPKI Trust Anchors
 .%U https://datatracker.ietf.org/doc/html/draft-ietf-sidrops-rpki-ta-tiebreaker
-.%D June, 2024
+.%D February, 2025
+.Re
+.Pp
+.Rs
+.%T A Profile for RPKI Canonical Cache Representation
+.%U https://datatracker.ietf.org/doc/html/draft-ietf-sidrops-rpki-ccr
+.%D December, 2025
 .Re
 .Sh HISTORY
 .Nm

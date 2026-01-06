@@ -1,4 +1,4 @@
-/*	$OpenBSD: qwx.c,v 1.75 2025/04/26 19:59:46 stsp Exp $	*/
+/*	$OpenBSD: qwx.c,v 1.97 2026/01/05 21:07:12 kettenis Exp $	*/
 
 /*
  * Copyright 2023 Stefan Sperling <stsp@openbsd.org>
@@ -105,6 +105,15 @@
 	const __typeof( ((type *)0)->member ) *__mptr = (ptr);	\
 	(type *)( (char *)__mptr - offsetof(type,member) );})
 
+static inline uint8_t
+hweight8(uint8_t x)
+{
+	x = (x & 0x55) + ((x & 0xaa) >> 1);
+	x = (x & 0x33) + ((x & 0xcc) >> 2);
+	x = (x + (x >> 4)) & 0x0f;
+	return (x);
+}
+
 /* #define QWX_DEBUG */
 
 #include <dev/ic/qwxreg.h>
@@ -153,6 +162,7 @@ int qwx_dp_tx_send_reo_cmd(struct qwx_softc *, struct dp_rx_tid *,
 void qwx_dp_rx_deliver_msdu(struct qwx_softc *, struct qwx_rx_msdu *);
 void qwx_dp_service_mon_ring(void *);
 void qwx_peer_frags_flush(struct qwx_softc *, struct ath11k_peer *);
+struct ath11k_peer *qwx_peer_find_by_id(struct qwx_softc *, uint16_t);
 int qwx_wmi_vdev_install_key(struct qwx_softc *,
     struct wmi_vdev_install_key_arg *, uint8_t);
 int qwx_dp_peer_rx_pn_replay_config(struct qwx_softc *, struct qwx_vif *,
@@ -161,11 +171,14 @@ void qwx_setkey_clear(struct qwx_softc *);
 void qwx_vif_free_all(struct qwx_softc *);
 void qwx_dp_stop_shadow_timers(struct qwx_softc *);
 void qwx_ce_stop_shadow_timers(struct qwx_softc *);
+int qwx_wmi_vdev_set_param_cmd(struct qwx_softc *, uint32_t, uint8_t,
+    uint32_t, uint32_t);
 
-int qwx_scan(struct qwx_softc *);
+int qwx_scan(struct qwx_softc *, int);
 void qwx_scan_abort(struct qwx_softc *);
 int qwx_auth(struct qwx_softc *);
 int qwx_deauth(struct qwx_softc *);
+int qwx_assoc(struct qwx_softc *);
 int qwx_run(struct qwx_softc *);
 int qwx_run_stop(struct qwx_softc *);
 
@@ -176,8 +189,46 @@ qwx_node_alloc(struct ieee80211com *ic)
 
 	nq = malloc(sizeof(struct qwx_node), M_DEVBUF, M_NOWAIT | M_ZERO);
 	if (nq != NULL)
-		nq->peer.peer_id = HAL_INVALID_PEERID;
+		nq->peer_id = HAL_INVALID_PEERID;
 	return (struct ieee80211_node *)nq;
+}
+
+void
+qwx_node_clear_peer_id(struct qwx_softc *sc, struct ath11k_peer *peer)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	struct qwx_node *nq = (struct qwx_node *)ni;
+	int s;
+
+	s = splnet();
+
+	if (nq->peer_id == peer->peer_id)
+		nq->peer_id = HAL_INVALID_PEERID;
+
+	RBT_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+		nq = (struct qwx_node *)ni;
+		if (nq->peer_id == peer->peer_id)
+			nq->peer_id = HAL_INVALID_PEERID;
+	}
+
+	splx(s);
+}
+
+void
+qwx_free_peers(struct qwx_softc *sc)
+{
+	struct ath11k_peer *peer;
+
+	while (!TAILQ_EMPTY(&sc->peers)) {
+		peer = TAILQ_FIRST(&sc->peers);
+		TAILQ_REMOVE(&sc->peers, peer, entry);
+		qwx_node_clear_peer_id(sc, peer);
+		free(peer, M_DEVBUF, sizeof(*peer));
+		sc->num_peers--;
+		if (TAILQ_EMPTY(&sc->peers) || sc->num_peers == 0)
+			KASSERT(TAILQ_EMPTY(&sc->peers) && sc->num_peers == 0);
+	}
 }
 
 int
@@ -195,14 +246,11 @@ qwx_init(struct ifnet *ifp)
 	 *
 	 * 1) Broadcast/Multicast frames will only be received on
 	 *    encrypted networks if hardware crypto is used and a
-	 *    CCMP group key is used. Otherwise such frames never
+	 *    CCMP/TKIP group key is used. Otherwise such frames never
 	 *    even trigger an interrupt. This breaks ARP and IPv6.
 	 *    This issue is known to affect the Linux ath11k vendor
 	 *    driver when software crypto mode is selected.
 	 *    Workaround: Use hardware crypto on WPA2 networks.
-	 *    However, even with hardware crypto broadcast frames
-	 *    are never received if TKIP is used as the WPA2 group
-	 *    cipher and we have no workaround for this.
 	 *
 	 * 2) Adding WEP keys for hardware crypto crashes the firmware.
 	 *    Presumably, lack of WEP support is deliberate because the
@@ -210,20 +258,8 @@ qwx_init(struct ifnet *ifp)
 	 *    WEP keys to hardware.
 	 *    Workaround: Use software crypto if WEP is enabled.
 	 *    This suffers from the broadcast issues mentioned above.
-	 *
-	 * 3) A WPA1 group key handshake message from the AP is never
-	 *    received if hardware crypto is used.
-	 *    Workaround: Use software crypto if WPA1 is enabled.
-	 *    This suffers from the broadcast issues mentioned above,
-	 *    even on WPA2 networks when WPA1 and WPA2 are both enabled.
-	 *    On OpenBSD, WPA1 is disabled by default.
-	 *
-	 * The only known fully working configurations are unencrypted
-	 * networks, and WPA2/CCMP-only networks provided WPA1 remains
-	 * disabled.
 	 */
-	if ((ic->ic_flags & IEEE80211_F_WEPON) ||
-	    (ic->ic_rsnprotos & IEEE80211_PROTO_WPA))
+	if (ic->ic_flags & IEEE80211_F_WEPON)
 		sc->crypto_mode = ATH11K_CRYPT_MODE_SW;
 	else
 		sc->crypto_mode = ATH11K_CRYPT_MODE_HW;
@@ -315,6 +351,49 @@ qwx_del_task(struct qwx_softc *sc, struct taskq *taskq, struct task *task)
 }
 
 void
+qwx_mfp_leave_done(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+	struct qwx_softc *sc = ic->ic_softc;
+	struct ifnet *ifp = &ic->ic_if;
+
+	if ((ifp->if_flags & IFF_RUNNING) &&
+	    ic->ic_state == IEEE80211_S_RUN &&
+	    (ni->ni_flags & IEEE80211_NODE_MFP)) {
+		sc->deauth_sent = 1;
+		wakeup(&sc->deauth_sent);
+	}
+}
+
+void
+qwx_mfp_leave(struct qwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = (void *)ic->ic_bss;
+
+	ic->ic_xflags |= IEEE80211_F_TX_MGMT_ONLY;
+	sc->deauth_sent = 0;
+
+	ni->ni_unref_cb = qwx_mfp_leave_done;
+	ni->ni_unref_arg = NULL;
+	ni->ni_unref_arg_size = 0;
+
+	/*
+	 * Send an authenticated deauth frame in order to let our AP know we
+	 * are leaving. This allows our AP to tear down MFP state cleanly.
+	 * Otherwise we would remain locked out of this AP until a timeout
+	 * of stale MFP state occurs at the AP, which might take a while.
+	 */
+	if (IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_DEAUTH,
+	    IEEE80211_REASON_AUTH_LEAVE) != 0) {
+		ni->ni_unref_cb = NULL;
+		return;
+	}
+
+	if (tsleep_nsec(&sc->deauth_sent, 0, "qwxlv", MSEC_TO_NSEC(500)) != 0)
+		ni->ni_unref_cb = NULL;
+}
+
+void
 qwx_stop(struct ifnet *ifp)
 {
 	struct qwx_softc *sc = ifp->if_softc;
@@ -334,7 +413,16 @@ qwx_stop(struct ifnet *ifp)
 	task_del(systq, &sc->init_task);
 	qwx_del_task(sc, sc->sc_nswq, &sc->newstate_task);
 	qwx_del_task(sc, systq, &sc->setkey_task);
+	qwx_del_task(sc, systq, &sc->ba_task);
+	qwx_del_task(sc, systq, &sc->bgscan_task);
 	refcnt_finalize(&sc->task_refs, "qwxstop");
+
+	clear_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags);
+
+	if (ic->ic_opmode == IEEE80211_M_STA &&
+	    ic->ic_state == IEEE80211_S_RUN &&
+	    (ic->ic_bss->ni_flags & IEEE80211_NODE_MFP))
+		qwx_mfp_leave(sc);
 
 	qwx_setkey_clear(sc);
 
@@ -342,8 +430,6 @@ qwx_stop(struct ifnet *ifp)
 
 	ifp->if_flags &= ~IFF_RUNNING;
 	ifq_clr_oactive(&ifp->if_snd);
-
-	clear_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags);
 
 	/*
 	 * Manually run the newstate task's code for switching to INIT state.
@@ -361,6 +447,8 @@ qwx_stop(struct ifnet *ifp)
 			sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
 		}
 		refcnt_finalize(&sc->task_refs, "qwxstop");
+		qwx_free_peers(sc);
+		sc->bss_peer_id = HAL_INVALID_PEERID;
 	}
 
 	sc->scan.state = ATH11K_SCAN_IDLE;
@@ -441,6 +529,7 @@ qwx_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 int
 qwx_tx(struct qwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 {
+	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_frame *wh;
 	struct qwx_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
 	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
@@ -452,6 +541,32 @@ qwx_tx(struct qwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 #if NBPFILTER > 0
 	if (sc->sc_drvbpf != NULL) {
 		struct qwx_tx_radiotap_header *tap = &sc->sc_txtap;
+		uint16_t chan_flags;
+
+		tap->wt_flags = 0;
+		tap->wt_chan_freq = htole16(ni->ni_chan->ic_freq);
+		chan_flags = ni->ni_chan->ic_flags;
+		if (ic->ic_curmode != IEEE80211_MODE_11N &&
+		    ic->ic_curmode != IEEE80211_MODE_11AC) {
+			chan_flags &= ~IEEE80211_CHAN_HT;
+			chan_flags &= ~IEEE80211_CHAN_40MHZ;
+		}
+		if (ic->ic_curmode != IEEE80211_MODE_11AC)
+			chan_flags &= ~IEEE80211_CHAN_VHT;
+		tap->wt_chan_flags = htole16(chan_flags);
+		if ((ni->ni_flags & IEEE80211_NODE_HT) &&
+		    !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+		    frame_type == IEEE80211_FC0_TYPE_DATA) {
+			tap->wt_rate = (0x80 | ni->ni_txmcs);
+		} else {
+			struct ieee80211_rateset *rs = &ni->ni_rates;
+			uint8_t rate = rs->rs_rates[ni->ni_txrate];
+
+			tap->wt_rate = rate & IEEE80211_RATE_VAL;
+		}
+		if ((ic->ic_flags & IEEE80211_F_WEPON) &&
+		    (wh->i_fc[1] & IEEE80211_FC1_PROTECTED))
+			tap->wt_flags |= IEEE80211_RADIOTAP_F_WEP;
 
 		bpf_mtap_hdr(sc->sc_drvbpf, tap, sc->sc_txtap_len,
 		    m, BPF_DIRECTION_OUT);
@@ -595,7 +710,8 @@ qwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 
 	if (test_bit(ATH11K_FLAG_HW_CRYPTO_DISABLED, sc->sc_flags) ||
 	    k->k_cipher == IEEE80211_CIPHER_WEP40 ||
-	    k->k_cipher == IEEE80211_CIPHER_WEP104)
+	    k->k_cipher == IEEE80211_CIPHER_WEP104 ||
+	    k->k_cipher == IEEE80211_CIPHER_BIP)
 		return ieee80211_set_key(ic, ni, k);
 
 	return qwx_queue_setkey_cmd(ic, ni, k, QWX_ADD_KEY);
@@ -609,7 +725,8 @@ qwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 
 	if (test_bit(ATH11K_FLAG_HW_CRYPTO_DISABLED, sc->sc_flags) ||
 	    k->k_cipher == IEEE80211_CIPHER_WEP40 ||
-	    k->k_cipher == IEEE80211_CIPHER_WEP104) {
+	    k->k_cipher == IEEE80211_CIPHER_WEP104 ||
+	    k->k_cipher == IEEE80211_CIPHER_BIP) {
 		ieee80211_delete_key(ic, ni, k);
 		return;
 	}
@@ -708,18 +825,50 @@ qwx_wmi_install_key_cmd(struct qwx_softc *sc, struct qwx_vif *arvif,
 	return sc->install_key_status;
 }
 
+enum hal_encrypt_type
+qwx_dp_tx_get_encrypt_type(enum ieee80211_cipher cipher)
+{
+	switch (cipher) {
+	case IEEE80211_CIPHER_NONE:
+		return HAL_ENCRYPT_TYPE_OPEN;
+	case IEEE80211_CIPHER_WEP40:
+		return HAL_ENCRYPT_TYPE_WEP_40;
+	case IEEE80211_CIPHER_WEP104:
+		return HAL_ENCRYPT_TYPE_WEP_104;
+	case IEEE80211_CIPHER_TKIP:
+		return HAL_ENCRYPT_TYPE_TKIP_MIC;
+	case IEEE80211_CIPHER_CCMP:
+		return HAL_ENCRYPT_TYPE_CCMP_128;
+#if 0
+	case WLAN_CIPHER_SUITE_CCMP_256:
+		return HAL_ENCRYPT_TYPE_CCMP_256;
+	case WLAN_CIPHER_SUITE_GCMP:
+		return HAL_ENCRYPT_TYPE_GCMP_128;
+	case WLAN_CIPHER_SUITE_GCMP_256:
+		return HAL_ENCRYPT_TYPE_AES_GCMP_256;
+#endif
+	default:
+		panic("unknown cipher 0x%x", cipher);
+	}
+}
+
 int
 qwx_add_sta_key(struct qwx_softc *sc, struct ieee80211_node *ni,
     struct ieee80211_key *k)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct qwx_node *nq = (struct qwx_node *)ni;
-	struct ath11k_peer *peer = &nq->peer;
+	struct ath11k_peer *peer;
 	struct qwx_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
+	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
 	int ret = 0;
 	uint32_t flags = 0;
 	const int want_keymask = (QWX_NODE_FLAG_HAVE_PAIRWISE_KEY |
 	    QWX_NODE_FLAG_HAVE_GROUP_KEY);
+
+	peer = qwx_peer_find_by_id(sc, nq->peer_id);
+	if (peer == NULL)
+		return EINVAL;
 
 	/*
 	 * Flush the fragments cache during key (re)install to
@@ -727,10 +876,13 @@ qwx_add_sta_key(struct qwx_softc *sc, struct ieee80211_node *ni,
 	 */
 	qwx_peer_frags_flush(sc, peer);
 
-	if (k->k_flags & IEEE80211_KEY_GROUP)
-		flags |= WMI_KEY_GROUP;
-	else
+	if (k->k_flags & IEEE80211_KEY_GROUP) {
+		flags |= WMI_KEY_GROUP | WMI_KEY_TX_USAGE;
+		peer->sec_type_grp = qwx_dp_tx_get_encrypt_type(k->k_cipher);
+	} else {
 		flags |= WMI_KEY_PAIRWISE;
+		peer->sec_type = qwx_dp_tx_get_encrypt_type(k->k_cipher);
+	}
 
 	ret = qwx_wmi_install_key_cmd(sc, arvif, ni->ni_macaddr, k, flags, 0);
 	if (ret) {
@@ -746,9 +898,15 @@ qwx_add_sta_key(struct qwx_softc *sc, struct ieee80211_node *ni,
 		return ret;
 	}
 
-	if (k->k_flags & IEEE80211_KEY_GROUP)
+	if (k->k_flags & IEEE80211_KEY_GROUP) {
+		ret = qwx_wmi_vdev_set_param_cmd(sc, arvif->vdev_id, pdev_id,
+		    WMI_VDEV_PARAM_DEF_KEYID, k->k_id);
+		if (ret) {
+			printf("%s: failed to set vdev %d def key ID %d: %d\n",
+			    sc->sc_dev.dv_xname, arvif->vdev_id, k->k_id, ret);
+		}
 		nq->flags |= QWX_NODE_FLAG_HAVE_GROUP_KEY;
-	else
+	} else
 		nq->flags |= QWX_NODE_FLAG_HAVE_PAIRWISE_KEY;
 
 	if ((nq->flags & want_keymask) == want_keymask) {
@@ -823,6 +981,76 @@ qwx_setkey_task(void *arg)
 }
 
 void
+qwx_clear_hwkeys(struct qwx_softc *sc, struct ath11k_peer *peer)
+{
+	struct qwx_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
+	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
+	struct wmi_vdev_install_key_arg arg =  {
+		.vdev_id = arvif->vdev_id,
+		.key_len = 0,
+		.key_data = NULL,
+		.key_cipher = WMI_CIPHER_NONE,
+		.key_flags = 0,
+	};
+	int k_id = 0, ret;
+
+	arg.macaddr = peer->addr;
+
+	for (k_id = 0; k_id <= WMI_MAX_KEY_INDEX; k_id++) {
+		arg.key_idx = k_id;
+
+		sc->install_key_done = 0;
+		ret = qwx_wmi_vdev_install_key(sc, &arg, pdev_id);
+		if (ret) {
+			printf("%s: delete key %d failed: error %d\n",
+			    sc->sc_dev.dv_xname, k_id, ret);
+			continue;
+		}
+
+		while (!sc->install_key_done) {
+			ret = tsleep_nsec(&sc->install_key_done, 0,
+			    "qwxinstkey", SEC_TO_NSEC(1));
+			if (ret) {
+				printf("%s: delete key %d timeout\n",
+				    sc->sc_dev.dv_xname, k_id);
+			}
+		}
+	}
+}
+
+void
+qwx_clear_pn_replay_config(struct qwx_softc *sc, struct ath11k_peer *peer)
+{
+	struct ath11k_hal_reo_cmd cmd = {0};
+	struct dp_rx_tid *rx_tid;
+	uint8_t tid;
+	int ret = 0;
+
+	cmd.flag |= HAL_REO_CMD_FLG_NEED_STATUS;
+	cmd.upd0 |= HAL_REO_CMD_UPD0_PN |
+		    HAL_REO_CMD_UPD0_PN_SIZE |
+		    HAL_REO_CMD_UPD0_PN_VALID |
+		    HAL_REO_CMD_UPD0_PN_CHECK |
+		    HAL_REO_CMD_UPD0_SVLD;
+
+	for (tid = 0; tid < IEEE80211_NUM_TID; tid++) {
+		rx_tid = &peer->rx_tid[tid];
+		if (!rx_tid->active)
+			continue;
+		cmd.addr_lo = rx_tid->paddr & 0xffffffff;
+		cmd.addr_hi = (rx_tid->paddr >> 32);
+		ret = qwx_dp_tx_send_reo_cmd(sc, rx_tid,
+		    HAL_REO_CMD_UPDATE_RX_QUEUE, &cmd, NULL);
+		if (ret) {
+			printf("%s: failed to configure rx tid %d queue "
+			    "for pn replay detection %d\n",
+			    sc->sc_dev.dv_xname, tid, ret);
+			break;
+		}
+	}
+}
+
+void
 qwx_setkey_clear(struct qwx_softc *sc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
@@ -860,11 +1088,11 @@ qwx_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 	    nstate != IEEE80211_S_AUTH)
 		return 0;
 	if (ic->ic_state == IEEE80211_S_RUN) {
-#if 0
 		qwx_del_task(sc, systq, &sc->ba_task);
-#endif
 		qwx_del_task(sc, systq, &sc->setkey_task);
 		qwx_setkey_clear(sc);
+
+		qwx_del_task(sc, systq, &sc->bgscan_task);
 #if 0
 		qwx_del_task(sc, systq, &sc->bgscan_done_task);
 #endif
@@ -923,8 +1151,10 @@ qwx_newstate_task(void *arg)
 			}
 			/* FALLTHROUGH */
 		case IEEE80211_S_SCAN:
-			if (nstate < IEEE80211_S_SCAN)
+			if (sc->scan.state == ATH11K_SCAN_RUNNING)
 				qwx_scan_abort(sc);
+			if (nstate == IEEE80211_S_SCAN)
+				ieee80211_free_allnodes(ic, 0);
 			break;
 		case IEEE80211_S_INIT:
 			break;
@@ -944,7 +1174,7 @@ qwx_newstate_task(void *arg)
 
 	case IEEE80211_S_SCAN:
 next_scan:
-		err = qwx_scan(sc);
+		err = qwx_scan(sc, 0);
 		if (err)
 			break;
 		if (ifp->if_flags & IFF_DEBUG)
@@ -969,6 +1199,7 @@ next_scan:
 		break;
 
 	case IEEE80211_S_ASSOC:
+		err = qwx_assoc(sc);
 		break;
 
 	case IEEE80211_S_RUN:
@@ -1911,20 +2142,22 @@ const struct ath11k_hw_ops ipq8074_ops = {
 	.rx_desc_get_ldpc_support = ath11k_hw_ipq8074_rx_desc_get_ldpc_support,
 	.rx_desc_get_mpdu_seq_ctl_vld = ath11k_hw_ipq8074_rx_desc_get_mpdu_seq_ctl_vld,
 	.rx_desc_get_mpdu_fc_valid = ath11k_hw_ipq8074_rx_desc_get_mpdu_fc_valid,
-	.rx_desc_get_mpdu_start_seq_no = ath11k_hw_ipq8074_rx_desc_get_mpdu_start_seq_no,
 #endif
+	.rx_desc_get_mpdu_start_seq_no = qwx_hw_ipq8074_rx_desc_get_mpdu_start_seq_no,
 	.rx_desc_get_msdu_len = qwx_hw_ipq8074_rx_desc_get_msdu_len,
-#ifdef notyet
-	.rx_desc_get_msdu_sgi = ath11k_hw_ipq8074_rx_desc_get_msdu_sgi,
-	.rx_desc_get_msdu_rate_mcs = ath11k_hw_ipq8074_rx_desc_get_msdu_rate_mcs,
-	.rx_desc_get_msdu_rx_bw = ath11k_hw_ipq8074_rx_desc_get_msdu_rx_bw,
-#endif
+	.rx_desc_get_msdu_sgi = qwx_hw_ipq8074_rx_desc_get_msdu_sgi,
+	.rx_desc_get_msdu_rate_mcs = qwx_hw_ipq8074_rx_desc_get_msdu_rate_mcs,
+	.rx_desc_get_msdu_rx_bw = qwx_hw_ipq8074_rx_desc_get_msdu_rx_bw,
 	.rx_desc_get_msdu_freq = qwx_hw_ipq8074_rx_desc_get_msdu_freq,
 #ifdef notyet
 	.rx_desc_get_msdu_pkt_type = ath11k_hw_ipq8074_rx_desc_get_msdu_pkt_type,
-	.rx_desc_get_msdu_nss = ath11k_hw_ipq8074_rx_desc_get_msdu_nss,
+#endif
+	.rx_desc_get_msdu_nss = qwx_hw_ipq8074_rx_desc_get_msdu_nss,
+#ifdef notyet
 	.rx_desc_get_mpdu_tid = ath11k_hw_ipq8074_rx_desc_get_mpdu_tid,
-	.rx_desc_get_mpdu_peer_id = ath11k_hw_ipq8074_rx_desc_get_mpdu_peer_id,
+#endif
+	.rx_desc_get_mpdu_peer_id = qwx_hw_ipq8074_rx_desc_get_mpdu_peer_id,
+#if 0
 	.rx_desc_copy_attn_end_tlv = ath11k_hw_ipq8074_rx_desc_copy_attn_end,
 	.rx_desc_get_mpdu_start_tag = ath11k_hw_ipq8074_rx_desc_get_mpdu_start_tag,
 	.rx_desc_get_mpdu_ppdu_id = ath11k_hw_ipq8074_rx_desc_get_mpdu_ppdu_id,
@@ -1965,20 +2198,20 @@ const struct ath11k_hw_ops ipq6018_ops = {
 	.rx_desc_get_ldpc_support = ath11k_hw_ipq8074_rx_desc_get_ldpc_support,
 	.rx_desc_get_mpdu_seq_ctl_vld = ath11k_hw_ipq8074_rx_desc_get_mpdu_seq_ctl_vld,
 	.rx_desc_get_mpdu_fc_valid = ath11k_hw_ipq8074_rx_desc_get_mpdu_fc_valid,
-	.rx_desc_get_mpdu_start_seq_no = ath11k_hw_ipq8074_rx_desc_get_mpdu_start_seq_no,
 #endif
+	.rx_desc_get_mpdu_start_seq_no = qwx_hw_ipq8074_rx_desc_get_mpdu_start_seq_no,
 	.rx_desc_get_msdu_len = qwx_hw_ipq8074_rx_desc_get_msdu_len,
-#ifdef notyet
-	.rx_desc_get_msdu_sgi = ath11k_hw_ipq8074_rx_desc_get_msdu_sgi,
-	.rx_desc_get_msdu_rate_mcs = ath11k_hw_ipq8074_rx_desc_get_msdu_rate_mcs,
-	.rx_desc_get_msdu_rx_bw = ath11k_hw_ipq8074_rx_desc_get_msdu_rx_bw,
-#endif
+	.rx_desc_get_msdu_sgi = qwx_hw_ipq8074_rx_desc_get_msdu_sgi,
+	.rx_desc_get_msdu_rate_mcs = qwx_hw_ipq8074_rx_desc_get_msdu_rate_mcs,
+	.rx_desc_get_msdu_rx_bw = qwx_hw_ipq8074_rx_desc_get_msdu_rx_bw,
 	.rx_desc_get_msdu_freq = qwx_hw_ipq8074_rx_desc_get_msdu_freq,
+	.rx_desc_get_msdu_pkt_type = qwx_hw_ipq8074_rx_desc_get_msdu_pkt_type,
+	.rx_desc_get_msdu_nss = qwx_hw_ipq8074_rx_desc_get_msdu_nss,
 #ifdef notyet
-	.rx_desc_get_msdu_pkt_type = ath11k_hw_ipq8074_rx_desc_get_msdu_pkt_type,
-	.rx_desc_get_msdu_nss = ath11k_hw_ipq8074_rx_desc_get_msdu_nss,
 	.rx_desc_get_mpdu_tid = ath11k_hw_ipq8074_rx_desc_get_mpdu_tid,
-	.rx_desc_get_mpdu_peer_id = ath11k_hw_ipq8074_rx_desc_get_mpdu_peer_id,
+#endif
+	.rx_desc_get_mpdu_peer_id = qwx_hw_ipq8074_rx_desc_get_mpdu_peer_id,
+#if 0
 	.rx_desc_copy_attn_end_tlv = ath11k_hw_ipq8074_rx_desc_copy_attn_end,
 	.rx_desc_get_mpdu_start_tag = ath11k_hw_ipq8074_rx_desc_get_mpdu_start_tag,
 	.rx_desc_get_mpdu_ppdu_id = ath11k_hw_ipq8074_rx_desc_get_mpdu_ppdu_id,
@@ -2019,20 +2252,20 @@ const struct ath11k_hw_ops qca6390_ops = {
 	.rx_desc_get_ldpc_support = ath11k_hw_ipq8074_rx_desc_get_ldpc_support,
 	.rx_desc_get_mpdu_seq_ctl_vld = ath11k_hw_ipq8074_rx_desc_get_mpdu_seq_ctl_vld,
 	.rx_desc_get_mpdu_fc_valid = ath11k_hw_ipq8074_rx_desc_get_mpdu_fc_valid,
-	.rx_desc_get_mpdu_start_seq_no = ath11k_hw_ipq8074_rx_desc_get_mpdu_start_seq_no,
 #endif
+	.rx_desc_get_mpdu_start_seq_no = qwx_hw_ipq8074_rx_desc_get_mpdu_start_seq_no,
 	.rx_desc_get_msdu_len = qwx_hw_ipq8074_rx_desc_get_msdu_len,
-#ifdef notyet
-	.rx_desc_get_msdu_sgi = ath11k_hw_ipq8074_rx_desc_get_msdu_sgi,
-	.rx_desc_get_msdu_rate_mcs = ath11k_hw_ipq8074_rx_desc_get_msdu_rate_mcs,
-	.rx_desc_get_msdu_rx_bw = ath11k_hw_ipq8074_rx_desc_get_msdu_rx_bw,
-#endif
+	.rx_desc_get_msdu_sgi = qwx_hw_ipq8074_rx_desc_get_msdu_sgi,
+	.rx_desc_get_msdu_rate_mcs = qwx_hw_ipq8074_rx_desc_get_msdu_rate_mcs,
+	.rx_desc_get_msdu_rx_bw = qwx_hw_ipq8074_rx_desc_get_msdu_rx_bw,
 	.rx_desc_get_msdu_freq = qwx_hw_ipq8074_rx_desc_get_msdu_freq,
+	.rx_desc_get_msdu_pkt_type = qwx_hw_ipq8074_rx_desc_get_msdu_pkt_type,
+	.rx_desc_get_msdu_nss = qwx_hw_ipq8074_rx_desc_get_msdu_nss,
 #ifdef notyet
-	.rx_desc_get_msdu_pkt_type = ath11k_hw_ipq8074_rx_desc_get_msdu_pkt_type,
-	.rx_desc_get_msdu_nss = ath11k_hw_ipq8074_rx_desc_get_msdu_nss,
 	.rx_desc_get_mpdu_tid = ath11k_hw_ipq8074_rx_desc_get_mpdu_tid,
-	.rx_desc_get_mpdu_peer_id = ath11k_hw_ipq8074_rx_desc_get_mpdu_peer_id,
+#endif
+	.rx_desc_get_mpdu_peer_id = qwx_hw_ipq8074_rx_desc_get_mpdu_peer_id,
+#if 0
 	.rx_desc_copy_attn_end_tlv = ath11k_hw_ipq8074_rx_desc_copy_attn_end,
 	.rx_desc_get_mpdu_start_tag = ath11k_hw_ipq8074_rx_desc_get_mpdu_start_tag,
 	.rx_desc_get_mpdu_ppdu_id = ath11k_hw_ipq8074_rx_desc_get_mpdu_ppdu_id,
@@ -2073,20 +2306,20 @@ const struct ath11k_hw_ops qcn9074_ops = {
 	.rx_desc_get_ldpc_support = ath11k_hw_qcn9074_rx_desc_get_ldpc_support,
 	.rx_desc_get_mpdu_seq_ctl_vld = ath11k_hw_qcn9074_rx_desc_get_mpdu_seq_ctl_vld,
 	.rx_desc_get_mpdu_fc_valid = ath11k_hw_qcn9074_rx_desc_get_mpdu_fc_valid,
-	.rx_desc_get_mpdu_start_seq_no = ath11k_hw_qcn9074_rx_desc_get_mpdu_start_seq_no,
 #endif
+	.rx_desc_get_mpdu_start_seq_no = qwx_hw_qcn9074_rx_desc_get_mpdu_start_seq_no,
 	.rx_desc_get_msdu_len = qwx_hw_qcn9074_rx_desc_get_msdu_len,
-#ifdef notyet
-	.rx_desc_get_msdu_sgi = ath11k_hw_qcn9074_rx_desc_get_msdu_sgi,
-	.rx_desc_get_msdu_rate_mcs = ath11k_hw_qcn9074_rx_desc_get_msdu_rate_mcs,
-	.rx_desc_get_msdu_rx_bw = ath11k_hw_qcn9074_rx_desc_get_msdu_rx_bw,
-#endif
+	.rx_desc_get_msdu_sgi = qwx_hw_qcn9074_rx_desc_get_msdu_sgi,
+	.rx_desc_get_msdu_rate_mcs = qwx_hw_qcn9074_rx_desc_get_msdu_rate_mcs,
+	.rx_desc_get_msdu_rx_bw = qwx_hw_qcn9074_rx_desc_get_msdu_rx_bw,
 	.rx_desc_get_msdu_freq = qwx_hw_qcn9074_rx_desc_get_msdu_freq,
+	.rx_desc_get_msdu_pkt_type = qwx_hw_qcn9074_rx_desc_get_msdu_pkt_type,
+	.rx_desc_get_msdu_nss = qwx_hw_qcn9074_rx_desc_get_msdu_nss,
 #ifdef notyet
-	.rx_desc_get_msdu_pkt_type = ath11k_hw_qcn9074_rx_desc_get_msdu_pkt_type,
-	.rx_desc_get_msdu_nss = ath11k_hw_qcn9074_rx_desc_get_msdu_nss,
 	.rx_desc_get_mpdu_tid = ath11k_hw_qcn9074_rx_desc_get_mpdu_tid,
-	.rx_desc_get_mpdu_peer_id = ath11k_hw_qcn9074_rx_desc_get_mpdu_peer_id,
+#endif
+	.rx_desc_get_mpdu_peer_id = qwx_hw_qcn9074_rx_desc_get_mpdu_peer_id,
+#if 0
 	.rx_desc_copy_attn_end_tlv = ath11k_hw_qcn9074_rx_desc_copy_attn_end,
 	.rx_desc_get_mpdu_start_tag = ath11k_hw_qcn9074_rx_desc_get_mpdu_start_tag,
 	.rx_desc_get_mpdu_ppdu_id = ath11k_hw_qcn9074_rx_desc_get_mpdu_ppdu_id,
@@ -2127,20 +2360,20 @@ const struct ath11k_hw_ops wcn6855_ops = {
 	.rx_desc_get_ldpc_support = ath11k_hw_wcn6855_rx_desc_get_ldpc_support,
 	.rx_desc_get_mpdu_seq_ctl_vld = ath11k_hw_wcn6855_rx_desc_get_mpdu_seq_ctl_vld,
 	.rx_desc_get_mpdu_fc_valid = ath11k_hw_wcn6855_rx_desc_get_mpdu_fc_valid,
-	.rx_desc_get_mpdu_start_seq_no = ath11k_hw_wcn6855_rx_desc_get_mpdu_start_seq_no,
 #endif
+	.rx_desc_get_mpdu_start_seq_no = qwx_hw_wcn6855_rx_desc_get_mpdu_start_seq_no,
 	.rx_desc_get_msdu_len = qwx_hw_wcn6855_rx_desc_get_msdu_len,
-#ifdef notyet
-	.rx_desc_get_msdu_sgi = ath11k_hw_wcn6855_rx_desc_get_msdu_sgi,
-	.rx_desc_get_msdu_rate_mcs = ath11k_hw_wcn6855_rx_desc_get_msdu_rate_mcs,
-	.rx_desc_get_msdu_rx_bw = ath11k_hw_wcn6855_rx_desc_get_msdu_rx_bw,
-#endif
+	.rx_desc_get_msdu_sgi = qwx_hw_wcn6855_rx_desc_get_msdu_sgi,
+	.rx_desc_get_msdu_rate_mcs = qwx_hw_wcn6855_rx_desc_get_msdu_rate_mcs,
+	.rx_desc_get_msdu_rx_bw = qwx_hw_wcn6855_rx_desc_get_msdu_rx_bw,
 	.rx_desc_get_msdu_freq = qwx_hw_wcn6855_rx_desc_get_msdu_freq,
+	.rx_desc_get_msdu_pkt_type = qwx_hw_wcn6855_rx_desc_get_msdu_pkt_type,
+	.rx_desc_get_msdu_nss = qwx_hw_wcn6855_rx_desc_get_msdu_nss,
 #ifdef notyet
-	.rx_desc_get_msdu_pkt_type = ath11k_hw_wcn6855_rx_desc_get_msdu_pkt_type,
-	.rx_desc_get_msdu_nss = ath11k_hw_wcn6855_rx_desc_get_msdu_nss,
 	.rx_desc_get_mpdu_tid = ath11k_hw_wcn6855_rx_desc_get_mpdu_tid,
-	.rx_desc_get_mpdu_peer_id = ath11k_hw_wcn6855_rx_desc_get_mpdu_peer_id,
+#endif
+	.rx_desc_get_mpdu_peer_id = qwx_hw_wcn6855_rx_desc_get_mpdu_peer_id,
+#if 0
 	.rx_desc_copy_attn_end_tlv = ath11k_hw_wcn6855_rx_desc_copy_attn_end,
 	.rx_desc_get_mpdu_start_tag = ath11k_hw_wcn6855_rx_desc_get_mpdu_start_tag,
 	.rx_desc_get_mpdu_ppdu_id = ath11k_hw_wcn6855_rx_desc_get_mpdu_ppdu_id,
@@ -2181,20 +2414,20 @@ const struct ath11k_hw_ops wcn6750_ops = {
 	.rx_desc_get_ldpc_support = ath11k_hw_qcn9074_rx_desc_get_ldpc_support,
 	.rx_desc_get_mpdu_seq_ctl_vld = ath11k_hw_qcn9074_rx_desc_get_mpdu_seq_ctl_vld,
 	.rx_desc_get_mpdu_fc_valid = ath11k_hw_qcn9074_rx_desc_get_mpdu_fc_valid,
-	.rx_desc_get_mpdu_start_seq_no = ath11k_hw_qcn9074_rx_desc_get_mpdu_start_seq_no,
 #endif
+	.rx_desc_get_mpdu_start_seq_no = qwx_hw_qcn9074_rx_desc_get_mpdu_start_seq_no,
 	.rx_desc_get_msdu_len = qwx_hw_qcn9074_rx_desc_get_msdu_len,
-#ifdef notyet
-	.rx_desc_get_msdu_sgi = ath11k_hw_qcn9074_rx_desc_get_msdu_sgi,
-	.rx_desc_get_msdu_rate_mcs = ath11k_hw_qcn9074_rx_desc_get_msdu_rate_mcs,
-	.rx_desc_get_msdu_rx_bw = ath11k_hw_qcn9074_rx_desc_get_msdu_rx_bw,
-#endif
+	.rx_desc_get_msdu_sgi = qwx_hw_qcn9074_rx_desc_get_msdu_sgi,
+	.rx_desc_get_msdu_rate_mcs = qwx_hw_qcn9074_rx_desc_get_msdu_rate_mcs,
+	.rx_desc_get_msdu_rx_bw = qwx_hw_qcn9074_rx_desc_get_msdu_rx_bw,
 	.rx_desc_get_msdu_freq = qwx_hw_qcn9074_rx_desc_get_msdu_freq,
+	.rx_desc_get_msdu_pkt_type = qwx_hw_qcn9074_rx_desc_get_msdu_pkt_type,
+	.rx_desc_get_msdu_nss = qwx_hw_qcn9074_rx_desc_get_msdu_nss,
 #ifdef notyet
-	.rx_desc_get_msdu_pkt_type = ath11k_hw_qcn9074_rx_desc_get_msdu_pkt_type,
-	.rx_desc_get_msdu_nss = ath11k_hw_qcn9074_rx_desc_get_msdu_nss,
 	.rx_desc_get_mpdu_tid = ath11k_hw_qcn9074_rx_desc_get_mpdu_tid,
-	.rx_desc_get_mpdu_peer_id = ath11k_hw_qcn9074_rx_desc_get_mpdu_peer_id,
+#endif
+	.rx_desc_get_mpdu_peer_id = qwx_hw_qcn9074_rx_desc_get_mpdu_peer_id,
+#if 0
 	.rx_desc_copy_attn_end_tlv = ath11k_hw_qcn9074_rx_desc_copy_attn_end,
 	.rx_desc_get_mpdu_start_tag = ath11k_hw_qcn9074_rx_desc_get_mpdu_start_tag,
 	.rx_desc_get_mpdu_ppdu_id = ath11k_hw_qcn9074_rx_desc_get_mpdu_ppdu_id,
@@ -8396,8 +8629,13 @@ qwx_core_check_dt(struct qwx_softc *sc)
 #ifdef __HAVE_FDT
 	if (sc->sc_node == 0)
 		return 0;
-	
-	OF_getprop(sc->sc_node, "qcom,ath11k-calibration-variant",
+
+	/* XXX deprecated; remove after OpenBSD 7.9 has been released */
+	if (OF_getprop(sc->sc_node, "qcom,ath11k-calibration-variant",
+	    sc->qmi_target.bdf_ext, sizeof(sc->qmi_target.bdf_ext) - 1) > 0)
+		return 0;
+
+	OF_getprop(sc->sc_node, "qcom,calibration-variant",
 	    sc->qmi_target.bdf_ext, sizeof(sc->qmi_target.bdf_ext) - 1);
 #endif
 
@@ -8813,7 +9051,7 @@ qwx_core_fetch_bdf(struct qwx_softc *sc, const u_char **boardfw,
 		return 0;
 
 	DPRINTF("%s: failed to fetch board data for %s from %s\n",
-	    sc->sc_dev.dv_xname, boardname, path);
+	    sc->sc_dev.dv_xname, boardname, ATH11K_BOARD_API2_FILE);
 	return ret;
 }
 
@@ -8859,7 +9097,7 @@ qwx_core_fetch_regdb(struct qwx_softc *sc, const u_char **boardfw,
 		return 0;
 
 	DPRINTF("%s: failed to fetch regdb data for %s from %s\n",
-	    sc->sc_dev.dv_xname, boardname, path);
+	    sc->sc_dev.dv_xname, boardname, ATH11K_BOARD_API2_FILE);
 	return ret;
 }
 
@@ -12580,7 +12818,8 @@ qwx_init_channels(struct qwx_softc *sc, struct cur_regulatory_info *reg_info)
 				chan->ic_flags = IEEE80211_CHAN_CCK |
 				    IEEE80211_CHAN_OFDM |
 				    IEEE80211_CHAN_DYN |
-				    IEEE80211_CHAN_2GHZ;
+				    IEEE80211_CHAN_2GHZ |
+				    IEEE80211_CHAN_HT;
 			}
 			chnum++;
 			freq = ieee80211_ieee2mhz(chnum, IEEE80211_CHAN_2GHZ);
@@ -12614,7 +12853,8 @@ qwx_init_channels(struct qwx_softc *sc, struct cur_regulatory_info *reg_info)
 				chan->ic_flags = 0;
 			} else {
 				chan->ic_freq = freq;
-				chan->ic_flags = IEEE80211_CHAN_A;
+				chan->ic_flags = IEEE80211_CHAN_A |
+				    IEEE80211_CHAN_HT;
 				if (rule->flags & (REGULATORY_CHAN_RADAR |
 				    REGULATORY_CHAN_NO_IR |
 				    REGULATORY_CHAN_INDOOR_ONLY)) {
@@ -13325,23 +13565,25 @@ qwx_mgmt_rx_event(struct qwx_softc *sc, struct mbuf *m)
 
 	wh = mtod(m, struct ieee80211_frame *);
 	ni = ieee80211_find_rxnode(ic, wh);
-#if 0
+
 	/* In case of PMF, FW delivers decrypted frames with Protected Bit set.
 	 * Don't clear that. Also, FW delivers broadcast management frames
 	 * (ex: group privacy action frames in mesh) as encrypted payload.
 	 */
-	if (ieee80211_has_protected(hdr->frame_control) &&
-	    !is_multicast_ether_addr(ieee80211_get_DA(hdr))) {
-		status->flag |= RX_FLAG_DECRYPTED;
-
+	if ((wh->i_fc[1] & IEEE80211_FC1_PROTECTED) &&
+	    !IEEE80211_IS_MULTICAST(wh->i_addr1)) {
+		rxi.rxi_flags |= IEEE80211_RXI_HWDEC;
+#if 0
 		if (!ieee80211_is_robust_mgmt_frame(skb)) {
 			status->flag |= RX_FLAG_IV_STRIPPED |
 					RX_FLAG_MMIC_STRIPPED;
 			hdr->frame_control = __cpu_to_le16(fc &
 					     ~IEEE80211_FCTL_PROTECTED);
 		}
+#endif
 	}
 
+#if 0
 	if (ieee80211_is_beacon(hdr->frame_control))
 		ath11k_mac_handle_beacon(ar, skb);
 #endif
@@ -13358,6 +13600,22 @@ qwx_mgmt_rx_event(struct qwx_softc *sc, struct mbuf *m)
 #if NBPFILTER > 0
 	if (sc->sc_drvbpf != NULL) {
 		struct qwx_rx_radiotap_header *tap = &sc->sc_rxtap;
+		uint16_t chan_flags;
+		uint32_t freq;
+
+		tap->wr_flags = 0;
+		freq = le32toh(rx_ev.chan_freq);
+		tap->wr_chan_freq = htole16(freq);
+		chan_flags = ic->ic_channels[rx_ev.channel & 0xff].ic_flags;
+		if (ic->ic_curmode != IEEE80211_MODE_11N &&
+		    ic->ic_curmode != IEEE80211_MODE_11AC) {
+			chan_flags &= ~IEEE80211_CHAN_HT;
+			chan_flags &= ~IEEE80211_CHAN_VHT;
+			chan_flags &= ~IEEE80211_CHAN_40MHZ;
+		}
+		tap->wr_rate = rx_ev.rate / 500;
+		tap->wr_chan_flags = htole16(chan_flags);
+		tap->wr_dbm_antsignal = rxi.rxi_rssi;
 
 		bpf_mtap_hdr(sc->sc_drvbpf, tap, sc->sc_rxtap_len,
 		    m, BPF_DIRECTION_IN);
@@ -14497,20 +14755,22 @@ qwx_peer_map_event(struct qwx_softc *sc, uint8_t vdev_id, uint16_t peer_id,
 #ifdef notyet
 	spin_lock_bh(&ab->base_lock);
 #endif
+	peer = qwx_peer_find_by_id(sc, HAL_INVALID_PEERID);
+	if (peer == NULL)
+		return;
+
 	ni = ieee80211_find_node(ic, mac_addr);
 	if (ni == NULL)
 		return;
 	nq = (struct qwx_node *)ni;
-	peer = &nq->peer;
 
 	peer->vdev_id = vdev_id;
 	peer->peer_id = peer_id;
 	peer->ast_hash = ast_hash;
 	peer->hw_peer_id = hw_peer_id;
-#if 0
-	ether_addr_copy(peer->addr, mac_addr);
-	list_add(&peer->list, &ab->peers);
-#endif
+	IEEE80211_ADDR_COPY(peer->addr, mac_addr);
+	nq->peer_id = peer_id;
+
 	sc->peer_mapped = 1;
 	wakeup(&sc->peer_mapped);
 
@@ -14521,40 +14781,35 @@ qwx_peer_map_event(struct qwx_softc *sc, uint8_t vdev_id, uint16_t peer_id,
 #endif
 }
 
-struct ieee80211_node *
+struct ath11k_peer *
 qwx_peer_find_by_id(struct qwx_softc *sc, uint16_t peer_id)
 {
-	struct ieee80211com *ic = &sc->sc_ic;
-	struct ieee80211_node *ni = NULL;
-	int s;
+	struct ath11k_peer *peer;
 
-	s = splnet();
-	RBT_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
-		struct qwx_node *nq = (struct qwx_node *)ni;
-		if (nq->peer.peer_id == peer_id)
-			break;
+	TAILQ_FOREACH(peer, &sc->peers, entry) {
+		if (peer->peer_id == peer_id)
+			return peer;
 	}
-	splx(s);
 
-	return ni;
+	return NULL;
 }
 
 void
 qwx_peer_unmap_event(struct qwx_softc *sc, uint16_t peer_id)
 {
-	struct ieee80211_node *ni;
+	struct ath11k_peer *peer;
 #ifdef notyet
 	spin_lock_bh(&ab->base_lock);
 #endif
-	ni = qwx_peer_find_by_id(sc, peer_id);
-	if (!ni) {
+	peer = qwx_peer_find_by_id(sc, peer_id);
+	if (!peer) {
 		printf("%s: peer-unmap-event: unknown peer id %d\n",
 		    sc->sc_dev.dv_xname, peer_id);
 		goto exit;
 	}
 
 	DNPRINTF(QWX_D_HTT, "%s: peer unmap peer %s id %d\n",
-	    __func__, ether_sprintf(ni->ni_macaddr), peer_id);
+	    __func__, ether_sprintf(peer->addr), peer_id);
 #if 0
 	list_del(&peer->list);
 	kfree(peer);
@@ -15647,6 +15902,7 @@ void
 qwx_dp_tx_free_txbuf(struct qwx_softc *sc, int msdu_id,
     struct dp_tx_ring *tx_ring)
 {
+	struct ieee80211com *ic = &sc->sc_ic;
 	struct qwx_tx_data *tx_data;
 
 	if (msdu_id >= sc->hw_params.tx_ring_size)
@@ -15654,12 +15910,19 @@ qwx_dp_tx_free_txbuf(struct qwx_softc *sc, int msdu_id,
 
 	tx_data = &tx_ring->data[msdu_id];
 
-	bus_dmamap_unload(sc->sc_dmat, tx_data->map);
-	m_freem(tx_data->m);
-	tx_data->m = NULL;
+	if (tx_data->m) {
+		bus_dmamap_unload(sc->sc_dmat, tx_data->map);
+		m_freem(tx_data->m);
+		tx_data->m = NULL;
 
-	if (tx_ring->queued > 0)
-		tx_ring->queued--;
+		if (tx_ring->queued > 0)
+			tx_ring->queued--;
+	}
+
+	if (tx_data->ni) {
+		ieee80211_release_node(ic, tx_data->ni);
+		tx_data->ni = NULL;
+	}
 }
 
 void
@@ -15800,21 +16063,30 @@ qwx_dp_tx_complete_msdu(struct qwx_softc *sc, struct dp_tx_ring *tx_ring,
 		return;
 	}
 
-	bus_dmamap_unload(sc->sc_dmat, tx_data->map);
-	m_freem(tx_data->m);
-	tx_data->m = NULL;
+	if (tx_data->m) {
+		bus_dmamap_unload(sc->sc_dmat, tx_data->map);
+		m_freem(tx_data->m);
+		tx_data->m = NULL;
+	
+		if (tx_ring->queued > 0)
+			tx_ring->queued--;
+	}
+
+	if (tx_data->ni == NULL)
+		return;
 
 	pkt_type = FIELD_GET(HAL_TX_RATE_STATS_INFO0_PKT_TYPE, ts->rate_stats);
 	mcs = FIELD_GET(HAL_TX_RATE_STATS_INFO0_MCS, ts->rate_stats);
-	if (qwx_mac_hw_ratecode_to_legacy_rate(tx_data->ni, mcs, pkt_type,
-	    &rateidx, &rate) == 0)
-		tx_data->ni->ni_txrate = rateidx;
+	if (pkt_type == HAL_TX_RATE_STATS_PKT_TYPE_11A ||
+	    pkt_type == HAL_TX_RATE_STATS_PKT_TYPE_11B) {
+		if (qwx_mac_hw_ratecode_to_legacy_rate(tx_data->ni, mcs, pkt_type,
+		    &rateidx, &rate) == 0)
+			tx_data->ni->ni_txrate = rateidx;
+	} else if (pkt_type == HAL_TX_RATE_STATS_PKT_TYPE_11N)
+		tx_data->ni->ni_txmcs = mcs;
 
 	ieee80211_release_node(ic, tx_data->ni);
 	tx_data->ni = NULL;
-	
-	if (tx_ring->queued > 0)
-		tx_ring->queued--;
 }
 
 #define QWX_TX_COMPL_NEXT(x)	(((x) + 1) % DP_TX_COMP_RING_SIZE)
@@ -16045,6 +16317,24 @@ static inline uint16_t
 qwx_dp_rx_h_msdu_start_msdu_len(struct qwx_softc *sc, struct hal_rx_desc *desc)
 {
 	return sc->hw_params.hw_ops->rx_desc_get_msdu_len(desc);
+}
+
+static inline uint8_t
+qwx_dp_rx_h_msdu_start_sgi(struct qwx_softc *sc, struct hal_rx_desc *desc)
+{
+	return sc->hw_params.hw_ops->rx_desc_get_msdu_sgi(desc);
+}
+
+static inline uint8_t
+qwx_dp_rx_h_msdu_start_rate_mcs(struct qwx_softc *sc, struct hal_rx_desc *desc)
+{
+	return sc->hw_params.hw_ops->rx_desc_get_msdu_rate_mcs(desc);
+}
+
+static inline uint8_t
+qwx_dp_rx_h_msdu_start_rx_bw(struct qwx_softc *sc, struct hal_rx_desc *desc)
+{
+	return sc->hw_params.hw_ops->rx_desc_get_msdu_rx_bw(desc);
 }
 
 void
@@ -16309,6 +16599,10 @@ qwx_dp_rx_h_rxdma_err(struct qwx_softc *sc, struct qwx_rx_msdu *msdu)
 		ic->ic_stats.is_rx_locmicfail++;
 		drop = 1;
 		break;
+	case HAL_REO_ENTR_RING_RXDMA_ECODE_DECRYPT_ERR:
+		ic->ic_stats.is_rx_wepfail++;
+		drop = 1;
+		break;
 	default:
 		/* TODO: Review other rxdma error code to check if anything is
 		 * worth reporting to mac80211
@@ -16324,6 +16618,8 @@ void
 qwx_dp_rx_wbm_err(struct qwx_softc *sc, struct qwx_rx_msdu *msdu,
     struct qwx_rx_msdu_list *msdu_list)
 {
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ifnet *ifp = &ic->ic_if;
 	int drop = 1;
 
 	switch (msdu->err_rel_src) {
@@ -16341,10 +16637,12 @@ qwx_dp_rx_wbm_err(struct qwx_softc *sc, struct qwx_rx_msdu *msdu,
 	if (drop) {
 		m_freem(msdu->m);
 		msdu->m = NULL;
+		ifp->if_ierrors++;
 		return;
 	}
 
 	qwx_dp_rx_deliver_msdu(sc, msdu);
+	msdu->m = NULL;
 }
 
 int
@@ -16480,6 +16778,12 @@ qwx_dp_rx_get_msdu_last_buf(struct qwx_rx_msdu_list *msdu_list,
 	return NULL;
 }
 
+static inline uint16_t
+qwx_dp_rx_h_mpdu_start_seq_no(struct qwx_softc *sc, struct hal_rx_desc *desc)
+{
+	return sc->hw_params.hw_ops->rx_desc_get_mpdu_start_seq_no(desc);
+}
+
 static inline void *
 qwx_dp_rx_get_attention(struct qwx_softc *sc, struct hal_rx_desc *desc)
 {
@@ -16494,6 +16798,12 @@ qwx_dp_rx_h_attn_is_mcbc(struct qwx_softc *sc, struct hal_rx_desc *desc)
 	return qwx_dp_rx_h_msdu_end_first_msdu(sc, desc) &&
 		(!!FIELD_GET(RX_ATTENTION_INFO1_MCAST_BCAST,
 		 le32toh(attn->info1)));
+}
+
+static inline uint16_t
+qwx_dp_rx_h_mpdu_start_peer_id(struct qwx_softc *sc, struct hal_rx_desc *desc)
+{
+	return sc->hw_params.hw_ops->rx_desc_get_mpdu_peer_id(desc);
 }
 
 static inline uint8_t
@@ -16512,6 +16822,18 @@ static inline uint32_t
 qwx_dp_rx_h_msdu_start_freq(struct qwx_softc *sc, struct hal_rx_desc *desc)
 {
 	return sc->hw_params.hw_ops->rx_desc_get_msdu_freq(desc);
+}
+
+static inline uint8_t
+qwx_dp_rx_h_msdu_start_pkt_type(struct qwx_softc *sc, struct hal_rx_desc *desc)
+{
+	return sc->hw_params.hw_ops->rx_desc_get_msdu_pkt_type(desc);
+}
+
+static inline uint8_t
+qwx_dp_rx_h_msdu_start_nss(struct qwx_softc *sc, struct hal_rx_desc *desc)
+{
+	return hweight8(sc->hw_params.hw_ops->rx_desc_get_msdu_nss(desc));
 }
 
 uint32_t
@@ -16594,17 +16916,138 @@ qwx_dp_rx_h_ppdu(struct qwx_softc *sc, struct hal_rx_desc *rx_desc,
 	qwx_dp_rx_h_rate(sc, rx_desc, rxi);
 }
 
-void
+int
 qwx_dp_rx_h_undecap_nwifi(struct qwx_softc *sc, struct qwx_rx_msdu *msdu,
     uint8_t *first_hdr, enum hal_encrypt_type enctype)
 {
-	/*
-	* This function will need to do some work once we are receiving
-	* aggregated frames. For now, it needs to do nothing.
-	*/
+	struct ieee80211_frame *wh;
+	struct ieee80211_qosframe *qwh;
+	uint8_t decap_hdr[IEEE80211_MAX_FRAME_HDR_LEN];
+	uint8_t da[IEEE80211_ADDR_LEN];
+	uint8_t sa[IEEE80211_ADDR_LEN];
+	u_int hdr_len;
+	struct mbuf *m;
+	int off;
 
-	if (!msdu->is_first_msdu)
-		printf("%s: not implemented\n", __func__);
+	/* copy SA & DA and pull decapped header */
+	wh = mtod(msdu->m, struct ieee80211_frame *);
+	hdr_len = ieee80211_get_hdrlen(wh);
+	switch (wh->i_fc[1] & IEEE80211_FC1_DIR_MASK) {
+	case IEEE80211_FC1_DIR_NODS:
+		IEEE80211_ADDR_COPY(da, wh->i_addr1);
+		IEEE80211_ADDR_COPY(sa, wh->i_addr2);
+		break;
+	case IEEE80211_FC1_DIR_TODS:
+		IEEE80211_ADDR_COPY(da, wh->i_addr3);
+		IEEE80211_ADDR_COPY(sa, wh->i_addr2);
+		break;
+	case IEEE80211_FC1_DIR_FROMDS:
+		IEEE80211_ADDR_COPY(da, wh->i_addr1);
+		IEEE80211_ADDR_COPY(sa, wh->i_addr3);
+		break;
+	case IEEE80211_FC1_DIR_DSTODS:
+		IEEE80211_ADDR_COPY(da, wh->i_addr3);
+		IEEE80211_ADDR_COPY(sa,
+		    ((struct ieee80211_frame_addr4 *)wh)->i_addr4);
+		break;
+	}
+	m_adj(msdu->m, hdr_len);
+
+	if (msdu->is_first_msdu) {
+		/*
+		 * The original 802.11 header is valid for the first msdu
+		 * hence we can reuse the same header.
+		 */
+		wh = (struct ieee80211_frame *)first_hdr;
+		hdr_len = ieee80211_get_hdrlen(wh);
+
+		/*
+		 * Each A-MSDU subframe will be reported as a separate MSDU,
+		 * so strip the A-MSDU bit from QoS Ctl.
+		 */
+		if (ieee80211_has_qos(wh)) {
+			qwh = (struct ieee80211_qosframe *)wh;
+			qwh->i_qos[0] &= ~IEEE80211_QOS_AMSDU;
+		}
+#if 0
+		if (!(status->flag & RX_FLAG_IV_STRIPPED)) {
+			memcpy(skb_push(msdu,
+					ath11k_dp_rx_crypto_param_len(ar, enctype)),
+			       (void *)hdr + hdr_len,
+			       ath11k_dp_rx_crypto_param_len(ar, enctype));
+		}
+#endif
+		m = m_makespace(msdu->m, 0, hdr_len, &off);
+		if (m == NULL)
+			return ENOMEM;
+
+		memcpy(mtod(m, void *) + off, wh, hdr_len);
+
+		/*
+		 * Original 802.11 header has a different DA and in
+		 * case of 4addr it may also have different SA.
+		 */
+		wh = mtod(m, struct ieee80211_frame *);
+		switch (wh->i_fc[1] & IEEE80211_FC1_DIR_MASK) {
+		case IEEE80211_FC1_DIR_NODS:
+			IEEE80211_ADDR_COPY(wh->i_addr1, da);
+			IEEE80211_ADDR_COPY(wh->i_addr2, sa);
+			break;
+		case IEEE80211_FC1_DIR_TODS:
+			IEEE80211_ADDR_COPY(wh->i_addr3, da);
+			IEEE80211_ADDR_COPY( wh->i_addr2, sa);
+			break;
+		case IEEE80211_FC1_DIR_FROMDS:
+			IEEE80211_ADDR_COPY(wh->i_addr1, da);
+			IEEE80211_ADDR_COPY(wh->i_addr3, sa);
+			break;
+		case IEEE80211_FC1_DIR_DSTODS:
+			IEEE80211_ADDR_COPY(wh->i_addr3, da);
+			IEEE80211_ADDR_COPY(
+			    ((struct ieee80211_frame_addr4 *)wh)->i_addr4, sa);
+			break;
+		}
+	} else {
+		uint16_t qos_ctl = msdu->tid & IEEE80211_QOS_TID;
+
+		/*  Rebuild QoS header if this is a middle/last msdu */
+		wh->i_fc[0] |= htole16(IEEE80211_FC0_SUBTYPE_QOS);
+
+		/* Reset the order bit as the HT_Control header is stripped */
+		wh->i_fc[1] &= ~(htole16(IEEE80211_FC1_ORDER));
+#if 0
+		if (ath11k_dp_rx_h_msdu_start_mesh_ctl_present(ar->ab, rxcb->rx_desc))
+			qos_ctl |= IEEE80211_QOS_CTL_MESH_CONTROL_PRESENT;
+#endif
+		/* TODO Add other QoS ctl fields when required */
+
+		/* copy decap header before overwriting for reuse below */
+		memcpy(decap_hdr, (uint8_t *)wh, hdr_len);
+#if 0
+		if (!(status->flag & RX_FLAG_IV_STRIPPED)) {
+			memcpy(skb_push(msdu,
+					ath11k_dp_rx_crypto_param_len(ar, enctype)),
+			       (void *)hdr + hdr_len,
+			       ath11k_dp_rx_crypto_param_len(ar, enctype));
+		}
+#endif
+		m = m_makespace(msdu->m, 0, hdr_len + sizeof(qos_ctl), &off);
+		if (m == NULL)
+			return ENOMEM;
+
+		memcpy(mtod(m, void *) + off, decap_hdr, hdr_len);
+		qwh = mtod(m, struct ieee80211_qosframe *);
+		*(u_int16_t *)qwh->i_qos = htole16(qos_ctl);
+	
+		/* A-MSDU subframes cause duplicate sequence numbers. */
+		msdu->rxi.rxi_flags |= IEEE80211_RXI_SAME_SEQ;
+	}
+
+	/* Hardware has already reordered A-MPDU subframes. */
+	msdu->rxi.rxi_flags |= IEEE80211_RXI_AMPDU_DONE;
+
+	msdu->m = m;
+	return 0;
 }
 
 void
@@ -16686,20 +17129,21 @@ qwx_dp_rx_h_msdu_start_decap_type(struct qwx_softc *sc, struct hal_rx_desc *desc
 	return sc->hw_params.hw_ops->rx_desc_get_decap_type(desc);
 }
 
-void
+int
 qwx_dp_rx_h_undecap(struct qwx_softc *sc, struct qwx_rx_msdu *msdu,
     struct hal_rx_desc *rx_desc, enum hal_encrypt_type enctype,
     int decrypted)
 {
 	uint8_t *first_hdr;
 	uint8_t decap;
+	int ret = 0;
 
 	first_hdr = qwx_dp_rx_h_80211_hdr(sc, rx_desc);
 	decap = qwx_dp_rx_h_msdu_start_decap_type(sc, rx_desc);
 
 	switch (decap) {
 	case DP_RX_DECAP_TYPE_NATIVE_WIFI:
-		qwx_dp_rx_h_undecap_nwifi(sc, msdu, first_hdr, enctype);
+		ret = qwx_dp_rx_h_undecap_nwifi(sc, msdu, first_hdr, enctype);
 		break;
 	case DP_RX_DECAP_TYPE_RAW:
 		qwx_dp_rx_h_undecap_raw(sc, msdu, enctype, decrypted);
@@ -16728,6 +17172,8 @@ qwx_dp_rx_h_undecap(struct qwx_softc *sc, struct qwx_rx_msdu *msdu,
 		break;
 #endif
 	}
+
+	return ret;
 }
 
 int
@@ -16737,38 +17183,36 @@ qwx_dp_rx_h_mpdu(struct qwx_softc *sc, struct qwx_rx_msdu *msdu,
 	struct ieee80211com *ic = &sc->sc_ic;
 	int fill_crypto_hdr = 0;
 	enum hal_encrypt_type enctype;
-	int is_decrypted = 0;
+	int is_decrypted = 0, ret;
 #if 0
 	struct ath11k_skb_rxcb *rxcb;
 #endif
 	struct ieee80211_frame *wh;
-#if 0
 	struct ath11k_peer *peer;
-#endif
 	struct rx_attention *rx_attention;
 	uint32_t err_bitmap;
 
 	/* PN for multicast packets will be checked in net80211 */
 	fill_crypto_hdr = qwx_dp_rx_h_attn_is_mcbc(sc, rx_desc);
 	msdu->is_mcbc = fill_crypto_hdr;
-#if 0
-	if (rxcb->is_mcbc) {
-		rxcb->peer_id = ath11k_dp_rx_h_mpdu_start_peer_id(ar->ab, rx_desc);
-		rxcb->seq_no = ath11k_dp_rx_h_mpdu_start_seq_no(ar->ab, rx_desc);
-	}
 
+	if (msdu->is_mcbc) {
+		msdu->peer_id = qwx_dp_rx_h_mpdu_start_peer_id(sc, rx_desc);
+		msdu->seq_no = qwx_dp_rx_h_mpdu_start_seq_no(sc, rx_desc);
+	}
+#ifdef notyet
 	spin_lock_bh(&ar->ab->base_lock);
-	peer = ath11k_dp_rx_h_find_peer(ar->ab, msdu);
+#endif
+	peer = qwx_peer_find_by_id(sc, msdu->peer_id);
 	if (peer) {
-		if (rxcb->is_mcbc)
+		if (msdu->is_mcbc)
 			enctype = peer->sec_type_grp;
 		else
 			enctype = peer->sec_type;
 	} else {
-#endif
 		enctype = qwx_dp_rx_h_mpdu_start_enctype(sc, rx_desc);
-#if 0
 	}
+#if 0
 	spin_unlock_bh(&ar->ab->base_lock);
 #endif
 	rx_attention = qwx_dp_rx_get_attention(sc, rx_desc);
@@ -16814,7 +17258,9 @@ qwx_dp_rx_h_mpdu(struct qwx_softc *sc, struct qwx_rx_msdu *msdu,
 #if 0
 	ath11k_dp_rx_h_csum_offload(ar, msdu);
 #endif
-	qwx_dp_rx_h_undecap(sc, msdu, rx_desc, enctype, is_decrypted);
+	ret = qwx_dp_rx_h_undecap(sc, msdu, rx_desc, enctype, is_decrypted);
+	if (ret)
+		return ret;
 
 	if (is_decrypted && !fill_crypto_hdr &&
 	    qwx_dp_rx_h_msdu_start_decap_type(sc, rx_desc) !=
@@ -16916,6 +17362,41 @@ qwx_dp_rx_deliver_msdu(struct qwx_softc *sc, struct qwx_rx_msdu *msdu)
 #if NBPFILTER > 0
 	if (sc->sc_drvbpf != NULL) {
 		struct qwx_rx_radiotap_header *tap = &sc->sc_rxtap;
+		uint8_t sgi, mcs, rx_bw, pkt_type, nss;
+		uint16_t chan_flags;
+		uint32_t freq;
+
+		sgi = qwx_dp_rx_h_msdu_start_sgi(sc, msdu->rx_desc);
+		mcs = qwx_dp_rx_h_msdu_start_rate_mcs(sc, msdu->rx_desc);
+		rx_bw = qwx_dp_rx_h_msdu_start_rx_bw(sc, msdu->rx_desc);
+		pkt_type = qwx_dp_rx_h_msdu_start_pkt_type(sc, msdu->rx_desc);
+		nss = qwx_dp_rx_h_msdu_start_nss(sc, msdu->rx_desc);
+		freq = qwx_dp_rx_h_msdu_start_freq(sc, msdu->rx_desc);
+
+		tap->wr_flags = 0;
+		tap->wr_chan_freq = ic->ic_channels[freq & 0xff].ic_freq;
+		chan_flags = ic->ic_channels[freq & 0xff].ic_flags;
+		if (pkt_type == HAL_TX_RATE_STATS_PKT_TYPE_11N &&
+		    !msdu->is_mcbc) {
+			if (nss > 1)
+				mcs += 8 * (nss - 1);
+			tap->wr_rate = (0x80 | mcs);
+		} else {
+			uint8_t rateidx;
+			uint16_t rate;
+
+			if (qwx_mac_hw_ratecode_to_legacy_rate(ni, mcs,
+			    pkt_type, &rateidx, &rate) == 0)
+				tap->wr_rate = rate;
+			else
+				tap->wr_rate = 0;
+
+			chan_flags &= ~IEEE80211_CHAN_HT;
+			chan_flags &= ~IEEE80211_CHAN_VHT;
+			chan_flags &= ~IEEE80211_CHAN_40MHZ;
+		}
+		tap->wr_chan_flags = htole16(chan_flags);
+		tap->wr_dbm_antsignal = msdu->rxi.rxi_rssi;
 
 		bpf_mtap_hdr(sc->sc_drvbpf, tap, sc->sc_rxtap_len,
 		    msdu->m, BPF_DIRECTION_IN);
@@ -16929,6 +17410,8 @@ void
 qwx_dp_rx_process_received_packets(struct qwx_softc *sc,
     struct qwx_rx_msdu_list *msdu_list, int mac_id)
 {
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ifnet *ifp = &ic->ic_if;
 	struct qwx_rx_msdu *msdu;
 	int ret;
 
@@ -16939,6 +17422,7 @@ qwx_dp_rx_process_received_packets(struct qwx_softc *sc,
 			DNPRINTF(QWX_D_MAC, "Unable to process msdu: %d", ret);
 			m_freem(msdu->m);
 			msdu->m = NULL;
+			ifp->if_ierrors++;
 			continue;
 		}
 
@@ -18760,7 +19244,7 @@ qwx_wmi_vdev_install_key(struct qwx_softc *sc,
 	cmd->key_idx = arg->key_idx;
 	cmd->key_flags = arg->key_flags;
 	cmd->key_cipher = arg->key_cipher;
-	cmd->key_len = arg->key_len;
+	cmd->key_len = arg->key_len - (arg->key_txmic_len + arg->key_rxmic_len);
 	cmd->key_txmic_len = arg->key_txmic_len;
 	cmd->key_rxmic_len = arg->key_rxmic_len;
 
@@ -19400,7 +19884,7 @@ qwx_wmi_mgmt_send(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 	frame_tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_BYTE) |
 	    FIELD_PREP(WMI_TLV_LEN, buf_len);
 
-	memcpy(frame_tlv->value, mtod(frame, void *), buf_len);
+	m_copydata(frame, 0, buf_len, frame_tlv->value);
 #if 0 /* Not needed on OpenBSD? */
 	ath11k_ce_byte_swap(frame_tlv->value, buf_len);
 #endif
@@ -20709,7 +21193,8 @@ qwx_hal_alloc_cont_rdp(struct qwx_softc *sc)
 			return ENOMEM;
 
 		}
-	}
+	} else
+		memset(QWX_DMA_KVA(hal->rdpmem), 0, size);
 
 	hal->rdp.vaddr = QWX_DMA_KVA(hal->rdpmem);
 	hal->rdp.paddr = QWX_DMA_DVA(hal->rdpmem);
@@ -20744,7 +21229,8 @@ qwx_hal_alloc_cont_wrp(struct qwx_softc *sc)
 			return ENOMEM;
 
 		}
-	}
+	} else
+		memset(QWX_DMA_KVA(hal->wrpmem), 0, size);
 
 	hal->wrp.vaddr = QWX_DMA_KVA(hal->wrpmem);
 	hal->wrp.paddr = QWX_DMA_DVA(hal->wrpmem);
@@ -22536,9 +23022,9 @@ qwx_reg_update_chan_list(struct qwx_softc *sc, uint8_t pdev_id)
 		if ((!scan_2ghz && IEEE80211_IS_CHAN_2GHZ(channel)) ||
 		    (!scan_5ghz && IEEE80211_IS_CHAN_5GHZ(channel)))
 			continue;
-#ifdef notyet
-		/* TODO: Set to true/false based on some condition? */
+
 		ch->allow_ht = true;
+#ifdef notyet
 		ch->allow_vht = true;
 		ch->allow_he = true;
 #endif
@@ -22555,13 +23041,24 @@ qwx_reg_update_chan_list(struct qwx_softc *sc, uint8_t pdev_id)
 		ch->maxregpower = ch->maxpower; 
 		ch->antennamax = 0;
 
-		/* TODO: Use appropriate phymodes */
-		if (IEEE80211_IS_CHAN_A(channel))
+		switch (IFM_MODE(ic->ic_media.ifm_cur->ifm_media)) {
+		case IFM_IEEE80211_11A:
 			ch->phy_mode = MODE_11A;
-		else if (IEEE80211_IS_CHAN_G(channel))
+			break;
+		case IFM_IEEE80211_11G:
 			ch->phy_mode = MODE_11G;
-		else
+			break;
+		case IFM_IEEE80211_11B:
 			ch->phy_mode = MODE_11B;
+			break;
+		case IFM_IEEE80211_11N:
+		default:
+			if (IEEE80211_IS_CHAN_A(channel))
+				ch->phy_mode = MODE_11NA_HT20;
+			else
+				ch->phy_mode = MODE_11NG_HT20;
+			break;
+		}
 #ifdef notyet
 		if (channel->band == NL80211_BAND_6GHZ &&
 		    cfg80211_channel_is_psc(channel))
@@ -22759,6 +23256,16 @@ qwx_mac_op_start(struct qwx_pdev *pdev)
 	}
 
 	qwx_set_antenna(pdev, pdev->cap.tx_chain_mask, pdev->cap.rx_chain_mask);
+
+	memset(ic->ic_sup_mcs, 0, sizeof(ic->ic_sup_mcs));
+	ic->ic_sup_mcs[0] = 0xff;		/* MCS 0-7 */
+	if (sc->num_rx_chains > 1)
+		ic->ic_sup_mcs[1] = 0xff;		/* MCS 8-15 */
+	if (sc->num_rx_chains > 2)
+		ic->ic_sup_mcs[2] = 0xff;		/* MCS 16-23 */
+	if (sc->num_rx_chains > 3)
+		ic->ic_sup_mcs[3] = 0xff;		/* MCS 24-31 */
+	
 
 	/* TODO: Do we need to enable ANI? */
 
@@ -22997,21 +23504,13 @@ qwx_mac_vdev_start_restart(struct qwx_softc *sc, struct qwx_vif *arvif,
 	arg.channel.band_center_freq1 = chan->ic_freq;
 	arg.channel.band_center_freq2 = chan->ic_freq;
 
-	switch (ic->ic_curmode) {
-	case IEEE80211_MODE_11A:
+	/* Deduce a legacy mode based on the channel characteristics. */
+	if (IEEE80211_IS_CHAN_5GHZ(chan))
 		arg.channel.mode = MODE_11A;
-		break;
-	case IEEE80211_MODE_11B:
-		arg.channel.mode = MODE_11B;
-		break;
-	case IEEE80211_MODE_11G:
+	else if (ic->ic_bss->ni_flags & IEEE80211_NODE_ERP)
 		arg.channel.mode = MODE_11G;
-		break;
-	default:
-		printf("%s: unsupported phy mode %d\n",
-		    sc->sc_dev.dv_xname, ic->ic_curmode);
-		return ENOTSUP;
-	}
+	else
+		arg.channel.mode = MODE_11B;
 
 	arg.channel.min_power = 0;
 	arg.channel.max_power = 20; /* XXX */
@@ -23654,17 +24153,18 @@ qwx_mac_get_rate_hw_value(struct ieee80211com *ic,
 
 int
 qwx_peer_delete(struct qwx_softc *sc, uint32_t vdev_id, uint8_t pdev_id,
-    uint8_t *addr)
+    struct ath11k_peer *peer)
 {
 	int ret;
 
 	sc->peer_mapped = 0;
 	sc->peer_delete_done = 0;
 
-	ret = qwx_wmi_send_peer_delete_cmd(sc, addr, vdev_id, pdev_id);
+	ret = qwx_wmi_send_peer_delete_cmd(sc, peer->addr, vdev_id, pdev_id);
 	if (ret) {
 		printf("%s: failed to delete peer vdev_id %d addr %s ret %d\n",
-		    sc->sc_dev.dv_xname, vdev_id, ether_sprintf(addr), ret);
+		    sc->sc_dev.dv_xname, vdev_id, ether_sprintf(peer->addr),
+		    ret);
 		return ret;
 	}
 
@@ -23688,7 +24188,10 @@ qwx_peer_delete(struct qwx_softc *sc, uint32_t vdev_id, uint8_t pdev_id,
 		}
 	}
 
+	TAILQ_REMOVE(&sc->peers, peer, entry);
 	sc->num_peers--;
+	qwx_node_clear_peer_id(sc, peer);
+	free(peer, M_DEVBUF, sizeof(*peer));
 	return 0;
 }
 
@@ -23712,7 +24215,7 @@ qwx_peer_create(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 	mutex_lock(&ar->ab->tbl_mtx_lock);
 	spin_lock_bh(&ar->ab->base_lock);
 #endif
-	peer = &nq->peer;
+	peer = qwx_peer_find_by_id(sc, nq->peer_id);
 	if (peer) {
 		if (peer->peer_id != HAL_INVALID_PEERID &&
 		    peer->vdev_id == param->vdev_id) {
@@ -23728,6 +24231,14 @@ qwx_peer_create(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 		 */
 		ath11k_peer_rhash_delete(ar->ab, peer);
 #endif
+	} else {
+		peer = malloc(sizeof(*peer), M_DEVBUF, M_ZERO | M_NOWAIT);
+		if (peer == NULL)
+			return ENOMEM;
+
+		peer->peer_id = HAL_INVALID_PEERID;
+		TAILQ_INSERT_TAIL(&sc->peers, peer, entry);
+		sc->num_peers++;
 	}
 #ifdef notyet
 	spin_unlock_bh(&ar->ab->base_lock);
@@ -23737,6 +24248,9 @@ qwx_peer_create(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 
 	ret = qwx_wmi_send_peer_create_cmd(sc, pdev_id, param);
 	if (ret) {
+		TAILQ_REMOVE(&sc->peers, peer, entry);
+		sc->num_peers--;
+		free(peer, M_DEVBUF, sizeof(*peer));
 		printf("%s: failed to send peer create vdev_id %d ret %d\n",
 		    sc->sc_dev.dv_xname, param->vdev_id, ret);
 		return ret;
@@ -23746,11 +24260,16 @@ qwx_peer_create(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 		ret = tsleep_nsec(&sc->peer_mapped, 0, "qwxpeer",
 		    SEC_TO_NSEC(3));
 		if (ret) {
+			TAILQ_REMOVE(&sc->peers, peer, entry);
+			sc->num_peers--;
+			free(peer, M_DEVBUF, sizeof(*peer));
 			printf("%s: peer create command timeout\n",
 			    sc->sc_dev.dv_xname);
 			return ret;
 		}
 	}
+
+	nq->peer_id = peer->peer_id;
 
 #ifdef notyet
 	mutex_lock(&ar->ab->tbl_mtx_lock);
@@ -23783,10 +24302,10 @@ qwx_peer_create(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 		arvif->ast_hash = peer->ast_hash;
 		arvif->ast_idx = peer->hw_peer_id;
 	}
-#if 0
+
 	peer->sec_type = HAL_ENCRYPT_TYPE_OPEN;
 	peer->sec_type_grp = HAL_ENCRYPT_TYPE_OPEN;
-
+#if 0
 	if (sta) {
 		struct ath11k_sta *arsta = (struct ath11k_sta *)sta->drv_priv;
 		arsta->tcl_metadata |= FIELD_PREP(HTT_TCL_META_DATA_TYPE, 0) |
@@ -23797,7 +24316,6 @@ qwx_peer_create(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 		arsta->tcl_metadata &= ~HTT_TCL_META_DATA_VALID_HTT;
 	}
 #endif
-	sc->num_peers++;
 #ifdef notyet
 	spin_unlock_bh(&ar->ab->base_lock);
 	mutex_unlock(&ar->ab->tbl_mtx_lock);
@@ -24240,22 +24758,25 @@ qwx_dp_rx_tid_mem_free(struct qwx_softc *sc, struct ieee80211_node *ni,
     int vdev_id, uint8_t tid)
 {
 	struct qwx_node *nq = (struct qwx_node *)ni;
-	struct ath11k_peer *peer = &nq->peer;
+	struct ath11k_peer *peer;
 	struct dp_rx_tid *rx_tid;
 #ifdef notyet
 	spin_lock_bh(&ab->base_lock);
 #endif
-	rx_tid = &peer->rx_tid[tid];
+	peer = qwx_peer_find_by_id(sc, nq->peer_id);
+	if (peer) {
+		rx_tid = &peer->rx_tid[tid];
 
-	if (rx_tid->mem) {
-		qwx_dmamem_free(sc->sc_dmat, rx_tid->mem);
-		rx_tid->mem = NULL;
-		rx_tid->vaddr = NULL;
-		rx_tid->paddr = 0ULL;
-		rx_tid->size = 0;
+		if (rx_tid->mem) {
+			qwx_dmamem_free(sc->sc_dmat, rx_tid->mem);
+			rx_tid->mem = NULL;
+			rx_tid->vaddr = NULL;
+			rx_tid->paddr = 0ULL;
+			rx_tid->size = 0;
+		}
+
+		rx_tid->active = 0;
 	}
-
-	rx_tid->active = 0;
 #ifdef notyet
 	spin_unlock_bh(&ab->base_lock);
 #endif
@@ -24267,7 +24788,7 @@ qwx_peer_rx_tid_setup(struct qwx_softc *sc, struct ieee80211_node *ni,
     enum hal_pn_type pn_type)
 {
 	struct qwx_node *nq = (struct qwx_node *)ni;
-	struct ath11k_peer *peer = &nq->peer;
+	struct ath11k_peer *peer;
 	struct dp_rx_tid *rx_tid;
 	uint32_t hw_desc_sz;
 	void *vaddr;
@@ -24276,6 +24797,14 @@ qwx_peer_rx_tid_setup(struct qwx_softc *sc, struct ieee80211_node *ni,
 #ifdef notyet
 	spin_lock_bh(&ab->base_lock);
 #endif
+	peer = qwx_peer_find_by_id(sc, nq->peer_id);
+	if (peer == NULL) {
+#ifdef notyet
+		spin_unlock_bh(&ab->base_lock);
+#endif
+		return EINVAL;
+	}
+
 	rx_tid = &peer->rx_tid[tid];
 	/* Update the tid queue if it is already setup */
 	if (rx_tid->active) {
@@ -24352,12 +24881,20 @@ qwx_peer_rx_frag_setup(struct qwx_softc *sc, struct ieee80211_node *ni,
     int vdev_id)
 {
 	struct qwx_node *nq = (struct qwx_node *)ni;
-	struct ath11k_peer *peer = &nq->peer;
+	struct ath11k_peer *peer;
 	struct dp_rx_tid *rx_tid;
 	int i;
 #ifdef notyet
 	spin_lock_bh(&ab->base_lock);
 #endif
+	peer = qwx_peer_find_by_id(sc, nq->peer_id);
+	if (peer == NULL) {
+#ifdef notyet
+		spin_unlock_bh(&ab->base_lock);
+#endif
+		return EINVAL;
+	}
+
 	for (i = 0; i <= nitems(peer->rx_tid); i++) {
 		rx_tid = &peer->rx_tid[i];
 #if 0
@@ -24379,9 +24916,13 @@ qwx_dp_peer_setup(struct qwx_softc *sc, int vdev_id, int pdev_id,
     struct ieee80211_node *ni)
 {
 	struct qwx_node *nq = (struct qwx_node *)ni;
-	struct ath11k_peer *peer = &nq->peer;
+	struct ath11k_peer *peer;
 	uint32_t reo_dest;
 	int ret = 0, tid;
+
+	peer = qwx_peer_find_by_id(sc, nq->peer_id);
+	if (peer == NULL)
+		return EINVAL;
 
 	/* reo_dest ring id starts from 1 unlike mac_id which starts from 0 */
 	reo_dest = sc->pdev_dp.mac_id + 1;
@@ -24442,18 +24983,10 @@ qwx_dp_peer_rx_pn_replay_config(struct qwx_softc *sc, struct qwx_vif *arvif,
 {
 	struct ath11k_hal_reo_cmd cmd = {0};
 	struct qwx_node *nq = (struct qwx_node *)ni;
-	struct ath11k_peer *peer = &nq->peer;
+	struct ath11k_peer *peer;
 	struct dp_rx_tid *rx_tid;
 	uint8_t tid;
 	int ret = 0;
-
-	/*
-	 * NOTE: Enable PN/TSC replay check offload only for unicast frames.
-	 * We use net80211 PN/TSC replay check functionality for bcast/mcast
-	 * for now.
-	 */
-	if (k->k_flags & IEEE80211_KEY_GROUP)
-		return 0;
 
 	cmd.flag |= HAL_REO_CMD_FLG_NEED_STATUS;
 	cmd.upd0 |= HAL_REO_CMD_UPD0_PN |
@@ -24480,6 +25013,10 @@ qwx_dp_peer_rx_pn_replay_config(struct qwx_softc *sc, struct qwx_vif *arvif,
 		    sc->sc_dev.dv_xname, k->k_cipher);
 		return EOPNOTSUPP;
 	}
+
+	peer = qwx_peer_find_by_id(sc, nq->peer_id);
+	if (peer == NULL)
+		return EINVAL;
 
 	for (tid = 0; tid < IEEE80211_NUM_TID; tid++) {
 		rx_tid = &peer->rx_tid[tid];
@@ -24516,10 +25053,15 @@ uint8_t
 qwx_dp_tx_get_tid(struct mbuf *m)
 {
 	struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
-	uint16_t qos = ieee80211_get_qos(wh);
-	uint8_t tid = qos & IEEE80211_QOS_TID;
 
-	return tid;
+	if (ieee80211_has_qos(wh)) {
+		uint16_t qos = ieee80211_get_qos(wh);
+		uint8_t tid = qos & IEEE80211_QOS_TID;
+
+		return tid;
+	}
+
+	return HAL_DESC_REO_NON_QOS_TID;
 }
 
 void
@@ -24561,6 +25103,27 @@ qwx_hal_tx_cmd_desc_setup(struct qwx_softc *sc, void *cmd,
 	if (ti->enable_mesh)
 		ab->hw_params.hw_ops->tx_mesh_enable(ab, tcl_cmd);
 #endif
+}
+
+void
+qwx_dp_tx_encap_nwifi(struct mbuf *m)
+{
+	struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
+	struct ieee80211_qosframe *qwh;
+	uint8_t *qos_ctl;
+
+	if (!ieee80211_has_qos(wh))
+		return;
+
+	/* Trim QoS info. */
+	qwh = (struct ieee80211_qosframe *)wh;
+	qos_ctl = &qwh->i_qos[0];
+	memmove(mtod(m, void *) + 2, mtod(m, void *),
+	    (void *)qos_ctl - mtod(m, void *));
+	m_adj(m, 2);
+
+	wh = mtod(m, struct ieee80211_frame *);
+	wh->i_fc[0] &= ~IEEE80211_FC0_SUBTYPE_QOS;
 }
 
 int
@@ -24643,6 +25206,7 @@ qwx_dp_tx(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 					return ENOSPC;
 				}
 				break;
+			case IEEE80211_CIPHER_BIP:
 			default:
 				ti.encrypt_type = HAL_ENCRYPT_TYPE_OPEN;
 				break;
@@ -24682,15 +25246,14 @@ qwx_dp_tx(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 	ti.flags1 |= FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_TID_OVERWRITE, 1);
 
 	ti.tid = qwx_dp_tx_get_tid(m);
-#if 0
 	switch (ti.encap_type) {
 	case HAL_TCL_ENCAP_TYPE_NATIVE_WIFI:
-		ath11k_dp_tx_encap_nwifi(skb);
+		qwx_dp_tx_encap_nwifi(m);
 		break;
 	case HAL_TCL_ENCAP_TYPE_RAW:
-		if (!test_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags)) {
-			ret = -EINVAL;
-			goto fail_remove_idr;
+		if (!test_bit(ATH11K_FLAG_RAW_MODE, sc->sc_flags)) {
+			m_freem(m);
+			return EINVAL;
 		}
 		break;
 	case HAL_TCL_ENCAP_TYPE_ETHERNET:
@@ -24699,11 +25262,9 @@ qwx_dp_tx(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 	case HAL_TCL_ENCAP_TYPE_802_3:
 	default:
 		/* TODO: Take care of other encap modes as well */
-		ret = -EINVAL;
-		atomic_inc(&ab->soc_stats.tx_err.misc_fail);
-		goto fail_remove_idr;
+		m_freem(m);
+		return EINVAL;
 	}
-#endif
 	ret = bus_dmamap_load_mbuf(sc->sc_dmat, tx_data->map,
 	    m, BUS_DMA_WRITE | BUS_DMA_NOWAIT);
 	if (ret && ret != EFBIG) {
@@ -24778,15 +25339,13 @@ qwx_dp_tx(struct qwx_softc *sc, struct qwx_vif *arvif, uint8_t pdev_id,
 
 int
 qwx_mac_station_remove(struct qwx_softc *sc, struct qwx_vif *arvif,
-    uint8_t pdev_id, struct ieee80211_node *ni)
+    uint8_t pdev_id, struct ath11k_peer *peer)
 {
-	struct qwx_node *nq = (struct qwx_node *)ni;
-	struct ath11k_peer *peer = &nq->peer;
 	int ret;
 
 	qwx_peer_rx_tid_cleanup(sc, peer);
 
-	ret = qwx_peer_delete(sc, arvif->vdev_id, pdev_id, ni->ni_macaddr);
+	ret = qwx_peer_delete(sc, arvif->vdev_id, pdev_id, peer);
 	if (ret) {
 		printf("%s: unable to delete BSS peer: %d\n",
 		   sc->sc_dev.dv_xname, ret);
@@ -24822,51 +25381,84 @@ qwx_mac_station_add(struct qwx_softc *sc, struct qwx_vif *arvif,
 
 	ret = qwx_dp_peer_setup(sc, arvif->vdev_id, pdev_id, ni);
 	if (ret) {
+		struct qwx_node *nq = (struct qwx_node *)ni;
+		struct ath11k_peer *peer;
+
 		printf("%s: failed to setup dp for peer %s on vdev %d (%d)\n",
 		    sc->sc_dev.dv_xname, ether_sprintf(ni->ni_macaddr),
 		    arvif->vdev_id, ret);
-		goto free_peer;
+		peer = qwx_peer_find_by_id(sc, nq->peer_id);
+		if (peer)
+			qwx_peer_delete(sc, arvif->vdev_id, pdev_id, peer);
+		return ret;
 	}
 
 	return 0;
-
-free_peer:
-	qwx_peer_delete(sc, arvif->vdev_id, pdev_id, ni->ni_macaddr);
-	return ret;
 }
 
 int
 qwx_mac_mgmt_tx_wmi(struct qwx_softc *sc, struct qwx_vif *arvif,
     uint8_t pdev_id, struct ieee80211_node *ni, struct mbuf *m)
 {
+	struct ieee80211com *ic = &sc->sc_ic;
 	struct qwx_txmgmt_queue *txmgmt = &arvif->txmgmt;
 	struct qwx_tx_data *tx_data;
+	struct ieee80211_frame *wh;
 	int buf_id;
 	int ret;
+	uint8_t subtype;
 
 	buf_id = txmgmt->cur;
 
 	DNPRINTF(QWX_D_MAC, "%s: tx mgmt frame, buf id %d\n", __func__, buf_id);
 
-	if (txmgmt->queued >= nitems(txmgmt->data))
+	if (txmgmt->queued >= nitems(txmgmt->data)) {
+		m_freem(m);
 		return ENOSPC;
+	}
 
 	tx_data = &txmgmt->data[buf_id];
-#if 0
-	if (!(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP)) {
-		if ((ieee80211_is_action(hdr->frame_control) ||
-		     ieee80211_is_deauth(hdr->frame_control) ||
-		     ieee80211_is_disassoc(hdr->frame_control)) &&
-		     ieee80211_has_protected(hdr->frame_control)) {
-			skb_put(skb, IEEE80211_CCMP_MIC_LEN);
+
+	wh = mtod(m, struct ieee80211_frame *);
+	subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+
+	if ((ni->ni_flags & IEEE80211_NODE_MFP) &&
+	    (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) &&
+	    (subtype == IEEE80211_FC0_SUBTYPE_DISASSOC ||
+	     subtype == IEEE80211_FC0_SUBTYPE_DEAUTH ||
+	     subtype == IEEE80211_FC0_SUBTYPE_ACTION)) {
+		if (IEEE80211_IS_MULTICAST(wh->i_addr1)) {
+			struct ieee80211_key *k;
+
+			/* BIP needs to be done in software crypto. */
+			k = ieee80211_get_txkey(ic, wh, ni);
+			if ((m = ieee80211_encrypt(ic, m, k)) == NULL)
+				return ENOBUFS;
+		} else {
+			int off;
+
+			/* Make space for CCMP header. */
+			if (m_makespace(m, ieee80211_get_hdrlen(wh),
+			    IEEE80211_CCMP_HDRLEN, &off) == NULL) {
+				m_freem(m);
+				return ENOMEM;
+			}
+
+			/* Add trailing space for CCMP MIC. */
+			if (m_makespace(m, m->m_pkthdr.len,
+			    IEEE80211_CCMP_MICLEN, &off) == NULL) {
+				m_freem(m);
+				return ENOMEM;
+			}
 		}
 	}
-#endif
+
 	ret = bus_dmamap_load_mbuf(sc->sc_dmat, tx_data->map,
 	    m, BUS_DMA_WRITE | BUS_DMA_NOWAIT);
 	if (ret && ret != EFBIG) {
 		printf("%s: failed to map mgmt Tx buffer: %d\n",
 		    sc->sc_dev.dv_xname, ret);
+		m_freem(m);
 		return ret;
 	}
 	if (ret) {
@@ -24889,6 +25481,7 @@ qwx_mac_mgmt_tx_wmi(struct qwx_softc *sc, struct qwx_vif *arvif,
 	if (ret) {
 		printf("%s: failed to send mgmt frame: %d\n",
 		    sc->sc_dev.dv_xname, ret);
+		m_freem(m);
 		goto err_unmap_buf;
 	}
 	tx_data->ni = ni;
@@ -25155,7 +25748,7 @@ qwx_start_scan(struct qwx_softc *sc, struct scan_req_params *arg)
 #define ATH11K_MAC_SCAN_CMD_EVT_OVERHEAD		200 /* in msecs */
 
 int
-qwx_scan(struct qwx_softc *sc)
+qwx_scan(struct qwx_softc *sc, int bgscan)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct qwx_vif *arvif = TAILQ_FIRST(&sc->vif_list);
@@ -25319,7 +25912,7 @@ qwx_scan(struct qwx_softc *sc)
 #ifdef notyet
 		spin_unlock_bh(&ar->data_lock);
 #endif
-	} else {
+	} else if (!bgscan) {
 		/*
 		 * The current mode might have been fixed during association.
 		 * Ensure all channels get scanned.
@@ -25385,6 +25978,31 @@ qwx_scan_abort(struct qwx_softc *sc)
 #ifdef notyet
 	spin_unlock_bh(&ar->data_lock);
 #endif
+}
+
+void
+qwx_bgscan_task(void *arg)
+{
+	struct qwx_softc *sc = arg;
+	struct ieee80211com *ic = &sc->sc_ic;
+
+	if (ic->ic_state == IEEE80211_S_RUN &&
+	    sc->scan.state == ATH11K_SCAN_IDLE &&
+	    !test_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags))
+		qwx_scan(sc, 1);
+
+	refcnt_rele_wake(&sc->task_refs);
+}
+
+int
+qwx_bgscan(struct ieee80211com *ic)
+{
+	struct ifnet *ifp = &ic->ic_if;
+	struct qwx_softc *sc = ifp->if_softc;
+
+	qwx_add_task(sc, systq, &sc->bgscan_task);
+
+	return 0;
 }
 
 /*
@@ -25515,11 +26133,14 @@ qwx_auth(struct qwx_softc *sc)
 int
 qwx_deauth(struct qwx_softc *sc)
 {
-	struct ieee80211com *ic = &sc->sc_ic;
-	struct ieee80211_node *ni = ic->ic_bss;
 	struct qwx_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
 	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
+	struct ath11k_peer *peer;
 	int ret;
+
+	peer = qwx_peer_find_by_id(sc, sc->bss_peer_id);
+	if (peer == NULL)
+		return EINVAL;
 
 	ret = qwx_mac_vdev_stop(sc, arvif, pdev_id);
 	if (ret) {
@@ -25528,20 +26149,18 @@ qwx_deauth(struct qwx_softc *sc)
 		return ret;
 	}
 
-	ret = qwx_wmi_set_peer_param(sc, ni->ni_macaddr, arvif->vdev_id,
-	    pdev_id, WMI_PEER_AUTHORIZE, 0);
-	if (ret) {
-		printf("%s: unable to deauthorize BSS peer: %d\n",
-		   sc->sc_dev.dv_xname, ret);
-		return ret;
-	}
+	qwx_clear_pn_replay_config(sc, peer);
+	qwx_clear_hwkeys(sc, peer);
 
-	ret = qwx_mac_station_remove(sc, arvif, pdev_id, ni);
+	ret = qwx_mac_station_remove(sc, arvif, pdev_id, peer);
 	if (ret)
 		return ret;
 
+	qwx_free_peers(sc);
+	sc->bss_peer_id = HAL_INVALID_PEERID;
+
 	DNPRINTF(QWX_D_MAC, "%s: disassociated from bssid %s aid %d\n",
-	    __func__, ether_sprintf(ni->ni_bssid), arvif->aid);
+	    __func__, ether_sprintf(arvif->bssid), arvif->aid);
 
 	return 0;
 }
@@ -25574,12 +26193,11 @@ qwx_peer_assoc_h_crypto(struct qwx_softc *sc, struct qwx_vif *arvif,
 		if (ni->ni_rsnprotos == IEEE80211_PROTO_WPA)
 			arg->need_gtk_2_way = 1;
 	}
-#if 0
-	if (sta->mfp) {
+
+	if (ni->ni_flags & IEEE80211_NODE_MFP) {
 		/* TODO: Need to check if FW supports PMF? */
 		arg->is_pmf_enabled = true;
 	}
-#endif
 }
 
 int
@@ -25622,6 +26240,12 @@ qwx_peer_assoc_h_phymode(struct qwx_softc *sc, struct ieee80211_node *ni,
 	case IEEE80211_MODE_11G:
 		phymode = MODE_11G;
 		break;
+	case IEEE80211_MODE_11N:
+		if (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan))
+			phymode = MODE_11NA_HT20;
+		else
+			phymode = MODE_11NG_HT20;
+		break;
 	default:
 		phymode = MODE_UNKNOWN;
 		break;
@@ -25631,6 +26255,136 @@ qwx_peer_assoc_h_phymode(struct qwx_softc *sc, struct ieee80211_node *ni,
 	    ether_sprintf(ni->ni_macaddr), qwx_wmi_phymode_str(phymode));
 
 	arg->peer_phymode = phymode;
+}
+
+/*
+ * 802.11n D2.0 defined values for "Minimum MPDU Start Spacing":
+ *   0 for no restriction
+ *   1 for 1/4 us
+ *   2 for 1/2 us
+ *   3 for 1 us
+ *   4 for 2 us
+ *   5 for 4 us
+ *   6 for 8 us
+ *   7 for 16 us
+ */
+uint8_t
+qwx_parse_mpdudensity(uint8_t mpdudensity)
+{
+	switch (mpdudensity) {
+	case 0:
+		return 0;
+	case 1:
+	case 2:
+	case 3:
+	/* Our lower layer calculations limit our precision to
+	 * 1 microsecond
+	 */
+		return 1;
+	case 4:
+		return 2;
+	case 5:
+		return 4;
+	case 6:
+		return 8;
+	case 7:
+		return 16;
+	default:
+		return 0;
+	}
+}
+
+void
+qwx_peer_assoc_h_ht(struct qwx_softc *sc, struct qwx_vif *arvif,
+    struct ieee80211_node *ni, struct peer_assoc_params *arg)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	int i, n;
+	uint8_t max_nss;
+	uint32_t stbc, aggsize, mpdu_density;
+#ifdef notyet
+	lockdep_assert_held(&ar->conf_mutex);
+#endif
+	if ((ni->ni_flags & IEEE80211_NODE_HT) == 0)
+		return;
+
+	arg->ht_flag = true;
+
+	aggsize = (ni->ni_ampdu_param & IEEE80211_AMPDU_PARAM_LE);
+	arg->peer_max_mpdu = (1 << (13 + aggsize)) - 1;
+
+	mpdu_density = (ni->ni_ampdu_param & IEEE80211_AMPDU_PARAM_SS) >> 2;
+	arg->peer_mpdu_density = qwx_parse_mpdudensity(mpdu_density);
+
+	arg->peer_ht_caps = ni->ni_htcaps;
+	arg->peer_rate_caps |= WMI_HOST_RC_HT_FLAG;
+
+	if (ni->ni_htcaps & IEEE80211_HTCAP_LDPC)
+		arg->ldpc_flag = true;
+#if 0
+	if (sta->deflink.bandwidth >= IEEE80211_STA_RX_BW_40) {
+		arg->bw_40 = true;
+		arg->peer_rate_caps |= WMI_HOST_RC_CW40_FLAG;
+	}
+#endif
+	if (ieee80211_node_supports_ht_sgi20(ni) ||
+	    ieee80211_node_supports_ht_sgi40(ni))
+		arg->peer_rate_caps |= WMI_HOST_RC_SGI_FLAG;
+
+	if (ni->ni_htcaps & IEEE80211_HTCAP_TXSTBC) {
+		arg->peer_rate_caps |= WMI_HOST_RC_TX_STBC_FLAG;
+		arg->stbc_flag = true;
+	}
+
+	if (ni->ni_htcaps & IEEE80211_HTCAP_TXSTBC) {
+		stbc = ni->ni_htcaps & IEEE80211_HTCAP_RXSTBC_MASK;
+		stbc = stbc >> IEEE80211_HTCAP_RXSTBC_SHIFT;
+		stbc = stbc << WMI_HOST_RC_RX_STBC_FLAG_S;
+		arg->peer_rate_caps |= stbc;
+		arg->stbc_flag = true;
+	}
+
+	if (ni->ni_rxmcs[1] && ni->ni_rxmcs[2])
+		arg->peer_rate_caps |= WMI_HOST_RC_TS_FLAG;
+	else if (ni->ni_rxmcs[1])
+		arg->peer_rate_caps |= WMI_HOST_RC_DS_FLAG;
+
+	for (i = 0, n = 0, max_nss = 0; i < nitems(ni->ni_rxmcs) * 8; i++)
+		if ((ic->ic_sup_mcs[i / 8] & BIT(i % 8)) &&
+		    (ni->ni_rxmcs[i / 8] & BIT(i % 8))) {
+			max_nss = (i / 8) + 1;
+			arg->peer_ht_rates.rates[n++] = i;
+		}
+
+	/* This is a workaround for HT-enabled STAs which break the spec
+	 * and have no HT capabilities RX mask (no HT RX MCS map).
+	 *
+	 * As per spec, in section 20.3.5 Modulation and coding scheme (MCS),
+	 * MCS 0 through 7 are mandatory in 20MHz with 800 ns GI at all STAs.
+	 *
+	 * Firmware asserts if such situation occurs.
+	 */
+	if (n == 0) {
+		arg->peer_ht_rates.num_rates = 8;
+		for (i = 0; i < arg->peer_ht_rates.num_rates; i++)
+			arg->peer_ht_rates.rates[i] = i;
+	} else {
+		arg->peer_ht_rates.num_rates = n;
+		arg->peer_nss = max_nss;
+	}
+
+	DNPRINTF(QWX_D_MAC, "%s: ht peer %pM mcs cnt %d nss %d\n", __func__,
+	    arg->peer_mac, arg->peer_ht_rates.num_rates, arg->peer_nss);
+}
+
+void
+qwx_peer_assoc_h_qos(struct qwx_softc *sc, struct qwx_vif *vif,
+    struct ieee80211_node *ni, struct peer_assoc_params *arg)
+{
+	if (ni->ni_flags & IEEE80211_NODE_QOS) {
+		arg->is_wme_set = 1;
+		arg->qos_flag = 1;
+	}
 }
 
 void
@@ -25644,12 +26398,14 @@ qwx_peer_assoc_prepare(struct qwx_softc *sc, struct qwx_vif *arvif,
 	qwx_peer_assoc_h_crypto(sc, arvif, ni, arg);
 	qwx_peer_assoc_h_rates(ni, arg);
 	qwx_peer_assoc_h_phymode(sc, ni, arg);
-#if 0
 	qwx_peer_assoc_h_ht(sc, arvif, ni, arg);
+#if 0
 	qwx_peer_assoc_h_vht(sc, arvif, ni, arg);
 	qwx_peer_assoc_h_he(sc, arvif, ni, arg);
 	qwx_peer_assoc_h_he_6ghz(sc, arvif, ni, arg);
+#endif
 	qwx_peer_assoc_h_qos(sc, arvif, ni, arg);
+#if 0
 	qwx_peer_assoc_h_smps(ni, arg);
 #endif
 #if 0
@@ -25658,11 +26414,151 @@ qwx_peer_assoc_prepare(struct qwx_softc *sc, struct qwx_vif *arvif,
 	/* TODO: amsdu_disable req? */
 }
 
+void
+qwx_rx_agg_start(struct qwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
+    uint16_t ssn, uint16_t winsize)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct qwx_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
+	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
+	enum hal_pn_type pn_type;
+
+	if (!test_bit(ATH11K_FLAG_HW_CRYPTO_DISABLED, sc->sc_flags) &&
+	    (ic->ic_flags & IEEE80211_F_RSNON))
+		pn_type = HAL_PN_TYPE_WPA;
+	else
+		pn_type = HAL_PN_TYPE_NONE;
+
+	if (qwx_peer_rx_tid_setup(sc, ni, arvif->vdev_id, pdev_id, tid,
+	    winsize, ssn, pn_type))
+		ieee80211_addba_req_refuse(ic, ni, tid);
+	else 
+		ieee80211_addba_req_accept(ic, ni, tid);
+}
+
+void
+qwx_rx_agg_stop(struct qwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
+    uint16_t ssn, uint16_t winsize, int timeout_val, int start)
+{
+	struct qwx_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
+	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
+	struct qwx_node *nq = (struct qwx_node *)ni;
+	struct ath11k_peer *peer;
+	uint64_t paddr;
+	int ret;
+
+	peer = qwx_peer_find_by_id(sc, nq->peer_id);
+	if (peer == NULL)
+		return;
+
+	if (!peer->rx_tid[tid].active)
+		return;
+
+	ret = qwx_peer_rx_tid_reo_update(sc, peer,
+	    peer->rx_tid, 1, 0, false);
+	if (ret) {
+		printf("%s: failed to update reo for rx tid %d: %d\n",
+		    sc->sc_dev.dv_xname, tid, ret);
+	}
+
+	paddr = peer->rx_tid[tid].paddr;
+	ret = qwx_wmi_peer_rx_reorder_queue_setup(sc, arvif->vdev_id, pdev_id,
+	    ni->ni_macaddr, paddr, tid, 1, 1);
+	if (ret) {
+		printf("%s: failed to send wmi to delete rx tid %d\n",
+		    sc->sc_dev.dv_xname, ret);
+	}
+}
+
+void
+qwx_ba_task(void *arg)
+{
+	struct qwx_softc *sc = arg;
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	int s = splnet();
+	int tid;
+
+	for (tid = 0; tid < IEEE80211_NUM_TID; tid++) {
+		if (test_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags))
+			break;
+		if (sc->ba_rx.start_tidmask & (1 << tid)) {
+			struct ieee80211_rx_ba *ba = &ni->ni_rx_ba[tid];
+			qwx_rx_agg_start(sc, ni, tid, ba->ba_winstart,
+			    ba->ba_winsize);
+			sc->ba_rx.start_tidmask &= ~(1 << tid);
+		} else if (sc->ba_rx.stop_tidmask & (1 << tid)) {
+			qwx_rx_agg_stop(sc, ni, tid, 0, 0, 0, 0);
+			sc->ba_rx.stop_tidmask &= ~(1 << tid);
+		}
+	}
+
+	refcnt_rele_wake(&sc->task_refs);
+	splx(s);
+}
+
 int
-qwx_run(struct qwx_softc *sc)
+qwx_ampdu_rx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	struct qwx_softc *sc = ic->ic_softc;
+
+	sc->ba_rx.start_tidmask |= (1 << tid);
+	qwx_add_task(sc, systq, &sc->ba_task);
+	return EBUSY;
+}
+
+void
+qwx_ampdu_rx_stop(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	struct qwx_softc *sc = ic->ic_softc;
+
+	sc->ba_rx.stop_tidmask |= (1 << tid);
+	qwx_add_task(sc, systq, &sc->ba_task);
+}
+
+int
+qwx_ampdu_tx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	/* Firmware handles Tx aggregation internally. */
+	return 0;
+}
+
+int
+qwx_setup_peer_smps(struct qwx_softc *sc, uint8_t pdev_id, struct qwx_vif *arvif,
+    uint8_t *addr, uint16_t htcaps)
+{
+	uint16_t smps;
+	uint32_t val;
+
+	smps = (htcaps & IEEE80211_HTCAP_SMPS_MASK) >>
+	    IEEE80211_HTCAP_SMPS_SHIFT;
+
+	switch (smps) {
+	case IEEE80211_HTCAP_SMPS_STA:
+		val = WMI_PEER_SMPS_STATIC;
+		break;
+	case IEEE80211_HTCAP_SMPS_DYN:
+		val = WMI_PEER_SMPS_DYNAMIC;
+		break;
+	case IEEE80211_HTCAP_SMPS_DIS:
+	default:
+		val = WMI_PEER_SMPS_PS_NONE;
+		break;
+	}
+
+	return qwx_wmi_set_peer_param(sc, addr, arvif->vdev_id,
+	    pdev_id, WMI_PEER_MIMO_PS_STATE, val);
+}
+
+int
+qwx_assoc(struct qwx_softc *sc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_node *ni = ic->ic_bss;
+	struct qwx_node *nq = (struct qwx_node *)ni;
 	struct qwx_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
 	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
 	struct peer_assoc_params peer_arg;
@@ -25697,16 +26593,17 @@ qwx_run(struct qwx_softc *sc)
 			return ret;
 		}
 	}
-#if 0
-	ret = ath11k_setup_peer_smps(ar, arvif, sta->addr,
-				     &sta->deflink.ht_cap,
-				     le16_to_cpu(sta->deflink.he_6ghz_capa.capa));
-	if (ret) {
-		ath11k_warn(ar->ab, "failed to setup peer SMPS for vdev %d: %d\n",
-			    arvif->vdev_id, ret);
-		return ret;
-	}
 
+	if (ni->ni_flags & IEEE80211_NODE_HT) {
+		ret = qwx_setup_peer_smps(sc, pdev_id, arvif, ni->ni_macaddr,
+		    ni->ni_htcaps);
+		if (ret) {
+			printf("%s: failed to setup SMPS for vdev %d: %d\n",
+			    sc->sc_dev.dv_xname, arvif->vdev_id, ret);
+			return ret;
+		}
+	}
+#if 0
 	if (!ath11k_mac_vif_recalc_sta_he_txbf(ar, vif, &he_cap)) {
 		ath11k_warn(ar->ab, "failed to recalc he txbf for vdev %i on bss %pM\n",
 			    arvif->vdev_id, bss_conf->bssid);
@@ -25718,6 +26615,26 @@ qwx_run(struct qwx_softc *sc)
 
 	arvif->aid = ni->ni_associd;
 	IEEE80211_ADDR_COPY(arvif->bssid, ni->ni_bssid);
+	sc->bss_peer_id = nq->peer_id;
+
+	/*
+	 * Enable reception of data frames now, if not already enabled.
+	 * We may need to receive EAPOL data frames very soon after the
+	 * AP sends a response to our assoc request.
+	 */
+	sc->ops.irq_enable(sc);
+
+	return 0;
+}
+
+int
+qwx_run(struct qwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	struct qwx_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
+	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
+	int ret;
 
 	ret = qwx_wmi_vdev_up(sc, arvif->vdev_id, pdev_id, arvif->aid,
 	    arvif->bssid, NULL, 0, 0);
@@ -25752,10 +26669,19 @@ qwx_run_stop(struct qwx_softc *sc)
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct qwx_vif *arvif = TAILQ_FIRST(&sc->vif_list); /* XXX */
 	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
-	struct qwx_node *nq = (void *)ic->ic_bss;
+	struct ieee80211_node *ni = ic->ic_bss;
+	struct qwx_node *nq = (void *)ni;
 	int ret;
 
 	sc->ops.irq_disable(sc);
+
+	ret = qwx_wmi_set_peer_param(sc, ni->ni_macaddr, arvif->vdev_id,
+	    pdev_id, WMI_PEER_AUTHORIZE, 0);
+	if (ret) {
+		printf("%s: unable to deauthorize BSS peer: %d\n",
+		   sc->sc_dev.dv_xname, ret);
+		return ret;
+	}
 
 	if (ic->ic_opmode == IEEE80211_M_STA) {
 		ic->ic_bss->ni_txrate = 0;
@@ -25782,11 +26708,11 @@ qwx_radiotap_attach(struct qwx_softc *sc)
 
 	sc->sc_rxtap_len = sizeof(sc->sc_rxtapu);
 	sc->sc_rxtap.wr_ihdr.it_len = htole16(sc->sc_rxtap_len);
-	sc->sc_rxtap.wr_ihdr.it_present = htole32(IWX_RX_RADIOTAP_PRESENT);
+	sc->sc_rxtap.wr_ihdr.it_present = htole32(QWX_RX_RADIOTAP_PRESENT);
 
 	sc->sc_txtap_len = sizeof(sc->sc_txtapu);
 	sc->sc_txtap.wt_ihdr.it_len = htole16(sc->sc_txtap_len);
-	sc->sc_txtap.wt_ihdr.it_present = htole32(IWX_TX_RADIOTAP_PRESENT);
+	sc->sc_txtap.wt_ihdr.it_present = htole32(QWX_TX_RADIOTAP_PRESENT);
 }
 #endif
 
@@ -25800,6 +26726,8 @@ qwx_attach(struct qwx_softc *sc)
 	task_set(&sc->init_task, qwx_init_task, sc);
 	task_set(&sc->newstate_task, qwx_newstate_task, sc);
 	task_set(&sc->setkey_task, qwx_setkey_task, sc);
+	task_set(&sc->ba_task, qwx_ba_task, sc);
+	task_set(&sc->bgscan_task, qwx_bgscan_task, sc);
 	timeout_set_proc(&sc->scan.timeout, qwx_scan_timeout, sc);
 #if NBPFILTER > 0
 	qwx_radiotap_attach(sc);
@@ -25808,6 +26736,7 @@ qwx_attach(struct qwx_softc *sc)
 		sc->pdevs[i].sc = sc;
 
 	TAILQ_INIT(&sc->vif_list);
+	TAILQ_INIT(&sc->peers);
 
 	error = qwx_init(ifp);
 	if (error)
@@ -25822,6 +26751,8 @@ qwx_attach(struct qwx_softc *sc)
 void
 qwx_detach(struct qwx_softc *sc)
 {
+	qwx_free_peers(sc);
+
 	if (sc->fwmem) {
 		qwx_dmamem_free(sc->sc_dmat, sc->fwmem);
 		sc->fwmem = NULL;
@@ -25903,6 +26834,10 @@ qwx_activate(struct device *self, int act)
 		}
 		break;
 	case DVACT_RESUME:
+		err = qwx_hal_srng_init(sc);
+		if (err)
+			printf("%s: could not initialize hal\n",
+			    sc->sc_dev.dv_xname);
 		break;
 	case DVACT_WAKEUP:
 		if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP) {

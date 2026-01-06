@@ -1,4 +1,4 @@
-/*	$OpenBSD: sysctl.c,v 1.265 2025/04/29 02:24:32 tedu Exp $	*/
+/*	$OpenBSD: sysctl.c,v 1.269 2025/12/27 22:25:31 kn Exp $	*/
 /*	$NetBSD: sysctl.c,v 1.9 1995/09/30 07:12:50 thorpej Exp $	*/
 
 /*
@@ -75,7 +75,6 @@
 
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
-#include <netinet6/ip6_divert.h>
 
 #include <netmpls/mpls.h>
 
@@ -200,7 +199,6 @@ int sysctl_link(char *, char **, int *, int, int *);
 int sysctl_bpf(char *, char **, int *, int, int *);
 int sysctl_mpls(char *, char **, int *, int, int *);
 int sysctl_pipex(char *, char **, int *, int, int *);
-int sysctl_fs(char *, char **, int *, int, int *);
 static int sysctl_vfs(char *, char **, int[], int, int *);
 static int sysctl_vfsgen(char *, char **, int[], int, int *);
 int sysctl_bios(char *, char **, int *, int, int *);
@@ -297,7 +295,7 @@ main(int argc, char *argv[])
 
 		while (getline(&line, &sz, fp) != -1) {
 			lp = line + strspn(line, " \t");
-			line[strcspn(line, " \t\n#")] = '\0';
+			lp[strcspn(lp, " \t\n#")] = '\0';
 
 			if (lp[0] != '\0')
 				parse(line, 1);
@@ -695,13 +693,8 @@ parse(char *string, int flags)
 			if (len < 0)
 				return;
 
-			if (mib[2] == IPPROTO_IPV6 &&
-			    mib[3] == IPV6CTL_SOIIKEY)
-				special |= HEX;
-
 			if ((mib[2] == IPPROTO_IPV6 && mib[3] == IPV6CTL_MRTMFC) ||
-			    (mib[2] == IPPROTO_IPV6 && mib[3] == IPV6CTL_MRTMIF) ||
-			    (mib[2] == IPPROTO_DIVERT && mib[3] == DIVERT6CTL_STATS)) {
+			    (mib[2] == IPPROTO_IPV6 && mib[3] == IPV6CTL_MRTMIF)) {
 				if (flags == 0)
 					return;
 				warnx("use netstat to view %s information",
@@ -2170,7 +2163,6 @@ sysctl_inet(char *string, char **bufpp, int mib[], int flags, int *typep)
 struct ctlname inet6name[] = CTL_IPV6PROTO_NAMES;
 struct ctlname ip6name[] = IPV6CTL_NAMES;
 struct ctlname icmp6name[] = ICMPV6CTL_NAMES;
-struct ctlname divert6name[] = DIVERT6CTL_NAMES;
 struct list inet6list = { inet6name, IPV6PROTO_MAXID };
 struct list inet6vars[] = {
 /*0*/	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
@@ -2251,7 +2243,7 @@ struct list inet6vars[] = {
 	{ 0, 0 },
 	{ 0, 0 },
 	{ 0, 0 },
-	{ divert6name, DIVERT6CTL_MAXID },
+	{ 0, 0 },
 };
 
 /*

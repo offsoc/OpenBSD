@@ -1,4 +1,4 @@
-/*	$OpenBSD: tcp_usrreq.c,v 1.248 2025/05/21 09:33:49 mvs Exp $	*/
+/*	$OpenBSD: tcp_usrreq.c,v 1.253 2025/10/24 15:09:56 bluhm Exp $	*/
 /*	$NetBSD: tcp_usrreq.c,v 1.20 1996/02/13 23:44:16 christos Exp $	*/
 
 /*
@@ -72,18 +72,14 @@
 #include <sys/systm.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 #include <sys/protosw.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/domain.h>
-#include <sys/kernel.h>
 #include <sys/pool.h>
-#include <sys/proc.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/route.h>
 
 #include <netinet/in.h>
 #include <netinet/in_var.h>
@@ -135,6 +131,7 @@ const struct pr_usrreqs tcp_usrreqs = {
 	.pru_control	= in_control,
 	.pru_sockaddr	= tcp_sockaddr,
 	.pru_peeraddr	= tcp_peeraddr,
+	.pru_flowid	= in_flowid,
 };
 
 #ifdef INET6
@@ -156,9 +153,11 @@ const struct pr_usrreqs tcp6_usrreqs = {
 	.pru_control	= in6_control,
 	.pru_sockaddr	= tcp_sockaddr,
 	.pru_peeraddr	= tcp_peeraddr,
+	.pru_flowid	= in_flowid,
 };
 #endif
 
+#ifndef SMALL_KERNEL
 const struct sysctl_bounded_args tcpctl_vars[] = {
 	{ TCPCTL_KEEPINITTIME, &tcp_keepinit_sec, 1,
 	    3 * TCPTV_KEEPINIT / TCP_TIME(1) },
@@ -180,6 +179,7 @@ const struct sysctl_bounded_args tcpctl_vars[] = {
 	{ TCPCTL_ALWAYS_KEEPALIVE, &tcp_always_keepalive, 0, 1 },
 	{ TCPCTL_TSO, &tcp_do_tso, 0, 1 },
 };
+#endif /* SMALL_KERNEL */
 
 struct	inpcbtable tcbtable;
 #ifdef INET6
@@ -1214,7 +1214,7 @@ tcp_ident(void *oldp, size_t *oldlenp, void *newp, size_t newlen, int dodrop)
 		struct tcpcb *tp = NULL;
 
 		if (inp != NULL) {
-			so = in_pcbsolock_ref(inp);
+			so = in_pcbsolock(inp);
 			if (so != NULL)
 				tp = intotcpcb(inp);
 		}
@@ -1223,7 +1223,7 @@ tcp_ident(void *oldp, size_t *oldlenp, void *newp, size_t newlen, int dodrop)
 		else
 			error = ESRCH;
 
-		in_pcbsounlock_rele(inp, so);
+		in_pcbsounlock(inp, so);
 		NET_UNLOCK_SHARED();
 		in_pcbunref(inp);
 		return (error);
@@ -1246,7 +1246,7 @@ tcp_ident(void *oldp, size_t *oldlenp, void *newp, size_t newlen, int dodrop)
 	}
 
 	if (inp != NULL)
-		so = in_pcbsolock_ref(inp);
+		so = in_pcbsolock(inp);
 
 	if (so != NULL && ISSET(so->so_state, SS_CONNECTOUT)) {
 		tir.ruid = so->so_ruid;
@@ -1256,7 +1256,7 @@ tcp_ident(void *oldp, size_t *oldlenp, void *newp, size_t newlen, int dodrop)
 		tir.euid = -1;
 	}
 
-	in_pcbsounlock_rele(inp, so);
+	in_pcbsounlock(inp, so);
 	NET_UNLOCK_SHARED();
 	in_pcbunref(inp);
 
@@ -1264,6 +1264,7 @@ tcp_ident(void *oldp, size_t *oldlenp, void *newp, size_t newlen, int dodrop)
 	return copyout(&tir, oldp, sizeof(tir));
 }
 
+#ifndef SMALL_KERNEL
 int
 tcp_sysctl_tcpstat(void *oldp, size_t *oldlenp, void *newp)
 {
@@ -1332,6 +1333,7 @@ tcp_sysctl_tcpstat(void *oldp, size_t *oldlenp, void *newp)
 	ASSIGN(tcps_preddat);
 	ASSIGN(tcps_pcbhashmiss);
 	ASSIGN(tcps_noport);
+	ASSIGN(tcps_closing);
 	ASSIGN(tcps_badsyn);
 	ASSIGN(tcps_dropsyn);
 	ASSIGN(tcps_rcvbadsig);
@@ -1554,6 +1556,7 @@ tcp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	}
 	/* NOTREACHED */
 }
+#endif /* SMALL_KERNEL */
 
 /*
  * Scale the send buffer so that inflight data is not accounted against

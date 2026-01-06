@@ -1,4 +1,4 @@
-$OpenBSD: usbdevs,v 1.777 2025/05/23 03:04:43 kevlo Exp $
+$OpenBSD: usbdevs,v 1.784 2025/12/28 14:48:54 kettenis Exp $
 /* $NetBSD: usbdevs,v 1.322 2003/05/10 17:47:14 hamajima Exp $ */
 
 /*
@@ -517,7 +517,7 @@ vendor TSUNAMI		0x1241	Tsunami
 vendor PHEENET		0x124a	Pheenet
 vendor RAPTORGAMING	0x1267	Raptor Gaming
 vendor TWINMOS		0x126f	TwinMOS
-vendor TENDA		0x1286	Tenda
+vendor MARVELL2		0x1286	Marvell
 vendor TESTO		0x128d	Testo AG
 vendor CREATIVE2	0x1292	Creative Labs
 vendor BELKIN2		0x1293	Belkin Components
@@ -576,6 +576,7 @@ vendor WIENERPLEINBAUS	0x16dc	WIENER Plein & Baus
 vendor AXESSTEL		0x1726	Axesstel
 vendor LINKSYS4		0x1737	Linksys
 vendor SENAO		0x1740	Senao
+vendor DMAX		0x174f	D-Max
 vendor ASUS2		0x1761	ASUS
 vendor STRAWBERRYLINUX	0x1774	Strawberry linux Co., Ltd.
 vendor SWEEX2		0x177f	Sweex
@@ -2830,6 +2831,7 @@ product MACALLY MOUSE1		0x0101	mouse
 
 /* Marvell products */
 product MARVELL SHEEVAPLUG	0x9e8f	SheevaPlug
+product MARVELL2 TWL541U	0x1fab	TWL541U WLAN
 
 /* Matrix Orbital products */
 product MATRIXORB LCD_0100	0x0100	LCD
@@ -3108,6 +3110,7 @@ product MEDIATEK UMASS		0x0002	USB MSM installer
 product MEDIATEK DC_4COM	0x00a5	UMTS USB modem
 product MEDIATEK MT7601_1	0x760a	MT7601
 product MEDIATEK MT7601_2	0x760b	MT7601
+product MEDIATEK MT7612		0x7612	MT7612
 
 /* MEI products */
 product MEI CASHFLOW_SC		0x1100	Cashflow-SC
@@ -3168,7 +3171,7 @@ product MGE UPS2		0xffff	UPS
 product MICROCHIP USBLCD20X2	0x0002	USB-LCD-20x2
 product MICROCHIP USBLCD256X64	0xc002	USB-LCD-256x64
 
-/* Microdia / Sonix Techonology Co., Ltd. products */
+/* Microdia / Sonix Technology Co., Ltd. products */
 product MICRODIA YUREX		0x1010	YUREX
 product MICRODIA CAM_1		0x62c0	CAM_1
 product MICRODIA TEMPER		0x7401	TEMPer sensor
@@ -3789,6 +3792,7 @@ product QUECTEL AG525R		0x0455	AG550R
 product QUECTEL EG12		0x0512	EG12/EM12/EG18
 product QUECTEL EG20		0x0620	EG20
 product QUECTEL BG95		0x0700	BG95/BG77/BG600L-M3/BC69
+product QUECTEL EC200A		0x6005	EC200A
 product QUECTEL RG5XXQ		0x0800	RG500Q/RM500Q/RG510Q/RM510Q
 
 /* Quickshot products */
@@ -4461,9 +4465,6 @@ product TEKRAM ZD1211_2		0x6630	ZD1211
 /* Telex Communications products */
 product TELEX MIC1		0x0001	Microphone
 
-/* Tenda */
-product TENDA TWL541U		0x1fab	TWL541U WLAN
-
 /* Ten X Technology, Inc. */
 product TENX MISSILE		0x0202	Missile Launcher
 product TENX TEMPER		0x660c	TEMPer sensor
@@ -4712,6 +4713,7 @@ product WCH CH341		0x5523	CH341 serial/parallel
 product WCH2 CH341A		0x5523	CH341A serial/parallel
 product WCH2 CH343		0x55d3	CH343 serial/parallel
 product WCH2 CH9102		0x55d4	CH9102 serial/parallel
+product WCH2 CH340K		0x7522	CH340K serial/parallel
 product WCH2 CH340		0x7523	CH340 serial/parallel
 product	WCH2 TEMPER		0xe025	TEMPer sensor
 

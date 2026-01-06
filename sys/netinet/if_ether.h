@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ether.h,v 1.94 2025/03/02 21:28:32 bluhm Exp $	*/
+/*	$OpenBSD: if_ether.h,v 1.99 2025/12/02 03:24:19 dlg Exp $	*/
 /*	$NetBSD: if_ether.h,v 1.22 1996/05/11 13:00:00 mycroft Exp $	*/
 
 /*
@@ -220,12 +220,12 @@ do {									\
 
 #include <net/if_var.h>	/* for "struct ifnet" */
 
-struct ether_brport {
-	struct mbuf	*(*eb_input)(struct ifnet *, struct mbuf *,
+struct ether_port {
+	struct mbuf	*(*ep_input)(struct ifnet *, struct mbuf *,
 			   uint64_t, void *, struct netstack *);
-	void		(*eb_port_take)(void *);
-	void		(*eb_port_rele)(void *);
-	void		  *eb_port;
+	void		*(*ep_port_take)(void *);
+	void		 (*ep_port_rele)(void *, void *);
+	void		  *ep_port;
 };
 
 /*
@@ -241,8 +241,8 @@ struct	arpcom {
 	int	 ac_multicnt;			/* length of ac_multiaddrs */
 	int	 ac_multirangecnt;		/* number of mcast ranges */
 
-	void	*ac_trunkport;
-	const struct ether_brport *ac_brport;
+	const struct ether_port *ac_trport;
+	const struct ether_port *ac_brport;
 };
 
 extern int arpt_keep;				/* arp resolved cache expire */
@@ -265,7 +265,6 @@ int	revarpwhoami(struct in_addr *, struct ifnet *);
 void	arpinit(void);
 void	arpinput(struct ifnet *, struct mbuf *, struct netstack *);
 void	arprequest(struct ifnet *, u_int32_t *, u_int32_t *, u_int8_t *);
-void	arpwhohas(struct arpcom *, struct in_addr *);
 int	arpproxy(struct in_addr, unsigned int);
 int	arpresolve(struct ifnet *, struct rtentry *, struct mbuf *,
 	    struct sockaddr *, u_char *);
@@ -290,11 +289,11 @@ void	ether_rtrequest(struct ifnet *, int, struct rtentry *);
 char	*ether_sprintf(u_char *);
 
 int	ether_brport_isset(struct ifnet *);
-void	ether_brport_set(struct ifnet *, const struct ether_brport *);
+void	ether_brport_set(struct ifnet *, const struct ether_port *);
 void	ether_brport_clr(struct ifnet *);
-const struct ether_brport *
+const struct ether_port *
 	ether_brport_get(struct ifnet *);
-const struct ether_brport *
+const struct ether_port *
 	ether_brport_get_locked(struct ifnet *);
 
 uint64_t	ether_addr_to_e64(const struct ether_addr *);
@@ -314,6 +313,7 @@ struct ether_extracted {
 };
 
 void ether_extract_headers(struct mbuf *, struct ether_extracted *);
+struct mbuf *ether_offload_ifcap(struct ifnet *, struct mbuf *);
 
 /*
  * Ethernet multicast address structure.  There is one of these for each
@@ -388,7 +388,7 @@ u_int32_t ether_crc32_be(const u_int8_t *, size_t);
 #else /* _KERNEL */
 
 __BEGIN_DECLS
-char *ether_ntoa(struct ether_addr *);
+char *ether_ntoa(const struct ether_addr *);
 struct ether_addr *ether_aton(const char *);
 int ether_ntohost(char *, struct ether_addr *);
 int ether_hostton(const char *, struct ether_addr *);

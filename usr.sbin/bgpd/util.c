@@ -1,4 +1,4 @@
-/*	$OpenBSD: util.c,v 1.95 2025/03/26 15:29:30 claudio Exp $ */
+/*	$OpenBSD: util.c,v 1.98 2025/12/24 07:59:55 claudio Exp $ */
 
 /*
  * Copyright (c) 2006 Claudio Jeker <claudio@openbsd.org>
@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <endian.h>
 #include <errno.h>
+#include <limits.h>
 #include <netdb.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -249,13 +250,8 @@ const char *
 log_roa(struct roa *roa)
 {
 	static char buf[256];
-	char maxbuf[32];
-#if defined(__GNUC__) && __GNUC__ < 4
-	struct bgpd_addr addr = { .aid = roa->aid };
-	addr.v6 = roa->prefix.inet6;
-#else
 	struct bgpd_addr addr = { .aid = roa->aid, .v6 = roa->prefix.inet6 };
-#endif
+	char maxbuf[32];
 
 	maxbuf[0] = '\0';
 	if (roa->prefixlen != roa->maxlen)
@@ -1299,4 +1295,54 @@ get_baudrate(unsigned long long baudrate, char *unit)
 		    baudrate, unit);
 
 	return (bbuf);
+}
+
+/* internal functions needed for bucket sizing, stolen from omalloc.c */
+
+/* using built-in function version */
+__attribute__((const)) static inline unsigned int
+lb(unsigned int x)
+{
+	/* I need an extension just for integer-length (: */
+	return (sizeof(x) * CHAR_BIT - 1) - __builtin_clz(x);
+}
+
+/*
+ * https://pvk.ca/Blog/2015/06/27/linear-log-bucketing-fast-versatile-simple/
+ * via Tony Finch
+ */
+static inline unsigned int
+bin_of(unsigned int size, unsigned int linear, unsigned int subbin)
+{
+	unsigned int mask, rounded, rounded_size;
+	unsigned int n_bits, shift;
+
+	n_bits = lb(size | (1U << linear));
+	shift = n_bits - subbin;
+	mask = (1U << shift) - 1;
+	rounded = size + mask; /* XXX: overflow. */
+
+	rounded_size = rounded & ~mask;
+	return rounded_size;
+}
+
+unsigned int
+bin_of_attrs(unsigned int count)
+{
+	/* 4, 8, 12, ... 60, 64, 72, 80, ... */
+	return bin_of(count, 5, 3);
+}
+
+unsigned int
+bin_of_communities(unsigned int count)
+{
+	/* 8, 16, 24, ... 56, 64, 80, 96, ... */
+	return bin_of(count, 5, 2);
+}
+
+unsigned int
+bin_of_adjout_prefixes(unsigned int count)
+{
+	/* 1, 2, 3, 4, 6, 8, 12, 16, 24, ... */
+	return bin_of(count, 1, 1);
 }

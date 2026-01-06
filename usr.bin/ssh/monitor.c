@@ -1,4 +1,4 @@
-/* $OpenBSD: monitor.c,v 1.247 2024/12/03 22:30:03 jsg Exp $ */
+/* $OpenBSD: monitor.c,v 1.251 2025/12/19 00:56:34 djm Exp $ */
 /*
  * Copyright 2002 Niels Provos <provos@citi.umich.edu>
  * Copyright 2002 Markus Friedl <markus@openbsd.org>
@@ -136,7 +136,8 @@ static char *auth_submethod = NULL;
 static u_int session_id2_len = 0;
 static u_char *session_id2 = NULL;
 static pid_t monitor_child_pid;
-int auth_attempted = 0;
+static int auth_attempted = 0;
+static int invalid_user = 0;
 
 struct mon_table {
 	enum monitor_reqtype type;
@@ -226,7 +227,7 @@ void
 monitor_child_preauth(struct ssh *ssh, struct monitor *pmonitor)
 {
 	struct mon_table *ent;
-	int authenticated = 0, partial = 0;
+	int status, authenticated = 0, partial = 0;
 
 	debug3("preauth child monitor started");
 
@@ -312,11 +313,29 @@ monitor_child_preauth(struct ssh *ssh, struct monitor *pmonitor)
 	while (pmonitor->m_log_recvfd != -1 && monitor_read_log(pmonitor) == 0)
 		;
 
+	/* Wait for the child's exit status */
+	while (waitpid(pmonitor->m_pid, &status, 0) == -1) {
+		if (errno == EINTR)
+			continue;
+		fatal_f("waitpid: %s", strerror(errno));
+	}
+	if (WIFEXITED(status)) {
+		if (WEXITSTATUS(status) != 0)
+			fatal_f("preauth child %ld exited with status %d",
+			    (long)pmonitor->m_pid, WEXITSTATUS(status));
+	} else if (WIFSIGNALED(status)) {
+		fatal_f("preauth child %ld terminated by signal %d",
+		    (long)pmonitor->m_pid, WTERMSIG(status));
+	}
+	debug3_f("preauth child %ld terminated successfully",
+	    (long)pmonitor->m_pid);
+
 	if (pmonitor->m_recvfd >= 0)
 		close(pmonitor->m_recvfd);
 	if (pmonitor->m_log_sendfd >= 0)
 		close(pmonitor->m_log_sendfd);
 	pmonitor->m_sendfd = pmonitor->m_log_recvfd = -1;
+	pmonitor->m_pid = -1;
 }
 
 static void
@@ -511,15 +530,13 @@ monitor_reset_key_state(void)
 }
 
 int
-mm_answer_state(struct ssh *ssh, int sock, struct sshbuf *m)
+mm_answer_state(struct ssh *ssh, int sock, struct sshbuf *unused)
 {
-	struct sshbuf *inc = NULL, *hostkeys = NULL;
+	struct sshbuf *m = NULL, *inc = NULL, *hostkeys = NULL;
 	struct sshbuf *opts = NULL, *confdata = NULL;
 	struct include_item *item = NULL;
 	int postauth;
 	int r;
-
-	sshbuf_reset(m);
 
 	debug_f("config len %zu", sshbuf_len(cfg));
 
@@ -578,9 +595,10 @@ mm_answer_state(struct ssh *ssh, int sock, struct sshbuf *m)
 	sshbuf_free(inc);
 	sshbuf_free(opts);
 	sshbuf_free(confdata);
+	sshbuf_free(hostkeys);
 
 	mm_request_send(sock, MONITOR_ANS_STATE, m);
-
+	sshbuf_free(m);
 	debug3_f("done");
 
 	return (0);
@@ -748,7 +766,7 @@ mm_encode_server_options(struct sshbuf *m)
 		    (r = sshbuf_put_cstring(m, options.x)) != 0) \
 			fatal_fr(r, "assemble %s", #x); \
 	} while (0)
-#define M_CP_STRARRAYOPT(x, nx) do { \
+#define M_CP_STRARRAYOPT(x, nx, clobber) do { \
 		for (i = 0; i < options.nx; i++) { \
 			if ((r = sshbuf_put_cstring(m, options.x[i])) != 0) \
 				fatal_fr(r, "assemble %s", #x); \
@@ -782,6 +800,7 @@ mm_answer_pwnamallow(struct ssh *ssh, int sock, struct sshbuf *m)
 	sshbuf_reset(m);
 
 	if (pwent == NULL) {
+		invalid_user = 1;
 		if ((r = sshbuf_put_u8(m, 0)) != 0)
 			fatal_fr(r, "assemble fakepw");
 		authctxt->pw = fakepw();
@@ -1629,6 +1648,18 @@ void
 monitor_reinit(struct monitor *mon)
 {
 	monitor_openfds(mon, 0);
+}
+
+int
+monitor_auth_attempted(void)
+{
+	return auth_attempted;
+}
+
+int
+monitor_invalid_user(void)
+{
+	return invalid_user;
 }
 
 #ifdef GSSAPI

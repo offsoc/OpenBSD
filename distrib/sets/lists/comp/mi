@@ -306,6 +306,7 @@
 ./usr/include/dev/ic/iha.h
 ./usr/include/dev/ic/imxiicvar.h
 ./usr/include/dev/ic/iosfvar.h
+./usr/include/dev/ic/ispivar.h
 ./usr/include/dev/ic/lancereg.h
 ./usr/include/dev/ic/lancevar.h
 ./usr/include/dev/ic/lemacreg.h
@@ -626,6 +627,7 @@
 ./usr/include/dev/pci/ixgb_ids.h
 ./usr/include/dev/pci/ixgbe.h
 ./usr/include/dev/pci/ixgbe_type.h
+./usr/include/dev/pci/lpssreg.h
 ./usr/include/dev/pci/mpiireg.h
 ./usr/include/dev/pci/neoreg.h
 ./usr/include/dev/pci/pccbbreg.h
@@ -915,8 +917,11 @@
 ./usr/include/fstab.h
 ./usr/include/fts.h
 ./usr/include/ftw.h
-./usr/include/fuse.h
-./usr/include/fuse_opt.h
+./usr/include/fuse
+./usr/include/fuse/fuse.h
+./usr/include/fuse/fuse_common.h
+./usr/include/fuse/fuse_lowlevel.h
+./usr/include/fuse/fuse_opt.h
 ./usr/include/gelf.h
 ./usr/include/getopt.h
 ./usr/include/glob.h
@@ -1077,7 +1082,6 @@
 ./usr/include/netinet6/in6.h
 ./usr/include/netinet6/in6_ifattach.h
 ./usr/include/netinet6/in6_var.h
-./usr/include/netinet6/ip6_divert.h
 ./usr/include/netinet6/ip6_mroute.h
 ./usr/include/netinet6/ip6_var.h
 ./usr/include/netinet6/ip6protosw.h
@@ -1145,6 +1149,7 @@
 ./usr/include/openssl/lhash.h
 ./usr/include/openssl/md4.h
 ./usr/include/openssl/md5.h
+./usr/include/openssl/mlkem.h
 ./usr/include/openssl/modes.h
 ./usr/include/openssl/obj_mac.h
 ./usr/include/openssl/objects.h
@@ -1433,6 +1438,7 @@
 ./usr/include/sys/vnode.h
 ./usr/include/sys/wait.h
 ./usr/include/sys/witness.h
+./usr/include/sys/xcall.h
 ./usr/include/sysexits.h
 ./usr/include/syslog.h
 ./usr/include/tar.h
@@ -1606,12 +1612,10 @@
 ./usr/share/man/man1/libtool.1
 ./usr/share/man/man1/lorder.1
 ./usr/share/man/man1/objdump.1
-./usr/share/man/man1/protoize.1
 ./usr/share/man/man1/ranlib.1
 ./usr/share/man/man1/readelf.1
 ./usr/share/man/man1/rpcgen.1
 ./usr/share/man/man1/strip.1
-./usr/share/man/man1/unprotoize.1
 ./usr/share/man/man1/yacc.1
 ./usr/share/man/man2/__get_tcb.2
 ./usr/share/man/man2/__thrsigdivert.2
@@ -1980,7 +1984,6 @@
 ./usr/share/man/man3/MD5.3
 ./usr/share/man/man3/MD5Init.3
 ./usr/share/man/man3/NAME_CONSTRAINTS_new.3
-./usr/share/man/man3/OBJ_NAME_add.3
 ./usr/share/man/man3/OBJ_create.3
 ./usr/share/man/man3/OBJ_find_sigid_algs.3
 ./usr/share/man/man3/OBJ_nid2obj.3
@@ -1997,12 +2000,11 @@
 ./usr/share/man/man3/OPENSSL_config.3
 ./usr/share/man/man3/OPENSSL_init_crypto.3
 ./usr/share/man/man3/OPENSSL_init_ssl.3
-./usr/share/man/man3/OPENSSL_load_builtin_modules.3
 ./usr/share/man/man3/OPENSSL_malloc.3
 ./usr/share/man/man3/OPENSSL_sk_new.3
 ./usr/share/man/man3/OpenSSL_add_all_algorithms.3
 ./usr/share/man/man3/PEM_ASN1_read.3
-./usr/share/man/man3/PEM_X509_INFO_read.3
+./usr/share/man/man3/PEM_X509_INFO_read_bio.3
 ./usr/share/man/man3/PEM_bytes_read_bio.3
 ./usr/share/man/man3/PEM_read.3
 ./usr/share/man/man3/PEM_read_SSL_SESSION.3
@@ -2062,11 +2064,9 @@
 ./usr/share/man/man3/SHA1Init.3
 ./usr/share/man/man3/SHA256Init.3
 ./usr/share/man/man3/SMIME_crlf_copy.3
-./usr/share/man/man3/SMIME_read_ASN1.3
 ./usr/share/man/man3/SMIME_read_CMS.3
 ./usr/share/man/man3/SMIME_read_PKCS7.3
 ./usr/share/man/man3/SMIME_text.3
-./usr/share/man/man3/SMIME_write_ASN1.3
 ./usr/share/man/man3/SMIME_write_CMS.3
 ./usr/share/man/man3/SMIME_write_PKCS7.3
 ./usr/share/man/man3/SSL_CIPHER_get_name.3
@@ -2218,7 +2218,6 @@
 ./usr/share/man/man3/X509_NAME_new.3
 ./usr/share/man/man3/X509_NAME_print_ex.3
 ./usr/share/man/man3/X509_OBJECT_get0_X509.3
-./usr/share/man/man3/X509_PKEY_new.3
 ./usr/share/man/man3/X509_PUBKEY_new.3
 ./usr/share/man/man3/X509_PURPOSE_set.3
 ./usr/share/man/man3/X509_REQ_add1_attr.3
@@ -2625,7 +2624,6 @@
 ./usr/share/man/man3/getaddrinfo.3
 ./usr/share/man/man3/getbsize.3
 ./usr/share/man/man3/getc.3
-./usr/share/man/man3/getc_unlocked.3
 ./usr/share/man/man3/getcwd.3
 ./usr/share/man/man3/getdelim.3
 ./usr/share/man/man3/getdiskbyname.3
@@ -2838,12 +2836,7 @@
 ./usr/share/man/man3/pthread_cancel.3
 ./usr/share/man/man3/pthread_cleanup_pop.3
 ./usr/share/man/man3/pthread_cleanup_push.3
-./usr/share/man/man3/pthread_cond_broadcast.3
-./usr/share/man/man3/pthread_cond_destroy.3
 ./usr/share/man/man3/pthread_cond_init.3
-./usr/share/man/man3/pthread_cond_signal.3
-./usr/share/man/man3/pthread_cond_timedwait.3
-./usr/share/man/man3/pthread_cond_wait.3
 ./usr/share/man/man3/pthread_condattr_init.3
 ./usr/share/man/man3/pthread_create.3
 ./usr/share/man/man3/pthread_detach.3
@@ -2857,17 +2850,10 @@
 ./usr/share/man/man3/pthread_key_delete.3
 ./usr/share/man/man3/pthread_kill.3
 ./usr/share/man/man3/pthread_main_np.3
-./usr/share/man/man3/pthread_mutex_destroy.3
 ./usr/share/man/man3/pthread_mutex_init.3
-./usr/share/man/man3/pthread_mutex_lock.3
-./usr/share/man/man3/pthread_mutex_unlock.3
 ./usr/share/man/man3/pthread_mutexattr.3
 ./usr/share/man/man3/pthread_once.3
-./usr/share/man/man3/pthread_rwlock_destroy.3
 ./usr/share/man/man3/pthread_rwlock_init.3
-./usr/share/man/man3/pthread_rwlock_rdlock.3
-./usr/share/man/man3/pthread_rwlock_unlock.3
-./usr/share/man/man3/pthread_rwlock_wrlock.3
 ./usr/share/man/man3/pthread_rwlockattr_destroy.3
 ./usr/share/man/man3/pthread_rwlockattr_getpshared.3
 ./usr/share/man/man3/pthread_rwlockattr_init.3
@@ -2886,7 +2872,6 @@
 ./usr/share/man/man3/pthreads.3
 ./usr/share/man/man3/ptsname.3
 ./usr/share/man/man3/putc.3
-./usr/share/man/man3/putc_unlocked.3
 ./usr/share/man/man3/putwc.3
 ./usr/share/man/man3/pw_dup.3
 ./usr/share/man/man3/pw_init.3
@@ -3081,6 +3066,7 @@
 ./usr/share/man/man3/wscanf.3
 ./usr/share/man/man3/xdr.3
 ./usr/share/man/man3/yp_bind.3
+./usr/share/man/man4/bcmstbintc.4
 ./usr/share/man/man9/KASSERT.9
 ./usr/share/man/man9/RBT_INIT.9
 ./usr/share/man/man9/SMR_LIST_INIT.9
@@ -3116,6 +3102,7 @@
 ./usr/share/man/man9/config_defer.9
 ./usr/share/man/man9/copy.9
 ./usr/share/man/man9/counters_alloc.9
+./usr/share/man/man9/cpu_xcall.9
 ./usr/share/man/man9/cpumem_get.9
 ./usr/share/man/man9/crypto.9
 ./usr/share/man/man9/delay.9

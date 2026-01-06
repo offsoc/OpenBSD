@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6.c,v 1.270 2025/05/20 05:51:43 bluhm Exp $	*/
+/*	$OpenBSD: in6.c,v 1.277 2026/01/03 14:10:04 bluhm Exp $	*/
 /*	$KAME: in6.c,v 1.372 2004/06/14 08:14:21 itojun Exp $	*/
 
 /*
@@ -73,16 +73,14 @@
 #include <sys/mbuf.h>
 #include <sys/systm.h>
 #include <sys/time.h>
-#include <sys/kernel.h>
 #include <sys/syslog.h>
 
 #include <net/if.h>
-#include <net/if_dl.h>
+#include <net/if_var.h>
 #include <net/if_types.h>
 #include <net/route.h>
 
 #include <netinet/in.h>
-#include <netinet/if_ether.h>
 
 #include <netinet6/in6_var.h>
 #include <netinet/ip6.h>
@@ -1000,11 +998,33 @@ in6_ifinit(struct ifnet *ifp, struct in6_ifaddr *ia6, int newhost)
 }
 
 /*
+ * Look up the in6_multi record for a given IP6 multicast address
+ * on a given interface.  Return the matching record if found or NULL.
+ */
+struct in6_multi *
+in6_lookupmulti(const struct in6_addr *addr, struct ifnet *ifp)
+{
+	struct in6_multi *in6m = NULL;
+	struct ifmaddr *ifma;
+
+	NET_ASSERT_LOCKED();
+
+	TAILQ_FOREACH(ifma, &ifp->if_maddrlist, ifma_list) {
+		if (ifma->ifma_addr->sa_family == AF_INET6 &&
+		    IN6_ARE_ADDR_EQUAL(&ifmatoin6m(ifma)->in6m_addr, addr)) {
+			in6m = ifmatoin6m(ifma);
+			break;
+		}
+	}
+	return (in6m);
+}
+
+/*
  * Add an address to the list of IP6 multicast addresses for a
  * given interface.
  */
 struct in6_multi *
-in6_addmulti(struct in6_addr *maddr6, struct ifnet *ifp, int *errorp)
+in6_addmulti(const struct in6_addr *addr, struct ifnet *ifp, int *errorp)
 {
 	struct	in6_ifreq ifr;
 	struct	in6_multi *in6m;
@@ -1015,7 +1035,7 @@ in6_addmulti(struct in6_addr *maddr6, struct ifnet *ifp, int *errorp)
 	/*
 	 * See if address already in list.
 	 */
-	IN6_LOOKUP_MULTI(*maddr6, ifp, in6m);
+	in6m = in6_lookupmulti(addr, ifp);
 	if (in6m != NULL) {
 		/*
 		 * Found it; just increment the reference count.
@@ -1034,7 +1054,7 @@ in6_addmulti(struct in6_addr *maddr6, struct ifnet *ifp, int *errorp)
 
 		in6m->in6m_sin.sin6_len = sizeof(struct sockaddr_in6);
 		in6m->in6m_sin.sin6_family = AF_INET6;
-		in6m->in6m_sin.sin6_addr = *maddr6;
+		in6m->in6m_sin.sin6_addr = *addr;
 		refcnt_init_trace(&in6m->in6m_refcnt, DT_REFCNT_IDX_IFMADDR);
 		in6m->in6m_ifidx = ifp->if_index;
 		in6m->in6m_ifma.ifma_addr = sin6tosa(&in6m->in6m_sin);
@@ -1107,23 +1127,23 @@ in6_delmulti(struct in6_multi *in6m)
 }
 
 /*
- * Return 1 if the multicast group represented by ``maddr6'' has been
+ * Return 1 if the multicast group represented by ``addr'' has been
  * joined by interface ``ifp'', 0 otherwise.
  */
 int
-in6_hasmulti(struct in6_addr *maddr6, struct ifnet *ifp)
+in6_hasmulti(const struct in6_addr *addr, struct ifnet *ifp)
 {
 	struct in6_multi *in6m;
 	int joined;
 
-	IN6_LOOKUP_MULTI(*maddr6, ifp, in6m);
+	in6m = in6_lookupmulti(addr, ifp);
 	joined = (in6m != NULL);
 
 	return (joined);
 }
 
 struct in6_multi_mship *
-in6_joingroup(struct ifnet *ifp, struct in6_addr *addr, int *errorp)
+in6_joingroup(struct ifnet *ifp, const struct in6_addr *addr, int *errorp)
 {
 	struct in6_multi_mship *imm;
 
@@ -1338,6 +1358,8 @@ in6_ifawithscope(struct ifnet *oifp, const struct in6_addr *dst, u_int rdomain,
 		return (NULL);
 	}
 
+	NET_ASSERT_LOCKED();
+
 	/* We search for all addresses on all interfaces from the beginning. */
 	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
 		if (ifp->if_rdomain != rdomain)
@@ -1425,13 +1447,6 @@ in6_ifawithscope(struct ifnet *oifp, const struct in6_addr *dst, u_int rdomain,
 
 			/* Rule 3: Avoid deprecated addresses. */
 			if (ifatoia6(ifa)->ia6_flags & IN6_IFF_DEPRECATED) {
-				/*
-				 * Ignore any deprecated addresses if
-				 * specified by configuration.
-				 */
-				if (!ip6_use_deprecated)
-					continue;
-
 				/*
 				 * If we have already found a non-deprecated
 				 * candidate, just ignore deprecated addresses.

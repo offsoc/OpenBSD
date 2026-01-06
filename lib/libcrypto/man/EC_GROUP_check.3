@@ -1,4 +1,4 @@
-.\" $OpenBSD: EC_GROUP_check.3,v 1.2 2025/04/28 17:42:42 tb Exp $
+.\" $OpenBSD: EC_GROUP_check.3,v 1.6 2025/07/04 05:16:56 jsg Exp $
 .\"
 .\" Copyright (c) 2025 Theo Buehler <tb@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: April 28 2025 $
+.Dd $Mdocdate: July 4 2025 $
 .Dt EC_GROUP_CHECK 3
 .Os
 .Sh NAME
@@ -24,17 +24,18 @@
 .Vt EC_GROUP
 objects
 .Sh SYNOPSIS
+.Lb libcrypto
 .In openssl/bn.h
 .In openssl/ec.h
 .Pp
 Deprecated:
 .Pp
-.Ft "int"
+.Ft int
 .Fo EC_GROUP_check_discriminant
 .Fa "const EC_GROUP *group"
 .Fa "BN_CTX *ctx"
 .Fc
-.Ft "int"
+.Ft int
 .Fo EC_GROUP_check
 .Fa "const EC_GROUP *group"
 .Fa "BN_CTX *ctx"
@@ -67,7 +68,7 @@ this implies that the Weierstrass equation defines an elliptic curve.
 .Fn EC_GROUP_check
 partially verifies that
 .Fa group
-represents an an elliptic curve and that
+represents an elliptic curve and that
 .Fa generator
 is a point on the curve whose order divides
 .Fa order .
@@ -79,17 +80,19 @@ and then verifies that that
 is non-zero and that the product
 .Fa generator No * Fa order
 is the point at infinity.
-This implies that
+This implies that the
 .Fa order
+set on
+.Fa group
 is an integer multiple of the
 .Fa generator Ns 's
-.Fa order .
+order.
 The verification that
 .Fa p
 is a prime
 and that
 .Fa order
-is the
+is equal to the
 .Fa generator Ns 's
 order are skipped because they are too expensive.
 .Sh RETURN VALUES

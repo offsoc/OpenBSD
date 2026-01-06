@@ -1,4 +1,4 @@
-/*	$OpenBSD: keyword.c,v 1.56 2025/04/29 03:48:10 tedu Exp $	*/
+/*	$OpenBSD: keyword.c,v 1.58 2025/07/02 13:24:48 deraadt Exp $	*/
 /*	$NetBSD: keyword.c,v 1.12.6.1 1996/05/30 21:25:13 cgd Exp $	*/
 
 /*-
@@ -87,8 +87,8 @@ int	utime(), stime(), ixrss(), idrss(), isrss();
 /* Bit types must match their respective entries in struct kinfo_proc */
 /* Entries must be sorted in lexical ascending order! */
 VAR var[] = {
-	{"%cpu", "%CPU", NULL, NLIST, pcpu, 4},
-	{"%mem", "%MEM", NULL, NLIST, pmem, 4},
+	{"%cpu", "%CPU", NULL, 0, pcpu, 4},
+	{"%mem", "%MEM", NULL, 0, pmem, 4},
 	{"acflag", "ACFLG", NULL, 0, pvar, 3, 0, POFF(p_acflag), UINT32, "x"},
 	{"acflg", "", "acflag"},
 	{"args", "", "command"},
@@ -142,7 +142,7 @@ VAR var[] = {
 	{"pending", "", "sig"},
 	PID("pgid", "PGID", pvar, POFF(p__pgid)),
 	PID("pid", "PID", pvar, POFF(p_pid)),
-	{"pledge", "PLEDGE", NULL, LJUST|NLIST, printpledge, 64},
+	{"pledge", "PLEDGE", NULL, LJUST, printpledge, 64},
 	{"pmem", "", "%mem"},
 	PID("ppid", "PPID", pvar, POFF(p_ppid)),
 	{"pri", "PRI", NULL, 0, pri, 3},
@@ -166,7 +166,7 @@ VAR var[] = {
 	{"ssiz", "SSIZ", NULL, 0, ssize, 4},
 	{"start", "STARTED", NULL, LJUST|USER, started, 8},
 	{"stat", "", "state"},
-	{"state", "STAT", NULL, LJUST|NLIST, printstate, 6},
+	{"state", "STAT", NULL, LJUST, printstate, 6},
 	{"supgid", "SUPGID", NULL, LJUST, supgid, 64},
 	{"supgrp", "SUPGRP", NULL, LJUST, supgrp, 64},
 	GID("svgid", "SVGID", pvar, POFF(p_svgid)),
@@ -212,10 +212,11 @@ showkey(void)
 	(void) printf("\n");
 }
 
-void
+int
 parsefmt(char *p)
 {
 	static struct varent *vtail;
+	int rval = 0;
 
 #define	FMTSEP	" \t,\n"
 	while (p && *p) {
@@ -227,7 +228,12 @@ parsefmt(char *p)
 			/* void */;
 		if (!cp)
 			break;
-		if (!(v = findvar(cp)) || v->parsed == 1)
+		v = findvar(cp);
+		if (v == NULL) {
+			rval = 1;
+			continue;
+		}
+		if (v->parsed == 1)
 			continue;
 		v->parsed = 1;
 		if ((vent = malloc(sizeof(struct varent))) == NULL)
@@ -244,6 +250,7 @@ parsefmt(char *p)
 	}
 	if (!vhead)
 		errx(1, "no valid keywords");
+	return rval;
 }
 
 static VAR *
@@ -270,7 +277,6 @@ aliased:
 	}
 	if (!v) {
 		warnx("%s: keyword not found", p);
-		eval = 1;
 		return (NULL);
 	}
 	if (hp)

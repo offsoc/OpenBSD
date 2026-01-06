@@ -1,5 +1,5 @@
 #!/bin/ksh
-#	$OpenBSD: install.sub,v 1.1272 2025/05/20 02:00:14 kn Exp $
+#	$OpenBSD: install.sub,v 1.1283 2025/12/09 05:56:22 afresh1 Exp $
 #
 # Copyright (c) 1997-2015 Todd Miller, Theo de Raadt, Ken Westerback
 # Copyright (c) 2015, Robert Peichaer <rpe@openbsd.org>
@@ -68,7 +68,7 @@ err_exit() {
 
 # Show usage of the installer script and exit.
 usage() {
-	err_exit "usage: ${0##*/} [-ax] [-f filename] [-m install | upgrade]"
+	err_exit "usage: ${0##*/} [-ax] [-f filename]"
 }
 
 # Wait for the ftp(1) process started in start_cgiinfo() to end and extract
@@ -384,8 +384,8 @@ get_ifs_and_lladdrs() {
 get_dkdev_name() {
 	local _dev=${1#/dev/} _d
 
-	_dev=${_dev%.[a-p]}
-	((${#_dev} < 16)) && _dev=${_dev%[a-p]}
+	_dev=${_dev%.[${PARTITIONS}]}
+	((${#_dev} < 16)) && _dev=${_dev%[${PARTITIONS}]}
 	local IFS=,
 	for _d in $(sysctl -n hw.disknames); do
 		[[ $_dev == @(${_d%:*}|${_d#*:}) ]] && echo ${_d%:*} && break
@@ -464,7 +464,7 @@ disklabel_autolayout() {
 	_qst="Use (A)uto layout, (E)dit auto layout, or create (C)ustom layout?"
 	while :; do
 		echo "The auto-allocated layout for $_disk is:"
-		disklabel -h -A $_disk | egrep "^#  |^  [a-p]:"
+		disklabel -h -A $_disk | egrep "^#  |^  [${PARTITIONS}]:"
 		ask "$_qst" a
 		case $resp in
 		[aA]*)	_op=-w;;
@@ -1233,7 +1233,7 @@ v6_config() {
 
 	while :; do
 		ask_until "IPv6 address for $_if? (or 'autoconf' or 'none')" \
-			  "${_addr:-none}"
+			  "${_addr:-autoconf}"
 		case $resp in
 		none)	return
 			;;
@@ -1788,12 +1788,12 @@ install_files() {
 		return
 	fi
 
-	# We are committed to installing new files.  Attempt to cope with
-	# potential space shortage in /usr by deleting a few versioned
-	# areas which will be replaced from the new sets
 	if [[ $MODE == upgrade ]]; then
+		# We are committed to installing new files.  Attempt to cope
+		# with potential space shortage in /usr by deleting a few
+		# versioned areas which will be replaced from the new sets
 		if isin base$VERSION.tgz $_get_sets; then
-			rm -f /mnt/usr/share/relink/usr/lib/*
+			rm -rf /mnt/usr/share/relink/*
 			rm -rf /mnt/usr/lib/libLLVM.so.[0-7].0
 			rm -rf /mnt/usr/libdata/perl5
 		fi
@@ -1804,6 +1804,10 @@ install_files() {
 			# file changed to dir in libc++
 			rm -rf /mnt/usr/include/c++/v1
 		fi
+
+		# From 7.8 onwards, font cache isn't owned by root
+		chown -R _fc-cache:_fc-cache /mnt/var/cache/fontconfig >/dev/null 2>&1
+
 		rm -rf /mnt/var/syspatch/*
 	fi
 
@@ -2114,7 +2118,7 @@ mount_mnt2() {
 	local _dev=$1 _opts _file=/tmp/i/parts.$1 _parts
 
 	disklabel $_dev 2>/dev/null |
-		sed -En '/swap|unused/d;/^  [a-p]: /p' >$_file
+		sed -En "/swap|unused/d;/^  [${PARTITIONS}]: /p" >$_file
 	_parts=$(sed 's/^  \(.\): .*/\1/' $_file)
 	set -- $_parts
 	(($# == 0)) && { echo "No filesystems found on $_dev."; return 1; }
@@ -2128,9 +2132,7 @@ mount_mnt2() {
 	else
 		# Display partitions with filesystems and ask which to use.
 		cat $_file
-		ask_which "$_dev partition" "has the $MODE sets" \
-			'$(disklabel '$_dev' 2>/dev/null |
-			sed -En '\''/swap|unused/d;/^  ([a-p]): .*/s//\1/p'\'')'
+		ask_which "$_dev partition" "has the $MODE sets" "$_parts"
 		[[ $resp == done ]] && return 1
 	fi
 
@@ -2649,9 +2651,6 @@ enable_network() {
 	echo "127.0.0.1\tlocalhost" >/tmp/i/hosts
 	echo "::1\t\tlocalhost" >>/tmp/i/hosts
 
-	_f=/mnt/etc/soii.key
-	[[ -f $_f ]] && sysctl "net.inet6.ip6.soiikey=$(<$_f)"
-
 	enable_ifs
 }
 
@@ -3116,21 +3115,20 @@ do_autoinstall() {
 # otherwise return non-zero.
 pick_keydisk() {
 	KEYDISK=
-	local _disk _label
+	local _disk _label _parts
 
 	ask_which disk 'contains the key disk' '$(rmel $ROOTDISK $(get_dkdevs))'
 	[[ $resp == done ]] && return 1
 	_disk=$resp
 
 	make_dev $_disk
-	if disklabel $_disk 2>/dev/null | ! grep -qw RAID; then
+	_parts=$(disklabel $_disk | sed -En "/RAID/s/^  ([$PARTITIONS]): .*/\1/p")
+	if [[ -z $_parts ]]; then
 		echo "$_disk must contain a RAID partition."
 		return 1
 	fi
 
-	ask_which "$_disk partition" 'is the key disk' \
-		"\$(disklabel $_disk 2>/dev/null |
-		    sed -En 's/^  ([a-p]):.*RAID.*$/\1/p')"
+	ask_which "$_disk partition" 'is the key disk' "$_parts"
 	[[ $resp == done ]] && return 1
 	_label=$resp
 	KEYDISK=$_disk$_label
@@ -3573,17 +3571,20 @@ start_watchdog() {
 # above, so it's safest to put this code here rather than at the top.
 # ------------------------------------------------------------------------------
 
+
+PARTITIONS=a-p
+(( $(sysctl -n kern.maxpartitions) == 52 )) && PARTITIONS=a-zA-Z
+
 # Parse parameters.
 AI=false
 UU=false
 MODE=
 PROGNAME=${0##*/}
 AI_RESPFILE=
-while getopts "af:m:x" opt; do
+while getopts "af:x" opt; do
 	case $opt in
 	a)	AI=true;;
 	f)	AI_RESPFILE=$OPTARG;;
-	m)	MODE=$OPTARG;;
 	x)	UU=true;;
 	*)	usage;;
 	esac
@@ -3718,7 +3719,6 @@ Control-C, but this can leave your system in an inconsistent state.
 
 __EOT
 elif $UU; then
-	MODE=upgrade
 	check_unattendedupgrade || exit 1
 
 	start_watchdog

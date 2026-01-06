@@ -1,4 +1,4 @@
-/*	$OpenBSD: gpt.c,v 1.100 2025/05/25 10:16:22 lucas Exp $	*/
+/*	$OpenBSD: gpt.c,v 1.108 2025/07/31 13:37:06 krw Exp $	*/
 /*
  * Copyright (c) 2015 Markus Muller <mmu@grummel.net>
  * Copyright (c) 2015 Kenneth R Westerback <krw@openbsd.org>
@@ -39,7 +39,7 @@
 #define DPRINTF(x...)	printf(x)
 #else
 #define DPRINTF(x...)
-#endif
+#endif	/* DEBUG */
 
 struct mbr		gmbr;
 struct gpt_header	gh;
@@ -58,6 +58,8 @@ int			  protective_mbr(const struct mbr *);
 int			  gpt_chk_mbr(struct dos_partition *, uint64_t);
 void			  string_to_name(const unsigned int, const char *);
 const char		 *name_to_string(const unsigned int);
+void			  print_free(const uint64_t, const uint64_t,
+    const char *);
 
 void
 string_to_name(const unsigned int pn, const char *ch)
@@ -306,6 +308,17 @@ get_partition_table(void)
 	return rslt;
 }
 
+void
+print_free(const uint64_t start, const uint64_t end, const char *units)
+{
+	float			 size;
+	const struct unit_type	*ut;
+
+	size = units_size(units, end - start + 1, &ut);
+	printf("%4s: Free%-32s [%12llu: %12.0f%s]\n", "", "", start, size,
+	    ut->ut_abbr);
+}
+
 int
 GPT_recover_partition(const char *line1, const char *line2, const char *line3)
 {
@@ -316,7 +329,6 @@ GPT_recover_partition(const char *line1, const char *line2, const char *line3)
 	unsigned int		 pn;
 	int			 error, fields;
 	unsigned int		 i;
-	uint32_t		 status;
 
 	if (line1 == NULL) {
 		/* Try to recover from disk contents. */
@@ -367,23 +379,22 @@ GPT_recover_partition(const char *line1, const char *line2, const char *line3)
 		break;
 	}
 
-	uuid_from_string(type, &type_uuid, &status);
-	if (status != uuid_s_ok) {
-		p = PRT_desc_to_guid(type);
-		if (p)
-			uuid_from_string(p, &type_uuid, &status);
-		if (status != uuid_s_ok)
+	if (string_to_uuid(type, &type_uuid) != uuid_s_ok) {
+		for (i = strlen(type); i > 0; i--) {
+			if (!isspace((unsigned char)type[i - 1]))
+				break;
+			type[i - 1] = '\0';
+		}
+		if ((p = PRT_desc_to_guid(type)) == NULL)
+			return -1;
+		if (string_to_uuid(p, &type_uuid) != uuid_s_ok)
 			return -1;
 	}
 
-	uuid_from_string(guid, &guid_uuid, &status);
-	if (status != uuid_s_ok)
+	if (string_to_uuid(guid, &guid_uuid) != uuid_s_ok)
 		return -1;
-	if (uuid_is_nil(&guid_uuid, NULL)) {
-		uuid_create(&guid_uuid, &status);
-		if (status != uuid_s_ok)
-			return -1;
-	}
+	if (uuid_is_nil(&guid_uuid, NULL))
+		uuid_create(&guid_uuid, NULL);
 
 	if (start == 0) {
 		if (lba_free(&start, NULL) == -1)
@@ -466,19 +477,20 @@ GPT_read(const int which)
 }
 
 void
-GPT_print(const char *units, const int verbosity)
+GPT_print(const char *units)
 {
+	const struct gpt_partition * const *sgp;
 	const struct unit_type	*ut;
 	const int		 secsize = dl.d_secsize;
 	char			*guidstr = NULL;
 	double			 size;
-	unsigned int		 pn;
+	uint64_t		 bs, nextbs;
+	unsigned int		 i, pn;
 	uint32_t		 status;
 
 #ifdef	DEBUG
 	char			*p;
 	uint64_t		 sig;
-	unsigned int		 i;
 
 	sig = htole64(gh.gh_sig);
 	p = (char *)&sig;
@@ -529,16 +541,27 @@ GPT_print(const char *units, const int verbosity)
 		free(guidstr);
 	}
 
-	GPT_print_parthdr(verbosity);
-	for (pn = 0; pn < gh.gh_part_num; pn++) {
-		if (uuid_is_nil(&gp[pn].gp_type, NULL))
-			continue;
-		GPT_print_part(pn, units, verbosity);
+	GPT_print_parthdr();
+
+	sgp = sort_gpt();
+	bs = gh.gh_lba_start;
+	for (i = 0; sgp && sgp[i] != NULL; i++) {
+		for (pn = 0; pn < nitems(gp); pn++) {
+			if (&gp[pn] == sgp[i]) {
+				nextbs = gp[pn].gp_lba_start;
+				if (nextbs > bs)
+					print_free(bs, nextbs - 1, units);
+				GPT_print_part(pn, units);
+				bs = gp[pn].gp_lba_end + 1;
+			}
+		}
 	}
+	if (bs < gh.gh_lba_end)
+		print_free(bs, gh.gh_lba_end, units);
 }
 
 void
-GPT_print_parthdr(const int verbosity)
+GPT_print_parthdr(void)
 {
 	printf("   #: type                                "
 	    " [       start:         size ]\n");
@@ -549,7 +572,7 @@ GPT_print_parthdr(const int verbosity)
 }
 
 void
-GPT_print_part(const unsigned int pn, const char *units, const int verbosity)
+GPT_print_part(const unsigned int pn, const char *units)
 {
 	const struct unit_type	*ut;
 	char			*guidstr = NULL;
@@ -562,7 +585,7 @@ GPT_print_part(const unsigned int pn, const char *units, const int verbosity)
 	size = units_size(units, (start > end) ? 0 : end - start + 1, &ut);
 
 	printf(" %3u: %-36s [%12lld: %12.0f%s]\n", pn,
-	    PRT_uuid_to_desc(&gp[pn].gp_type), start, size, ut->ut_abbr);
+	    PRT_uuid_to_desc(&gp[pn].gp_type, 0), start, size, ut->ut_abbr);
 
 	if (verbosity == VERBOSE) {
 		uuid_to_string(&gp[pn].gp_guid, &guidstr, &status);

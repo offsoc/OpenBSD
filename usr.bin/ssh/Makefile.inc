@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile.inc,v 1.99 2025/04/01 23:23:20 djm Exp $
+#	$OpenBSD: Makefile.inc,v 1.104 2025/10/30 23:19:33 djm Exp $
 
 .include <bsd.own.mk>
 
@@ -15,19 +15,17 @@ CDIAGFLAGS+=	-Wextra
 CDIAGFLAGS+=	-Wformat-security
 CDIAGFLAGS+=	-Wmissing-declarations
 CDIAGFLAGS+=	-Wmissing-prototypes
+CDIAGFLAGS+=	-Wold-style-definition
 CDIAGFLAGS+=	-Wpointer-arith
 CDIAGFLAGS+=	-Wshadow
+CDIAGFLAGS+=	-Wstrict-aliasing=2
 CDIAGFLAGS+=	-Wstrict-prototypes
 CDIAGFLAGS+=	-Wunused
 CDIAGFLAGS+=	-Wno-unused-parameter # Lots of these in protocol handlers.
 .if ${COMPILER_VERSION:L} == "clang"
 CDIAGFLAGS+=	-Widiomatic-parentheses -Wparentheses
 .endif
-.if ${COMPILER_VERSION:L} != "gcc3"
-CDIAGFLAGS+=	-Wstrict-aliasing=2
-CDIAGFLAGS+=	-Wold-style-definition
 CDIAGFLAGS+=	-Werror
-.endif
 
 #DEBUG=-g
 #INSTALL_STRIP=
@@ -95,9 +93,13 @@ SRCS_KEY+=	cipher-chachapoly.c
 .endif
 SRCS_KEY+=	ssh-ed25519.c
 SRCS_KEY+=	ssh-ed25519-sk.c
+
+.if (${OPENSSL:L} == "yes")
+SRCS_KEY+=	ed25519-openssl.c
+.else
 # ed25519, from supercop
 SRCS_KEY+=	ed25519.c
-SRCS_KEY+=	hash.c
+.endif
 
 SRCS_KEYP+=	authfile.c
 SRCS_KEYP+=	sshbuf-io.c
@@ -123,13 +125,12 @@ SRCS_PROT+=	monitor_fdpass.c
 SRCS_PROT+=	nchan.c
 SRCS_PROT+=	ttymodes.c
 
-.if (${OPENSSL:L} == "yes")
 SRCS_PKCS11+=		ssh-pkcs11.c
 SRCS_PKCS11_CLIENT+=	ssh-pkcs11-client.c
+
+.if (${OPENSSL:L} == "yes")
 SRCS_MODULI+=		moduli.c
 .else
-SRCS_PKCS11+=
-SRCS_PKCS11_CLIENT+=
 SRCS_MODULI+=
 .endif
 
@@ -137,17 +138,5 @@ SRCS_SK=		ssh-sk.c
 SRCS_SK+=		sk-usbhid.c
 SRCS_SK_CLIENT=		ssh-sk-client.c
 SRCS_SK_CLIENT+=	msg.c
-
-WITH_XMSS?=	no
-.if (${WITH_XMSS:L} == "yes")
-CFLAGS+=	-DWITH_XMSS
-SRCS_KEY+=	ssh-xmss.c
-SRCS_KEY+=	sshkey-xmss.c
-SRCS_KEY+=	xmss_commons.c
-SRCS_KEY+=	xmss_fast.c
-SRCS_KEY+=	xmss_hash.c
-SRCS_KEY+=	xmss_hash_address.c
-SRCS_KEY+=	xmss_wots.c
-.endif
 
 .include <bsd.obj.mk>

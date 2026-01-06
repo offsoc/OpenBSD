@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.237 2025/05/25 06:27:02 jsing Exp $
+# $OpenBSD: Makefile,v 1.244 2025/09/05 23:30:12 beck Exp $
 
 LIB=	crypto
 LIBREBUILD=y
@@ -25,6 +25,7 @@ CFLAGS+= -DLIBRESSL_NAMESPACE -DLIBRESSL_CRYPTO_NAMESPACE
 CFLAGS+= -DHAVE_FUNOPEN
 
 CFLAGS+= -I${LCRYPTO_SRC}
+CFLAGS+= -I${LCRYPTO_SRC}/aes
 CFLAGS+= -I${LCRYPTO_SRC}/arch/${MACHINE_CPU}
 CFLAGS+= -I${LCRYPTO_SRC}/asn1
 CFLAGS+= -I${LCRYPTO_SRC}/bio
@@ -118,10 +119,8 @@ SRCS+= x_attrib.c
 SRCS+= x_bignum.c
 SRCS+= x_crl.c
 SRCS+= x_exten.c
-SRCS+= x_info.c
 SRCS+= x_long.c
 SRCS+= x_name.c
-SRCS+= x_pkey.c
 SRCS+= x_pubkey.c
 SRCS+= x_req.c
 SRCS+= x_sig.c
@@ -151,7 +150,6 @@ SRCS+= bss_conn.c
 SRCS+= bss_dgram.c
 SRCS+= bss_fd.c
 SRCS+= bss_file.c
-SRCS+= bss_log.c
 SRCS+= bss_mem.c
 SRCS+= bss_null.c
 SRCS+= bss_sock.c
@@ -376,8 +374,9 @@ SRCS+= md4.c
 SRCS+= md5.c
 
 # mlkem/
-SRCS+= mlkem768.c
-SRCS+= mlkem1024.c
+SRCS+= mlkem.c
+SRCS+= mlkem_internal.c
+SRCS+= mlkem_key.c
 
 # modes/
 SRCS+= cbc128.c
@@ -670,9 +669,11 @@ HDRS=\
 	${LCRYPTO_SRC}/lhash/lhash.h \
 	${LCRYPTO_SRC}/md4/md4.h \
 	${LCRYPTO_SRC}/md5/md5.h \
+	${LCRYPTO_SRC}/mlkem/mlkem.h \
 	${LCRYPTO_SRC}/modes/modes.h \
 	${LCRYPTO_SRC}/objects/objects.h \
 	${LCRYPTO_SRC}/ocsp/ocsp.h \
+	${LCRYPTO_SRC}/opensslconf.h \
 	${LCRYPTO_SRC}/opensslfeatures.h \
 	${LCRYPTO_SRC}/opensslv.h \
 	${LCRYPTO_SRC}/ossl_typ.h \
@@ -698,7 +699,6 @@ HDRS=\
 	${LCRYPTO_SRC}/x509/x509v3.h
 
 HDRS_GEN=\
-	${.CURDIR}/arch/${MACHINE_CPU}/opensslconf.h \
 	${.OBJDIR}/obj_mac.h
 
 prereq: obj_mac.h

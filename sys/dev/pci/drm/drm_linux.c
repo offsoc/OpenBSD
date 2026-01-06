@@ -1,4 +1,4 @@
-/*	$OpenBSD: drm_linux.c,v 1.124 2025/06/02 10:25:01 jmatthew Exp $	*/
+/*	$OpenBSD: drm_linux.c,v 1.128 2025/12/01 09:25:03 jsg Exp $	*/
 /*
  * Copyright (c) 2013 Jonathan Gray <jsg@openbsd.org>
  * Copyright (c) 2015, 2016 Mark Kettenis <kettenis@openbsd.org>
@@ -126,7 +126,7 @@ __set_current_state(int state)
 	SCHED_LOCK();
 	unsleep(p);
 	p->p_stat = SONPROC;
-	atomic_clearbits_int(&p->p_flag, P_INSCHED);
+	atomic_clearbits_int(&p->p_flag, P_INSCHED|P_SINTR);
 	SCHED_UNLOCK();
 }
 
@@ -140,15 +140,15 @@ long
 schedule_timeout(long timeout)
 {
 	unsigned long deadline;
-	int timo = 0;
+	uint64_t nsecs = INFSLP;
 
 	KASSERT(!cold);
 
-	if (timeout != MAX_SCHEDULE_TIMEOUT)
-		timo = timeout;
-	if (timeout != MAX_SCHEDULE_TIMEOUT)
+	if (timeout != MAX_SCHEDULE_TIMEOUT) {
 		deadline = jiffies + timeout;
-	sleep_finish(timo, timeout > 0);
+		nsecs = jiffies_to_nsecs(timeout);
+	}
+	sleep_finish(nsecs, timeout > 0);
 	if (timeout != MAX_SCHEDULE_TIMEOUT)
 		timeout = deadline - jiffies;
 
@@ -181,6 +181,15 @@ autoremove_wake_function(struct wait_queue_entry *wqe, unsigned int mode,
 		wake_up_process(wqe->private);
 	list_del_init(&wqe->entry);
 	return 0;
+}
+
+int
+woken_wake_function(struct wait_queue_entry *wqe, unsigned int mode,
+    int sync, void *key)
+{
+	smp_mb();
+	wqe->flags |= WQ_FLAG_WOKEN;
+	return wake_up_process(wqe->private);
 }
 
 void
@@ -1167,13 +1176,6 @@ sg_free_table(struct sg_table *table)
 	    table->orig_nents * sizeof(struct scatterlist));
 	table->orig_nents = 0;
 	table->sgl = NULL;
-}
-
-size_t
-sg_copy_from_buffer(struct scatterlist *sgl, unsigned int nents,
-    const void *buf, size_t buflen)
-{
-	panic("%s", __func__);
 }
 
 int

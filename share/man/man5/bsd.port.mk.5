@@ -1,4 +1,4 @@
-.\" $OpenBSD: bsd.port.mk.5,v 1.650 2025/05/08 10:36:54 sthen Exp $
+.\" $OpenBSD: bsd.port.mk.5,v 1.654 2025/11/04 12:52:28 tb Exp $
 .\"
 .\" Copyright (c) 2000-2008 Marc Espie
 .\"
@@ -24,7 +24,7 @@
 .\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 .\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 .\"
-.Dd $Mdocdate: May 8 2025 $
+.Dd $Mdocdate: November 4 2025 $
 .Dt BSD.PORT.MK 5
 .Os
 .Sh NAME
@@ -1432,8 +1432,6 @@ First element in the list that matches will be chosen.
 gcc 4.2 compiler from base
 .It base-clang
 clang compiler from base
-.It gcc3
-gcc 3 compiler from base
 .It ports-gcc
 gcc 8 compiler from ports
 (heeds
@@ -1447,12 +1445,12 @@ from the module)
 .El
 .Pp
 The first compiler that matches criteria will be chosen.
-On clang-based architectures, even though gcc is still compiled in base,
+On clang-based architectures
 .Sq base-gcc
 never matches.
 .Pp
 Defaults to base compilers, e.g.,
-.Sq base-clang base-gcc gcc3 .
+.Sq base-clang base-gcc .
 .Pp
 Common reasons for explicitly setting
 .Ev COMPILER
@@ -1530,8 +1528,8 @@ preferring various gnu programs, unless
 .Ev BUILD_DEPENDS
 explicitly ask for them.
 Read-only, available for debugging purposes.
-.It Ev CLANG_ARCHS, GCC3_ARCHS , GCC4_ARCHS
-List of architectures using Clang, GCC 3.3.6 or GCC 4.2.1 as the base compiler.
+.It Ev CLANG_ARCHS, GCC4_ARCHS
+List of architectures using Clang or GCC 4.2.1 as the base compiler.
 Read-only.
 Use with
 .Ev NOT_FOR_ARCHS
@@ -1574,6 +1572,9 @@ style.
 .Pp
 If
 .Sq gnu ,
+.Sq autoconf ,
+or
+.Sq autoreconf ,
 assume
 GNU configure style.
 Add
@@ -1587,13 +1588,13 @@ see also
 Add
 .Sq old
 if port is an older autoconf port that does not recognize --sysconfdir.
-Add
+Use
 .Sq autoconf
 if autoconf needs to be rerun first,
 but set
 .Sq no-autoheader
 to prevent autoheader from running.
-Alternatively, add
+Alternatively, use
 .Sq autoreconf
 to rerun autoconf, automake, and related tools to completely regenerate
 the GNU build framework.
@@ -3281,15 +3282,6 @@ to handle this mechanism correctly.
 User settings.
 List of sites to try after normal master sites.
 Normally includes ${SITE_OPENBSD} and ${SITE_FREEBSD}.
-.Po
-For now the ports tree is transitioning from
-.Ev MASTER_SITES*
-to
-.Ev SITES*
-which means that
-.Ev MASTER_SITE_BACKUP
-should be set instead until the transition is complete.
-.Pc
 .It Ev SITE_*
 Lists of standard sites to retrieve files from, refer to
 .Pa ${PORTSDIR}/infrastructure/db/network.conf

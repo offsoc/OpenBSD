@@ -1,4 +1,4 @@
-# $OpenBSD: RAMDISK,v 1.223 2025/04/21 21:11:04 mglocker Exp $
+# $OpenBSD: RAMDISK,v 1.238 2025/12/27 15:01:06 patrick Exp $
 
 machine		arm64
 maxusers	4
@@ -104,7 +104,6 @@ virtio*		at fdt?
 virtio*		at pci?
 vio*		at virtio?
 vioblk*		at virtio?
-viomb*		at virtio?
 viornd*		at virtio?
 vioscsi*	at virtio?
 viogpu*		at virtio?
@@ -162,7 +161,7 @@ imxesdhc*	at fdt?
 sdmmc*		at imxesdhc?
 imxpciephy*	at fdt?
 
-# Raspberry Pi 3/4
+# Raspberry Pi 3/4/5
 bcmaux*		at fdt? early 1
 bcmbsc*		at fdt?
 iic*		at bcmbsc?
@@ -173,16 +172,25 @@ bcmgpio*	at fdt? early 1
 bcmintc*	at fdt? early 1
 bcmirng*	at fdt?
 bcmmbox*	at fdt? early 1
+bcmmip*		at fdt? early 1
 bcmpcie*	at fdt?
 pci*		at bcmpcie?
 bcmrng*		at fdt?
 bcmsdhost*	at fdt?
 sdmmc*		at bcmsdhost?
+bcmstbgpio*	at fdt? early 1
+bcmstbpinctrl*	at fdt? early 1
+bcmstbrescal*	at fdt? early 1
+bcmstbreset*	at fdt? early 1
 bse*		at fdt?
 bse*		at acpi?
 dwctwo*		at fdt?
 usb*		at dwctwo?
+rpone*		at pci?
+rpiclock*	at fdt? early 1
 rpigpio*	at fdt? early 1
+rpipwm*		at fdt?
+rpirtc*		at fdt?
 
 # Amlogic SoCs
 amlclock*	at fdt? early 1
@@ -239,6 +247,7 @@ rkpinctrl*	at fdt? early 1
 rkpciephy*	at fdt? early 1
 rkcomphy*	at fdt? early 1
 rktcphy*	at fdt? early 1
+rkusbdpphy*	at fdt? early 1
 rkusbphy*	at fdt? early 1
 rkemmcphy*	at fdt?
 rkgpio*		at fdt?
@@ -314,6 +323,7 @@ em*		at pci?			# Intel Pro/1000 Ethernet
 igc*		at pci?			# Intel I225 Ethernet
 ix*		at pci?			# Intel 82598EB 10Gb Ethernet
 ixl*		at pci?			# Intel Ethernet 700 Series
+ice*		at pci?			# Intel Ethernet 800 Series
 mcx*		at pci?			# Mellanox ConnectX-4/5 Ethernet
 mskc*		at pci?			# Marvell Yukon-2
 msk*		at mskc?		#  each port of above
@@ -332,6 +342,7 @@ qwx*		at pci?			# Qualcomm 802.11ax
 ahci*		at pci? flags 0x0000	# AHCI SATA controllers
 					# flags 0x0001 to force SATA 1 (1.5Gb/s)
 nvme*		at pci?			# NVMe controllers
+sdhc*		at pci?			# SD Host Controller
 
 # USB Controllers
 ohci*		at pci?			# Open Host Controller
@@ -417,6 +428,7 @@ tipd*		at iic?			# TPS6598x Type-C controller
 
 pseudo-device	loop 1
 pseudo-device	vlan
+pseudo-device	aggr
 pseudo-device	trunk
 pseudo-device	bpfilter 1
 pseudo-device	rd 1

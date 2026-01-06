@@ -1,4 +1,4 @@
-/* $OpenBSD: sftp-client.c,v 1.177 2025/03/11 07:48:51 dtucker Exp $ */
+/* $OpenBSD: sftp-client.c,v 1.181 2025/12/22 01:20:39 djm Exp $ */
 /*
  * Copyright (c) 2001-2004 Damien Miller <djm@openbsd.org>
  *
@@ -561,17 +561,6 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 			    (unsigned long long)limits.read_length,
 			    ret->upload_buflen, ret->download_buflen);
 		}
-
-		/* Use the server limit to scale down our value only */
-		if (num_requests == 0 && limits.open_handles) {
-			ret->num_requests =
-			    MINIMUM(DEFAULT_NUM_REQUESTS, limits.open_handles);
-			if (ret->num_requests == 0)
-				ret->num_requests = 1;
-			debug3("server handle limit %llu; using %u",
-			    (unsigned long long)limits.open_handles,
-			    ret->num_requests);
-		}
 	}
 
 	/* Some filexfer v.0 servers don't support large packets */
@@ -589,6 +578,14 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 	}
 
 	return ret;
+}
+
+void
+sftp_free(struct sftp_conn *conn)
+{
+	if (conn == NULL)
+		return;
+	freezero(conn, sizeof(*conn));
 }
 
 u_int
@@ -1118,7 +1115,7 @@ sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	attr.flags |= SSH2_FILEXFER_ATTR_PERMISSIONS;
 
 	if ((msg = sshbuf_new()) == NULL)
-		fatal("%s: sshbuf_new failed", __func__);
+		fatal_f("sshbuf_new failed");
 
 	attrib_clear(&junk); /* Send empty attributes */
 
@@ -1129,7 +1126,7 @@ sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	    (r = sshbuf_put_cstring(msg, oldpath)) != 0 ||
 	    (r = sshbuf_put_u32(msg, SSH2_FXF_READ)) != 0 ||
 	    (r = encode_attrib(msg, &junk)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
 	send_msg(conn, msg);
 	debug3("Sent message SSH2_FXP_OPEN I:%u P:%s", id, oldpath);
 
@@ -1150,7 +1147,7 @@ sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	    (r = sshbuf_put_u32(msg, SSH2_FXF_WRITE|SSH2_FXF_CREAT|
 	    SSH2_FXF_TRUNC)) != 0 ||
 	    (r = encode_attrib(msg, &attr)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
 	send_msg(conn, msg);
 	debug3("Sent message SSH2_FXP_OPEN I:%u P:%s", id, newpath);
 
@@ -1174,7 +1171,7 @@ sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	    (r = sshbuf_put_u64(msg, 0)) != 0 ||
 	    (r = sshbuf_put_string(msg, new_handle, new_handle_len)) != 0 ||
 	    (r = sshbuf_put_u64(msg, 0)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
 	send_msg(conn, msg);
 	debug3("Sent message copy-data \"%s\" 0 0 -> \"%s\" 0",
 	       oldpath, newpath);
@@ -2010,7 +2007,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
     int fsync_flag, int inplace_flag)
 {
 	int r, local_fd;
-	u_int openmode, id, status = SSH2_FX_OK, reordered = 0;
+	u_int openmode, id, status = SSH2_FX_OK, status2, reordered = 0;
 	off_t offset, progress_counter;
 	u_char type, *handle, *data;
 	struct sshbuf *msg;
@@ -2147,9 +2144,11 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				fatal("Expected SSH2_FXP_STATUS(%d) packet, "
 				    "got %d", SSH2_FXP_STATUS, type);
 
-			if ((r = sshbuf_get_u32(msg, &status)) != 0)
+			if ((r = sshbuf_get_u32(msg, &status2)) != 0)
 				fatal_fr(r, "parse status");
-			debug3("SSH2_FXP_STATUS %u", status);
+			debug3("SSH2_FXP_STATUS %u", status2);
+			if (status2 != SSH2_FX_OK)
+				status = status2; /* remember errors */
 
 			/* Find the request in our queue */
 			if ((ack = request_find(&acks, rid)) == NULL)

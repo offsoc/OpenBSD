@@ -1,4 +1,4 @@
-/*	$OpenBSD: virtio.c,v 1.37 2025/01/09 10:55:22 sf Exp $	*/
+/*	$OpenBSD: virtio.c,v 1.39 2025/09/16 12:18:10 hshoexer Exp $	*/
 /*	$NetBSD: virtio.c,v 1.3 2011/11/02 23:05:52 njoly Exp $	*/
 
 /*
@@ -48,7 +48,7 @@ void		 vq_free_entry(struct virtqueue *, struct vq_entry *);
 struct vq_entry	*vq_alloc_entry(struct virtqueue *);
 
 struct cfdriver virtio_cd = {
-	NULL, "virtio", DV_DULL
+	NULL, "virtio", DV_DULL, CD_COCOVM
 };
 
 static const char * const virtio_device_name[] = {
@@ -387,9 +387,15 @@ virtio_alloc_vq(struct virtio_softc *sc, struct virtqueue *vq, int index,
 		allocsize3 = 0;
 	allocsize = allocsize1 + allocsize2 + allocsize3;
 
-	/* alloc and map the memory */
-	r = bus_dmamem_alloc(sc->sc_dmat, allocsize, VIRTIO_PAGE_SIZE, 0,
-	    &vq->vq_segs[0], 1, &rsegs, BUS_DMA_NOWAIT);
+	/*
+	 * alloc and map the memory
+	 *
+	 * With virtio 0.9, the ring memory must be in the lowest 2^32
+	 * pages. For simplicity, we use this limit even for virtio 1.0.
+	 */
+	r = bus_dmamem_alloc_range(sc->sc_dmat, allocsize, VIRTIO_PAGE_SIZE, 0,
+	    &vq->vq_segs[0], 1, &rsegs, BUS_DMA_NOWAIT, 0,
+	    ((uint64_t)VIRTIO_PAGE_SIZE << 32) - 1);
 	if (r != 0) {
 		printf("virtqueue %d for %s allocation failed, error %d\n",
 		       index, name, r);
@@ -403,7 +409,7 @@ virtio_alloc_vq(struct virtio_softc *sc, struct virtqueue *vq, int index,
 		goto err;
 	}
 	r = bus_dmamap_create(sc->sc_dmat, allocsize, 1, allocsize, 0,
-	    BUS_DMA_NOWAIT, &vq->vq_dmamap);
+	    BUS_DMA_NOWAIT | BUS_DMA_64BIT, &vq->vq_dmamap);
 	if (r != 0) {
 		printf("virtqueue %d for %s dmamap creation failed, "
 		    "error %d\n", index, name, r);

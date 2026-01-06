@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmm.c,v 1.131 2025/05/12 17:17:42 dv Exp $	*/
+/*	$OpenBSD: vmm.c,v 1.134 2025/09/24 15:27:19 dv Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -95,12 +95,11 @@ int
 vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
 	struct privsep		*ps = p->p_ps;
-	int			 res = 0, cmd = 0, verbose;
+	int			 res = 0, cmd = IMSG_NONE, verbose;
 	struct vmd_vm		*vm = NULL;
 	struct vm_terminate_params vtp;
 	struct vmop_id		 vid;
 	struct vmop_result	 vmr;
-	struct vmop_create_params vmc;
 	struct vmop_addr_result  var;
 	uint32_t		 id = 0, vm_id, type;
 	pid_t			 pid, vm_pid = 0;
@@ -250,43 +249,6 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		imsg_compose_event(&vm->vm_iev, type, -1, pid,
 		    imsg_get_fd(imsg), &vid, sizeof(vid));
 		break;
-	case IMSG_VMDOP_SEND_VM_REQUEST:
-		vmop_id_read(imsg, &vid);
-		id = vid.vid_id;
-		if ((vm = vm_getbyvmid(id)) == NULL) {
-			res = ENOENT;
-			close(imsg_get_fd(imsg));	/* XXX */
-			cmd = IMSG_VMDOP_START_VM_RESPONSE;
-			break;
-		}
-		imsg_compose_event(&vm->vm_iev, type, -1, pid,
-		    imsg_get_fd(imsg), &vid, sizeof(vid));
-		break;
-	case IMSG_VMDOP_RECEIVE_VM_REQUEST:
-		vmop_create_params_read(imsg, &vmc);
-		if (vm_register(ps, &vmc, &vm, vm_id, vmc.vmc_owner.uid) != 0) {
-			res = errno;
-			cmd = IMSG_VMDOP_START_VM_RESPONSE;
-			break;
-		}
-		vm->vm_tty = imsg_get_fd(imsg);
-		vm->vm_state |= VM_STATE_RECEIVED;
-		vm->vm_state |= VM_STATE_PAUSED;
-		break;
-	case IMSG_VMDOP_RECEIVE_VM_END:
-		if ((vm = vm_getbyvmid(vm_id)) == NULL) {
-			res = ENOENT;
-			close(imsg_get_fd(imsg));	/* XXX */
-			cmd = IMSG_VMDOP_START_VM_RESPONSE;
-			break;
-		}
-		vm->vm_receive_fd = imsg_get_fd(imsg);
-		res = vmm_start_vm(imsg, &id, &pid);
-		/* Check if the ID can be mapped correctly */
-		if ((id = vm_id2vmid(id, NULL)) == 0)
-			res = ENOENT;
-		cmd = IMSG_VMDOP_START_VM_RESPONSE;
-		break;
 	case IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE:
 		vmop_addr_result_read(imsg, &var);
 		if ((vm = vm_getbyvmid(var.var_vmid)) == NULL) {
@@ -336,12 +298,12 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		vmr.vmr_result = res;
 		vmr.vmr_id = id;
 		vmr.vmr_pid = vm_pid;
-		if (proc_compose_imsg(ps, PROC_PARENT, -1, cmd, vm_id, -1, &vmr,
+		if (proc_compose_imsg(ps, PROC_PARENT, cmd, vm_id, -1, &vmr,
 		    sizeof(vmr)) == -1)
 			return (-1);
 		break;
 	default:
-		if (proc_compose_imsg(ps, PROC_PARENT, -1, cmd, vm_id, -1, &res,
+		if (proc_compose_imsg(ps, PROC_PARENT, cmd, vm_id, -1, &res,
 		    sizeof(res)) == -1)
 			return (-1);
 		break;
@@ -401,9 +363,8 @@ vmm_sighdlr(int sig, short event, void *arg)
 				vmr.vmr_result = ret;
 				vmr.vmr_id = vm_id2vmid(vmid, vm);
 				if (proc_compose_imsg(ps, PROC_PARENT,
-				    -1, IMSG_VMDOP_TERMINATE_VM_EVENT,
-				    vm->vm_peerid, -1,
-				    &vmr, sizeof(vmr)) == -1)
+				    IMSG_VMDOP_TERMINATE_VM_EVENT,
+				    vm->vm_peerid, -1, &vmr, sizeof(vmr)) == -1)
 					log_warnx("could not signal "
 					    "termination of VM %u to "
 					    "parent", vm->vm_vmid);
@@ -523,7 +484,6 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 		case IMSG_VMDOP_VM_REBOOT:
 			vm->vm_state &= ~VM_STATE_SHUTDOWN;
 			break;
-		case IMSG_VMDOP_SEND_VM_RESPONSE:
 		case IMSG_VMDOP_PAUSE_VM_RESPONSE:
 		case IMSG_VMDOP_UNPAUSE_VM_RESPONSE:
 			for (i = 0; i < nitems(procs); i++) {
@@ -644,12 +604,11 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 	}
 	vcp = &vm->vm_params.vmc_params;
 
-	if (!(vm->vm_state & VM_STATE_RECEIVED)) {
-		if ((vm->vm_tty = imsg_get_fd(imsg)) == -1) {
-			log_warnx("%s: can't get tty", __func__);
-			goto err;
-		}
+	if ((vm->vm_tty = imsg_get_fd(imsg)) == -1) {
+		log_warnx("%s: can't get tty", __func__);
+		goto err;
 	}
+
 
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, PF_UNSPEC, fds)
 	    == -1)
@@ -873,7 +832,7 @@ get_info_vm(struct privsep *ps, struct imsg *imsg, int terminate)
 		vir.vir_info.vir_id = vm_id2vmid(info[i].vir_id, NULL);
 		peer_id = imsg_get_id(imsg);
 
-		if (proc_compose_imsg(ps, PROC_PARENT, -1,
+		if (proc_compose_imsg(ps, PROC_PARENT,
 		    IMSG_VMDOP_GET_INFO_VM_DATA, peer_id, -1,
 		    &vir, sizeof(vir)) == -1) {
 			ret = EIO;

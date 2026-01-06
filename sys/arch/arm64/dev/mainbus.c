@@ -1,4 +1,4 @@
-/* $OpenBSD: mainbus.c,v 1.32 2024/11/18 05:32:39 jsg Exp $ */
+/* $OpenBSD: mainbus.c,v 1.35 2026/01/05 20:06:15 patrick Exp $ */
 /*
  * Copyright (c) 2016 Patrick Wildt <patrick@blueri.se>
  * Copyright (c) 2017 Mark Kettenis <kettenis@openbsd.org>
@@ -174,8 +174,7 @@ mainbus_print(void *aux, const char *pnp)
 	if (!pnp)
 		return (QUIET);
 
-	if (OF_getprop(fa->fa_node, "status", buf, sizeof(buf)) > 0 &&
-	    strcmp(buf, "disabled") == 0)
+	if (!OF_is_enabled(fa->fa_node))
 		return (QUIET);
 
 	if (OF_getprop(fa->fa_node, "name", buf, sizeof(buf)) > 0) {
@@ -300,10 +299,8 @@ mainbus_match_status(struct device *parent, void *match, void *aux)
 	struct mainbus_softc *sc = (struct mainbus_softc *)parent;
 	struct fdt_attach_args *fa = aux;
 	struct cfdata *cf = match;
-	char buf[32];
 
-	if (OF_getprop(fa->fa_node, "status", buf, sizeof(buf)) > 0 &&
-	    strcmp(buf, "disabled") == 0)
+	if (!OF_is_enabled(fa->fa_node))
 		return 0;
 
 	if (cf->cf_loc[0] == sc->sc_early)
@@ -413,13 +410,30 @@ mainbus_attach_apm(struct device *self)
 void
 mainbus_attach_framebuffer(struct device *self)
 {
+	struct mainbus_softc *sc = (struct mainbus_softc *)self;
 	int node = OF_finddevice("/chosen");
+	int acells, scells;
 
 	if (node == -1)
 		return;
 
-	for (node = OF_child(node); node != 0; node = OF_peer(node))
-		mainbus_attach_node(self, node, NULL);
+	/*
+	 * On some systems, such as the Raspberry Pi 5B, /chosen has
+	 * its own #address-cells and #size-cells that differ from the
+	 * root node.
+	 */
+	acells = sc->sc_acells;
+	scells = sc->sc_scells;
+	sc->sc_acells = OF_getpropint(node, "#address-cells", acells);
+	sc->sc_scells = OF_getpropint(node, "#size-cells", scells);
+
+	for (node = OF_child(node); node != 0; node = OF_peer(node)) {
+		if (OF_is_compatible(node, "simple-framebuffer"))
+			mainbus_attach_node(self, node, NULL);
+	}
+
+	sc->sc_acells = acells;
+	sc->sc_scells = scells;
 }
 
 void

@@ -1,4 +1,4 @@
-/*	$OpenBSD: pchgpio.c,v 1.16 2024/08/18 11:10:10 kettenis Exp $	*/
+/*	$OpenBSD: pchgpio.c,v 1.19 2025/08/21 03:12:11 jsg Exp $	*/
 /*
  * Copyright (c) 2020 Mark Kettenis
  * Copyright (c) 2020 James Hastings
@@ -69,6 +69,7 @@ struct pchgpio_pincfg {
 struct pchgpio_intrhand {
 	int (*ih_func)(void *);
 	void *ih_arg;
+	int ih_ipl;
 };
 
 struct pchgpio_softc {
@@ -117,6 +118,7 @@ const char *pchgpio_hids[] = {
 	"INTC1055",
 	"INTC1056",
 	"INTC1057",
+	"INTC105E",
 	"INTC1082",
 	"INTC1083",
 	"INTC1085",
@@ -459,11 +461,12 @@ struct pchgpio_match pchgpio_devices[] = {
 	{ "INTC1085", &adl_s_device },
 	{ "INTC1082", &mtl_s_device },
 	{ "INTC1083", &mtl_p_device },
+	{ "INTC105E", &mtl_p_device },
 };
 
 int	pchgpio_read_pin(void *, int);
 void	pchgpio_write_pin(void *, int, int);
-void	pchgpio_intr_establish(void *, int, int, int (*)(void *), void *);
+void	pchgpio_intr_establish(void *, int, int, int, int (*)(void *), void *);
 void	pchgpio_intr_enable(void *, int);
 void	pchgpio_intr_disable(void *, int);
 int	pchgpio_intr(void *);
@@ -640,7 +643,7 @@ pchgpio_write_pin(void *cookie, int pin, int value)
 }
 
 void
-pchgpio_intr_establish(void *cookie, int pin, int flags,
+pchgpio_intr_establish(void *cookie, int pin, int flags, int level,
     int (*func)(void *), void *arg)
 {
 	struct pchgpio_softc *sc = cookie;
@@ -661,6 +664,7 @@ pchgpio_intr_establish(void *cookie, int pin, int flags,
 
 	sc->sc_pin_ih[pin].ih_func = func;
 	sc->sc_pin_ih[pin].ih_arg = arg;
+	sc->sc_pin_ih[pin].ih_ipl = level & ~IPL_WAKEUP;
 
 	reg = bus_space_read_4(sc->sc_memt[bar], sc->sc_memh[bar],
 	    sc->sc_padbar[bar] + pad * sc->sc_padsize);
@@ -737,7 +741,7 @@ int
 pchgpio_intr_handle(struct pchgpio_softc *sc, int group, int bit)
 {
 	uint32_t enable;
-	int gpiobase, pin, handled = 0;
+	int gpiobase, pin, s, handled = 0;
 	uint8_t bank, bar;
 
 	bar = sc->sc_device->groups[group].bar;
@@ -746,7 +750,9 @@ pchgpio_intr_handle(struct pchgpio_softc *sc, int group, int bit)
 
 	pin = gpiobase + bit;
 	if (sc->sc_pin_ih[pin].ih_func) {
+		s = splraise(sc->sc_pin_ih[pin].ih_ipl);
 		sc->sc_pin_ih[pin].ih_func(sc->sc_pin_ih[pin].ih_arg);
+		splx(s);
 		handled = 1;
 	} else {
 		/* Mask unhandled interrupt */

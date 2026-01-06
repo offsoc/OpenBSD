@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-pkcs11.h,v 1.7 2023/12/18 14:46:56 djm Exp $ */
+/* $OpenBSD: ssh-pkcs11.h,v 1.10 2025/10/15 23:54:20 djm Exp $ */
 /*
  * Copyright (c) 2010 Markus Friedl.  All rights reserved.
  *
@@ -15,6 +15,8 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+/* API for ssh-pkcs11.c and ssh-pkcs11-client.c */
+
 /* Errors for pkcs11_add_provider() */
 #define	SSH_PKCS11_ERR_GENERIC			1
 #define	SSH_PKCS11_ERR_LOGIN_FAIL		2
@@ -22,10 +24,17 @@
 #define	SSH_PKCS11_ERR_PIN_REQUIRED		4
 #define	SSH_PKCS11_ERR_PIN_LOCKED		5
 
+struct sshkey;
+
 int	pkcs11_init(int);
 void	pkcs11_terminate(void);
 int	pkcs11_add_provider(char *, char *, struct sshkey ***, char ***);
 int	pkcs11_del_provider(char *);
+int	pkcs11_sign(struct sshkey *, u_char **, size_t *,
+	    const u_char *, size_t, const char *, const char *,
+	    const char *, u_int);
+void	pkcs11_key_free(struct sshkey *);
+
 #ifdef WITH_PKCS11_KEYGEN
 struct sshkey *
 	pkcs11_gakp(char *, char *, unsigned int, char *, unsigned int,
@@ -35,9 +44,6 @@ struct sshkey *
 	    u_int32_t *);
 #endif
 
-/* Only available in ssh-pkcs11-client.c so far */
+/* Only available in ssh-pkcs11-client.c */
 int pkcs11_make_cert(const struct sshkey *,
     const struct sshkey *, struct sshkey **);
-#if !defined(WITH_OPENSSL) && defined(ENABLE_PKCS11)
-#undef ENABLE_PKCS11
-#endif

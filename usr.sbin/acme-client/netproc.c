@@ -1,4 +1,4 @@
-/*	$Id: netproc.c,v 1.38 2025/05/20 00:46:50 florian Exp $ */
+/*	$Id: netproc.c,v 1.45 2025/09/16 15:06:02 sthen Exp $ */
 /*
  * Copyright (c) 2016 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -19,6 +19,7 @@
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,14 +89,8 @@ url2host(const char *host, short *port, char **path)
 			warn("strdup");
 			return NULL;
 		}
-	} else if (strncmp(host, "http://", 7) == 0) {
-		*port = 80;
-		if ((url = strdup(host + 7)) == NULL) {
-			warn("strdup");
-			return NULL;
-		}
 	} else {
-		warnx("%s: unknown schema", host);
+		warnx("%s: RFC 8555 requires https for the API server", host);
 		return NULL;
 	}
 
@@ -110,6 +105,21 @@ url2host(const char *host, short *port, char **path)
 		warn("strdup");
 		free(url);
 		return NULL;
+	}
+
+	/* extract port */
+	if ((ep = strchr(url, ':')) != NULL) {
+		const char *errstr;
+
+		*ep = '\0';
+		*port = strtonum(ep + 1, 1, USHRT_MAX, &errstr);
+		if (errstr != NULL) {
+			warn("port is %s: %s", errstr, ep + 1);
+			free(*path);
+			*path = NULL;
+			free(url);
+			return NULL;
+		}
 	}
 
 	return url;
@@ -251,6 +261,7 @@ sreq(struct conn *c, const char *addr, int kid, const char *req, char **loc)
 	struct httphead	*h;
 	ssize_t		 ssz;
 	long		 code;
+	int		 retry = 0;
 
 	if ((host = url2host(c->newnonce, &port, &path)) == NULL)
 		return -1;
@@ -279,6 +290,7 @@ sreq(struct conn *c, const char *addr, int kid, const char *req, char **loc)
 	}
 	http_get_free(g);
 
+ again:
 	/*
 	 * Send the url, nonce and request payload to the acctproc.
 	 * This will create the proper JSON object we need.
@@ -337,6 +349,46 @@ sreq(struct conn *c, const char *addr, int kid, const char *req, char **loc)
 	} else
 		memcpy(c->buf.buf, g->bodypart, c->buf.sz);
 
+	if (code == 400) {
+		struct jsmnn	*j;
+		char		*type;
+
+		j = json_parse(c->buf.buf, c->buf.sz);
+		if (j == NULL) {
+			code = -1;
+			goto out;
+		}
+
+		type = json_getstr(j, "type");
+		json_free(j);
+
+		if (type == NULL) {
+			code = -1;
+			goto out;
+		}
+
+		if (strcmp(type, "urn:ietf:params:acme:error:badNonce") != 0) {
+			free(type);
+			goto out;
+		}
+		free(type);
+
+		if (retry++ < RETRY_MAX) {
+			h = http_head_get("Replay-Nonce", g->head, g->headsz);
+			if (h == NULL) {
+				warnx("no replay nonce");
+				code = -1;
+				goto out;
+			} else if ((nonce = strdup(h->val)) == NULL) {
+				warn("strdup");
+				code = -1;
+				goto out;
+			}
+			http_get_free(g);
+			goto again;
+		}
+	}
+ out:
 	if (loc != NULL) {
 		free(*loc);
 		*loc = NULL;
@@ -441,14 +493,14 @@ dochkacc(struct conn *c, const struct capaths *p, const char *contact)
  */
 static int
 doneworder(struct conn *c, const char *const *alts, size_t altsz,
-    struct order *order, const struct capaths *p)
+    struct order *order, const struct capaths *p, const char *profile)
 {
 	struct jsmnn	*j = NULL;
 	int		 rc = 0;
 	char		*req;
 	long		 lc;
 
-	if ((req = json_fmt_neworder(alts, altsz)) == NULL)
+	if ((req = json_fmt_neworder(alts, altsz, profile)) == NULL)
 		warnx("json_fmt_neworder");
 	else if ((lc = sreq(c, p->neworder, 1, req, &order->uri)) < 0)
 		warnx("%s: bad comm", p->neworder);
@@ -671,7 +723,7 @@ dodirs(struct conn *c, const char *addr, struct capaths *paths)
 int
 netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
     int revocate, struct authority_c *authority,
-    const char *const *alts, size_t altsz)
+    const char *const *alts, size_t altsz, const char *profile)
 {
 	int		 rc = 0, retries = 0;
 	size_t		 i;
@@ -695,7 +747,7 @@ netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
 		goto out;
 	}
 
-	if (http_init() == -1) {
+	if (http_init(authority->insecure) == -1) {
 		warn("http_init");
 		goto out;
 	}
@@ -762,7 +814,7 @@ netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
 	 * Following that, submit the request to the CA then notify the
 	 * certproc, which will in turn notify the fileproc.
 	 * XXX currently we can only sign with the account key, the RFC
-	 * also mentions signing with the privat key of the cert itself.
+	 * also mentions signing with the private key of the cert itself.
 	 */
 	if (revocate) {
 		if ((cert = readstr(rfd, COMM_CSR)) == NULL)
@@ -776,7 +828,7 @@ netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
 
 	memset(&order, 0, sizeof(order));
 
-	if (!doneworder(&c, alts, altsz, &order, &paths))
+	if (!doneworder(&c, alts, altsz, &order, &paths, profile))
 		goto out;
 
 	chngs = calloc(order.authsz, sizeof(struct chng));

@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6_pcb.c,v 1.148 2025/05/04 23:05:17 bluhm Exp $	*/
+/*	$OpenBSD: in6_pcb.c,v 1.152 2025/09/16 09:19:16 florian Exp $	*/
 
 /*
  * Copyright (C) 1995, 1996, 1997, and 1998 WIDE Project.
@@ -107,7 +107,6 @@
 #include <sys/mbuf.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -116,7 +115,6 @@
 #include <netinet/in.h>
 #include <netinet6/in6_var.h>
 #include <netinet/ip.h>
-#include <netinet/ip_var.h>
 #include <netinet6/ip6_var.h>
 #include <netinet/in_pcb.h>
 
@@ -336,10 +334,8 @@ in6_pcbconnect(struct inpcb *inp, struct mbuf *nam)
 	mtx_leave(&table->inpt_mtx);
 
 	inp->inp_flowinfo &= ~IPV6_FLOWLABEL_MASK;
-	if (ip6_auto_flowlabel) {
-		inp->inp_flowinfo |=
-		    (htonl(ip6_randomflowlabel()) & IPV6_FLOWLABEL_MASK);
-	}
+	inp->inp_flowinfo |=
+	    (htonl(ip6_randomflowlabel()) & IPV6_FLOWLABEL_MASK);
 #if NSTOEPLITZ > 0
 	inp->inp_flowid = stoeplitz_ip6port(&inp->inp_faddr6,
 	    &inp->inp_laddr6, inp->inp_fport, inp->inp_lport);
@@ -546,10 +542,10 @@ in6_pcbnotify(struct inpcbtable *table, const struct sockaddr_in6 *dst,
 		}
 	  do_notify:
 		mtx_leave(&table->inpt_mtx);
-		so = in_pcbsolock_ref(inp);
+		so = in_pcbsolock(inp);
 		if (so != NULL)
 			(*notify)(inp, errno);
-		in_pcbsounlock_rele(inp, so);
+		in_pcbsounlock(inp, so);
 		mtx_enter(&table->inpt_mtx);
 	}
 	mtx_leave(&table->inpt_mtx);
@@ -732,10 +728,8 @@ in6_pcbset_addr(struct inpcb *inp, const struct sockaddr_in6 *fsin6,
 	mtx_leave(&table->inpt_mtx);
 
 	inp->inp_flowinfo &= ~IPV6_FLOWLABEL_MASK;
-	if (ip6_auto_flowlabel) {
-		inp->inp_flowinfo |=
-		    (htonl(ip6_randomflowlabel()) & IPV6_FLOWLABEL_MASK);
-	}
+	inp->inp_flowinfo |=
+	    (htonl(ip6_randomflowlabel()) & IPV6_FLOWLABEL_MASK);
 #if NSTOEPLITZ > 0
 	inp->inp_flowid = stoeplitz_ip6port(&inp->inp_faddr6,
 	    &inp->inp_laddr6, inp->inp_fport, inp->inp_lport);

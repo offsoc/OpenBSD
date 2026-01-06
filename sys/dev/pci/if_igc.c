@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_igc.c,v 1.27 2024/08/11 01:02:10 dlg Exp $	*/
+/*	$OpenBSD: if_igc.c,v 1.30 2025/12/17 01:14:42 kevlo Exp $	*/
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
@@ -81,6 +81,7 @@ const struct pci_matchid igc_devices[] = {
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_BLANK_NVM },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_IT },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_LM },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_LMVP },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_K },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_V }
 };
@@ -724,8 +725,8 @@ igc_setup_msix(struct igc_softc *sc)
 	/* Give one vector to events. */
 	nmsix--;
 
-	sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix, IGC_MAX_VECTORS,
-	    INTRMAP_POWEROF2);
+	sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix,
+	    MIN(IGC_MAX_VECTORS, IF_MAX_VECTORS), INTRMAP_POWEROF2);
 	sc->sc_nqueues = intrmap_count(sc->sc_intrmap);
 }
 
@@ -1119,7 +1120,7 @@ igc_txeof(struct igc_txring *txr)
 
 	txr->next_to_clean = cons;
 
-	if (ifq_is_oactive(ifq))
+	if (done && ifq_is_oactive(ifq))
 		ifq_restart(ifq);
 
 	return (done);

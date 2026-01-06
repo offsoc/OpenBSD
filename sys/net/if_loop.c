@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_loop.c,v 1.101 2025/05/09 03:13:51 dlg Exp $	*/
+/*	$OpenBSD: if_loop.c,v 1.103 2025/09/09 09:16:18 bluhm Exp $	*/
 /*	$NetBSD: if_loop.c,v 1.15 1996/05/07 02:40:33 thorpej Exp $	*/
 
 /*
@@ -109,30 +109,16 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/kernel.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/errno.h>
 #include <sys/ioctl.h>
-#include <sys/time.h>
-
 
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/if_types.h>
-#include <net/netisr.h>
 #include <net/rtable.h>
 #include <net/route.h>
-
-#include <netinet/in.h>
-
-#ifdef INET6
-#include <netinet/ip6.h>
-#endif
-
-#ifdef MPLS
-#include <netmpls/mpls.h>
-#endif
 
 #if NBPFILTER > 0
 #include <net/bpf.h>
@@ -192,8 +178,8 @@ loop_clone_create(struct if_clone *ifc, int unit)
 		rtable_l2set(0, 0, ifp->if_index);
 	} else
 		if_attach(ifp);
-	if_attach_queues(ifp, net_sn_count());
-	if_attach_iqueues(ifp, net_sn_count());
+	if_attach_queues(ifp, softnet_count());
+	if_attach_iqueues(ifp, softnet_count());
 	if_alloc_sadl(ifp);
 #if NBPFILTER > 0
 	bpfattach(&ifp->if_bpf, ifp, DLT_LOOP, sizeof(u_int32_t));

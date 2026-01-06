@@ -1,4 +1,4 @@
-/*	$OpenBSD: main.c,v 1.281 2025/04/03 14:29:44 tb Exp $ */
+/*	$OpenBSD: main.c,v 1.303 2025/12/31 12:51:52 tb Exp $ */
 /*
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -57,7 +57,8 @@ int		 talsz;
 size_t	entity_queue;
 int	timeout = 60*60;
 volatile sig_atomic_t killme;
-void	suicide(int sig);
+volatile sig_atomic_t printinfo;
+void	sighandler(int sig);
 
 static struct filepath_tree	fpt = RB_INITIALIZER(&fpt);
 static struct msgbuf		*procq, *rsyncq, *httpq, *rrdpq;
@@ -145,7 +146,8 @@ entity_free(struct entity *ent)
 
 /*
  * Read a queue entity from the descriptor.
- * Matched by entity_write_req().
+ * Matched by entity_write_req() and entity_write_repo().
+ * Both the parser and filemode modules use this function.
  * The pointer must be passed entity_free().
  */
 void
@@ -154,17 +156,23 @@ entity_read_req(struct ibuf *b, struct entity *ent)
 	io_read_buf(b, &ent->type, sizeof(ent->type));
 	io_read_buf(b, &ent->location, sizeof(ent->location));
 	io_read_buf(b, &ent->repoid, sizeof(ent->repoid));
-	io_read_buf(b, &ent->talid, sizeof(ent->talid));
-	io_read_buf(b, &ent->certid, sizeof(ent->certid));
-	io_read_str(b, &ent->path);
-	io_read_str(b, &ent->file);
-	io_read_str(b, &ent->mftaki);
-	io_read_buf_alloc(b, (void **)&ent->data, &ent->datasz);
+
+	if (ent->type == RTYPE_REPO) {
+		io_read_opt_str(b, &ent->path);
+		io_read_str(b, &ent->file);
+	} else {
+		io_read_buf(b, &ent->talid, sizeof(ent->talid));
+		io_read_buf(b, &ent->certid, sizeof(ent->certid));
+		io_read_opt_str(b, &ent->path);
+		io_read_str(b, &ent->file);
+		io_read_opt_str(b, &ent->mftaki);
+		io_read_buf_alloc(b, (void **)&ent->data, &ent->datasz);
+	}
 }
 
 /*
  * Write the queue entity.
- * Matched by entity_read_req().
+ * Matched by entity_read_req() above.
  */
 static void
 entity_write_req(const struct entity *ent)
@@ -177,13 +185,17 @@ entity_write_req(const struct entity *ent)
 	io_simple_buffer(b, &ent->repoid, sizeof(ent->repoid));
 	io_simple_buffer(b, &ent->talid, sizeof(ent->talid));
 	io_simple_buffer(b, &ent->certid, sizeof(ent->certid));
-	io_str_buffer(b, ent->path);
+	io_opt_str_buffer(b, ent->path);
 	io_str_buffer(b, ent->file);
-	io_str_buffer(b, ent->mftaki);
+	io_opt_str_buffer(b, ent->mftaki);
 	io_buf_buffer(b, ent->data, ent->datasz);
 	io_close_buffer(procq, b);
 }
 
+/*
+ * Write a repository entity to inform the parser of a new repository.
+ * Matched by entity_read_req() above.
+ */
 static void
 entity_write_repo(const struct repo *rp)
 {
@@ -192,21 +204,17 @@ entity_write_repo(const struct repo *rp)
 	enum location loc = DIR_UNKNOWN;
 	unsigned int repoid;
 	char *path, *altpath;
-	int talid = 0, certid = 0;
 
 	repoid = repo_id(rp);
 	path = repo_basedir(rp, 0);
 	altpath = repo_basedir(rp, 1);
+
 	b = io_new_buffer();
 	io_simple_buffer(b, &type, sizeof(type));
 	io_simple_buffer(b, &loc, sizeof(loc));
 	io_simple_buffer(b, &repoid, sizeof(repoid));
-	io_simple_buffer(b, &talid, sizeof(talid));
-	io_simple_buffer(b, &certid, sizeof(certid));
-	io_str_buffer(b, path);
+	io_opt_str_buffer(b, path);
 	io_str_buffer(b, altpath);
-	io_buf_buffer(b, NULL, 0); /* ent->mftaki */
-	io_buf_buffer(b, NULL, 0); /* ent->data */
 	io_close_buffer(procq, b);
 	free(path);
 	free(altpath);
@@ -287,14 +295,18 @@ rrdp_fetch(unsigned int id, const char *uri, const char *local,
 {
 	enum rrdp_msg type = RRDP_START;
 	struct ibuf *b;
+	int c;
 
 	b = io_new_buffer();
 	io_simple_buffer(b, &type, sizeof(type));
 	io_simple_buffer(b, &id, sizeof(id));
 	io_str_buffer(b, local);
 	io_str_buffer(b, uri);
+	c = (s->session_id != NULL);
+	io_simple_buffer(b, &c, sizeof(c));
 
-	rrdp_session_buffer(b, s);
+	if (c != 0)
+		rrdp_session_buffer(b, s);
 	io_close_buffer(rrdpq, b);
 }
 
@@ -322,7 +334,7 @@ rsync_fetch(unsigned int id, const char *uri, const char *local,
 	b = io_new_buffer();
 	io_simple_buffer(b, &id, sizeof(id));
 	io_str_buffer(b, local);
-	io_str_buffer(b, base);
+	io_opt_str_buffer(b, base);
 	io_str_buffer(b, uri);
 	io_close_buffer(rsyncq, b);
 }
@@ -334,9 +346,9 @@ rsync_abort(unsigned int id)
 
 	b = io_new_buffer();
 	io_simple_buffer(b, &id, sizeof(id));
-	io_str_buffer(b, NULL);
-	io_str_buffer(b, NULL);
-	io_str_buffer(b, NULL);
+	io_opt_str_buffer(b, NULL);
+	io_opt_str_buffer(b, NULL);
+	io_opt_str_buffer(b, NULL);
 	io_close_buffer(rsyncq, b);
 }
 
@@ -351,7 +363,7 @@ http_fetch(unsigned int id, const char *uri, const char *last_mod, int fd)
 	b = io_new_buffer();
 	io_simple_buffer(b, &id, sizeof(id));
 	io_str_buffer(b, uri);
-	io_str_buffer(b, last_mod);
+	io_opt_str_buffer(b, last_mod);
 	/* pass file as fd */
 	ibuf_fd_set(b, fd);
 	io_close_buffer(httpq, b);
@@ -391,12 +403,12 @@ rrdp_http_done(unsigned int id, enum http_result res, const char *last_mod)
 	io_simple_buffer(b, &type, sizeof(type));
 	io_simple_buffer(b, &id, sizeof(id));
 	io_simple_buffer(b, &res, sizeof(res));
-	io_str_buffer(b, last_mod);
+	io_opt_str_buffer(b, last_mod);
 	io_close_buffer(rrdpq, b);
 }
 
 /*
- * Add a file (CER, ROA, CRL) from an MFT file, RFC 6486.
+ * Add a file (CER, ROA, CRL, ...) from a manifest fileList, RFC 9286.
  * These are always relative to the directory in which "mft" sits.
  */
 static void
@@ -409,10 +421,20 @@ queue_add_from_mft(const struct mft *mft)
 
 	rp = repo_byid(mft->repoid);
 	for (i = 0; i < mft->filesz; i++) {
+		unsigned char *data = NULL;
+		size_t datasz = 0;
+
 		f = &mft->files[i];
 
 		if (f->type == RTYPE_INVALID || f->type == RTYPE_CRL)
 			continue;
+
+		if (f->type == RTYPE_CER) {
+			if ((data = calloc(1, sizeof(mft->mfthash))) == NULL)
+				err(1, NULL);
+			memcpy(data, mft->mfthash, sizeof(mft->mfthash));
+			datasz = sizeof(mft->mfthash);
+		}
 
 		if (mft->path != NULL)
 			if ((npath = strdup(mft->path)) == NULL)
@@ -421,8 +443,9 @@ queue_add_from_mft(const struct mft *mft)
 			err(1, NULL);
 		if ((mftaki = strdup(mft->aki)) == NULL)
 			err(1, NULL);
-		entityq_add(npath, nfile, f->type, f->location, rp, NULL, 0,
-		    mft->talid, mft->certid, mftaki);
+
+		entityq_add(npath, nfile, f->type, f->location, rp,
+		    data, datasz, mft->talid, mft->certid, mftaki);
 	}
 }
 
@@ -561,9 +584,7 @@ queue_add_from_cert(const struct cert *cert, struct nca_tree *ncas)
  * In all cases, we gather statistics.
  */
 static void
-entity_process(struct ibuf *b, struct stats *st, struct vrp_tree *tree,
-    struct brk_tree *brktree, struct vap_tree *vaptree,
-    struct vsp_tree *vsptree, struct nca_tree *ncatree)
+entity_process(struct ibuf *b, struct validation_data *vd, struct stats *st)
 {
 	enum rtype	 type;
 	struct tal	*tal;
@@ -572,7 +593,7 @@ entity_process(struct ibuf *b, struct stats *st, struct vrp_tree *tree,
 	struct roa	*roa;
 	struct aspa	*aspa;
 	struct spl	*spl;
-	struct repo	*rp;
+	struct repo	*rp = NULL;
 	char		*file;
 	time_t		 mtime;
 	unsigned int	 id;
@@ -595,14 +616,19 @@ entity_process(struct ibuf *b, struct stats *st, struct vrp_tree *tree,
 	if (filemode)
 		goto done;
 
+	if (file == NULL)
+		errx(1, "no filename present in entity response");
 	if (filepath_valid(&fpt, file, talid)) {
 		warnx("%s: File already visited", file);
 		goto done;
 	}
 
-	rp = repo_byid(id);
-	repo_stat_inc(rp, talid, type, STYPE_OK);
-	repostats_new_files_inc(rp, file);
+	if (type != RTYPE_TAL) {
+		rp = repo_byid(id);
+		repo_stat_inc(rp, talid, type, STYPE_OK);
+		repostats_new_files_inc(rp, file);
+	}
+
 	switch (type) {
 	case RTYPE_TAL:
 		st->tals++;
@@ -619,11 +645,15 @@ entity_process(struct ibuf *b, struct stats *st, struct vrp_tree *tree,
 		cert = cert_read(b);
 		switch (cert->purpose) {
 		case CERT_PURPOSE_TA:
+			queue_add_from_cert(cert, &vd->ncas);
+			ccr_insert_tas(&vd->ccr.tas, cert);
+			break;
 		case CERT_PURPOSE_CA:
-			queue_add_from_cert(cert, ncatree);
+			queue_add_from_cert(cert, &vd->ncas);
+			ccr_insert_mft_sub(&vd->ccr.mfts, cert);
 			break;
 		case CERT_PURPOSE_BGPSEC_ROUTER:
-			cert_insert_brks(brktree, cert);
+			cert_insert_brks(&vd->brks, cert);
 			repo_stat_inc(rp, talid, type, STYPE_BGPSEC);
 			break;
 		default:
@@ -642,7 +672,8 @@ entity_process(struct ibuf *b, struct stats *st, struct vrp_tree *tree,
 		if (mft->seqnum_gap)
 			repo_stat_inc(rp, talid, type, STYPE_SEQNUM_GAP);
 		queue_add_from_mft(mft);
-		cert_remove_nca(ncatree, mft->certid, rp);
+		cert_remove_nca(&vd->ncas, mft->certid, rp);
+		ccr_insert_mft(&vd->ccr.mfts, mft);
 		mft_free(mft);
 		break;
 	case RTYPE_CRL:
@@ -656,13 +687,12 @@ entity_process(struct ibuf *b, struct stats *st, struct vrp_tree *tree,
 			break;
 		}
 		roa = roa_read(b);
-		if (roa->valid)
-			roa_insert_vrps(tree, roa, rp);
-		else
+		if (roa->valid) {
+			roa_insert_vrps(&vd->vrps, roa, rp);
+			ccr_insert_roa(&vd->ccr.vrps, roa);
+		} else
 			repo_stat_inc(rp, talid, type, STYPE_INVALID);
 		roa_free(roa);
-		break;
-	case RTYPE_GBR:
 		break;
 	case RTYPE_ASPA:
 		io_read_buf(b, &ok, sizeof(ok));
@@ -672,7 +702,7 @@ entity_process(struct ibuf *b, struct stats *st, struct vrp_tree *tree,
 		}
 		aspa = aspa_read(b);
 		if (aspa->valid)
-			aspa_insert_vaps(file, vaptree, aspa, rp);
+			aspa_insert_vaps(file, &vd->vaps, aspa, rp);
 		else
 			repo_stat_inc(rp, talid, type, STYPE_INVALID);
 		aspa_free(aspa);
@@ -686,7 +716,7 @@ entity_process(struct ibuf *b, struct stats *st, struct vrp_tree *tree,
 		}
 		spl = spl_read(b);
 		if (spl->valid)
-			spl_insert_vsps(vsptree, spl, rp);
+			spl_insert_vsps(&vd->vsps, spl, rp);
 		else
 			repo_stat_inc(rp, talid, type, STYPE_INVALID);
 		spl_free(spl);
@@ -730,8 +760,10 @@ rrdp_process(struct ibuf *b)
 		break;
 	case RRDP_HTTP_REQ:
 		io_read_str(b, &uri);
-		io_read_str(b, &last_mod);
+		io_read_opt_str(b, &last_mod);
 		rrdp_http_fetch(id, uri, last_mod);
+		free(uri);
+		free(last_mod);
 		break;
 	case RRDP_SESSION:
 		s = rrdp_session_read(b);
@@ -744,6 +776,9 @@ rrdp_process(struct ibuf *b)
 			io_read_buf(b, &hash, sizeof(hash));
 		io_read_str(b, &uri);
 		io_read_buf_alloc(b, (void **)&data, &dsz);
+
+		if (uri == NULL || (pt != PUB_DEL && dsz == 0))
+			errx(1, "bad rrdp file request");
 
 		ok = rrdp_handle_file(id, pt, uri, hash, sizeof(hash),
 		    data, dsz);
@@ -779,7 +814,6 @@ sum_stats(const struct repo *rp, const struct repotalstats *in, void *arg)
 	out->aspas_invalid += in->aspas_invalid;
 	out->brks += in->brks;
 	out->crls += in->crls;
-	out->gbrs += in->gbrs;
 	out->taks += in->taks;
 	out->vrps += in->vrps;
 	out->vrps_uniqs += in->vrps_uniqs;
@@ -965,9 +999,12 @@ process_start(const char *title, int *fd)
 }
 
 void
-suicide(int sig __attribute__((unused)))
+sighandler(int sig)
 {
-	killme = 1;
+	if (sig == SIGINFO)
+		printinfo = 1;
+	else
+		killme = 1;
 }
 
 #define NPFD	4
@@ -977,6 +1014,7 @@ main(int argc, char *argv[])
 {
 	int		 rc, c, i, st, hangup = 0;
 	int		 procfd, rsyncfd, httpfd, rrdpfd;
+	int		 nthreads = 2;
 	pid_t		 pid, procpid, rsyncpid, httppid, rrdppid;
 	struct pollfd	 pfd[NPFD];
 	struct msgbuf	*queues[NPFD];
@@ -986,15 +1024,20 @@ main(int argc, char *argv[])
 	const char	*cachedir = NULL, *outputdir = NULL;
 	const char	*errs, *name;
 	const char	*skiplistfile = NULL;
-	struct vrp_tree	 vrps = RB_INITIALIZER(&vrps);
-	struct vsp_tree	 vsps = RB_INITIALIZER(&vsps);
-	struct brk_tree	 brks = RB_INITIALIZER(&brks);
-	struct vap_tree	 vaps = RB_INITIALIZER(&vaps);
-	struct nca_tree	 ncas = RB_INITIALIZER(&ncas);
 	struct rusage	 ru;
 	struct timespec	 start_time, now_time;
+	struct validation_data vd = { 0 };
 
 	clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+	RB_INIT(&vd.vrps);
+	RB_INIT(&vd.brks);
+	RB_INIT(&vd.vaps);
+	RB_INIT(&vd.vsps);
+	RB_INIT(&vd.ncas);
+	RB_INIT(&vd.ccr.mfts);
+	RB_INIT(&vd.ccr.vrps);
+	RB_INIT(&vd.ccr.tas);
 
 	/* If started as root, priv-drop to _rpki-client */
 	if (getuid() == 0) {
@@ -1018,7 +1061,7 @@ main(int argc, char *argv[])
 		err(1, "pledge");
 
 	while ((c =
-	    getopt(argc, argv, "0Ab:Bcd:e:fH:jmnoP:Rs:S:t:vVx")) != -1)
+	    getopt(argc, argv, "0Ab:Bcd:e:fH:jmnop:P:Rs:S:t:vVx")) != -1)
 		switch (c) {
 		case '0':
 			excludeas0 = 0;
@@ -1060,6 +1103,11 @@ main(int argc, char *argv[])
 			break;
 		case 'o':
 			outformats |= FORMAT_OPENBGPD;
+			break;
+		case 'p':
+			nthreads = strtonum(optarg, 1, 128, &errs);
+			if (errs)
+				errx(1, "-p: %s", errs);
 			break;
 		case 'P':
 			evaluation_time = strtonum(optarg, X509_TIME_MIN + 1,
@@ -1133,9 +1181,12 @@ main(int argc, char *argv[])
 			err(1, "output directory %s", outputdir);
 		if (outformats == 0)
 			outformats = FORMAT_OPENBGPD;
+		outformats |= FORMAT_CCR;
 	}
 
 	check_fs_size(cachefd, cachedir);
+
+	x509_init_oid();
 
 	if (talsz == 0)
 		talsz = tal_load_default();
@@ -1154,7 +1205,7 @@ main(int argc, char *argv[])
 	procpid = process_start("parser", &procfd);
 	if (procpid == 0) {
 		if (!filemode)
-			proc_parser(procfd);
+			proc_parser(procfd, nthreads);
 		else
 			proc_filemode(procfd);
 	}
@@ -1218,13 +1269,15 @@ main(int argc, char *argv[])
 		rrdppid = -1;
 	}
 
+	if (!filemode)
+		signal(SIGINFO, sighandler);
 	if (!filemode && timeout > 0) {
 		/*
 		 * Commit suicide eventually
 		 * cron will normally start a new one
 		 */
 		alarm(timeout);
-		signal(SIGALRM, suicide);
+		signal(SIGALRM, sighandler);
 
 		/* give up a bit before the hard timeout and try to finish up */
 		if (!noop)
@@ -1295,13 +1348,18 @@ main(int argc, char *argv[])
 	while (entity_queue > 0 && !killme) {
 		int polltim;
 
-		polltim = repo_check_timeout(INFTIM);
+		if (printinfo) {
+			printinfo = 0;
+			repo_printinfo(entity_queue);
+		}
 
 		for (i = 0; i < NPFD; i++) {
 			pfd[i].events = POLLIN;
 			if (msgbuf_queuelen(queues[i]) > 0)
 				pfd[i].events |= POLLOUT;
 		}
+
+		polltim = repo_check_timeout(INFTIM);
 
 		if (poll(pfd, NPFD, polltim) == -1) {
 			if (errno == EINTR)
@@ -1369,7 +1427,7 @@ main(int argc, char *argv[])
 
 				io_read_buf(b, &id, sizeof(id));
 				io_read_buf(b, &res, sizeof(res));
-				io_read_str(b, &last_mod);
+				io_read_opt_str(b, &last_mod);
 				http_finish(id, res, last_mod);
 				free(last_mod);
 				ibuf_free(b);
@@ -1406,8 +1464,7 @@ main(int argc, char *argv[])
 				errx(1, "ibuf_read: connection closed");
 			}
 			while ((b = io_buf_get(queues[0])) != NULL) {
-				entity_process(b, &stats, &vrps, &brks, &vaps,
-				    &vsps, &ncas);
+				entity_process(b, &vd, &stats);
 				ibuf_free(b);
 			}
 		}
@@ -1415,6 +1472,7 @@ main(int argc, char *argv[])
 
 	signal(SIGALRM, SIG_DFL);
 	if (killme) {
+		repo_printinfo(entity_queue);
 		syslog(LOG_CRIT|LOG_DAEMON,
 		    "excessive runtime (%d seconds), giving up", timeout);
 		errx(1, "excessive runtime (%d seconds), giving up", timeout);
@@ -1427,9 +1485,15 @@ main(int argc, char *argv[])
 	 */
 
 	close(procfd);
+	msgbuf_free(procq);
 	close(rsyncfd);
+	msgbuf_free(rsyncq);
 	close(httpfd);
+	msgbuf_free(httpq);
 	close(rrdpfd);
+	msgbuf_free(rrdpq);
+	procq = rsyncq = httpq = rrdpq = NULL;
+	memset(queues, 0, sizeof(queues));
 
 	rc = 0;
 	for (;;) {
@@ -1463,8 +1527,10 @@ main(int argc, char *argv[])
 	}
 
 	/* processing did not finish because of error */
-	if (entity_queue != 0)
+	if (entity_queue != 0) {
+		repo_printinfo(entity_queue);
 		errx(1, "not all files processed, giving up");
+	}
 
 	/* if processing in filemode the process is done, no cleanup */
 	if (filemode)
@@ -1490,6 +1556,8 @@ main(int argc, char *argv[])
 		timespecadd(&stats.system_time, &ts, &stats.system_time);
 	}
 
+	vd.buildtime = get_current_time();
+
 	/* change working directory to the output directory */
 	if (fchdir(outdirfd) == -1)
 		err(1, "fchdir output dir");
@@ -1500,7 +1568,9 @@ main(int argc, char *argv[])
 	}
 	repo_stats_collect(sum_repostats, &stats.repo_stats);
 
-	if (outputfiles(&vrps, &brks, &vaps, &vsps, &ncas, &stats))
+	serialize_ccr_content(&vd);
+
+	if (outputfiles(&vd, &stats))
 		rc = 1;
 
 	printf("Processing time %lld seconds "
@@ -1509,6 +1579,9 @@ main(int argc, char *argv[])
 	    (long long)stats.user_time.tv_sec,
 	    (long long)stats.system_time.tv_sec);
 	printf("Skiplist entries: %u\n", stats.skiplistentries);
+	printf("CCR manifest state hash: %s\n", vd.ccr.mfts_hash);
+	printf("CCR ROA payloads hash: %s\n", vd.ccr.vrps_hash);
+	printf("CCR ASPA payloads hash: %s\n", vd.ccr.vaps_hash);
 	printf("Route Origin Authorizations: %u (%u failed parse, %u "
 	    "invalid)\n", stats.repo_tal_stats.roas,
 	    stats.repo_tal_stats.roas_fail,
@@ -1533,7 +1606,6 @@ main(int argc, char *argv[])
 	    stats.repo_tal_stats.mfts, stats.repo_tal_stats.mfts_fail,
 	    stats.repo_tal_stats.mfts_gap);
 	printf("Certificate revocation lists: %u\n", stats.repo_tal_stats.crls);
-	printf("Ghostbuster records: %u\n", stats.repo_tal_stats.gbrs);
 	printf("Trust Anchor Keys: %u\n", stats.repo_tal_stats.taks);
 	printf("Repositories: %u\n", stats.repos);
 	printf("New files moved into validated cache: %u\n",
@@ -1559,9 +1631,9 @@ usage:
 	fprintf(stderr,
 	    "usage: rpki-client [-0ABcjmnoRVvx] [-b sourceaddr] [-d cachedir]"
 	    " [-e rsync_prog]\n"
-	    "                   [-H fqdn] [-P epoch] [-S skiplist] [-s timeout]"
-	    " [-t tal]\n"
-	    "                   [outputdir]\n"
+	    "                   [-H fqdn] [-P posix-seconds] [-p threads]"
+	    " [-S skiplist]\n"
+	    "                   [-s timeout] [-t tal] [outputdir]\n"
 	    "       rpki-client [-Vv] [-d cachedir] [-j] [-t tal] -f file ..."
 	    "\n");
 	return 1;

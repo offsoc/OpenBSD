@@ -1,4 +1,4 @@
-/* $OpenBSD: window.c,v 1.304 2025/04/02 09:12:05 nicm Exp $ */
+/* $OpenBSD: window.c,v 1.308 2026/01/04 08:05:14 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -990,6 +990,8 @@ window_pane_destroy(struct window_pane *wp)
 
 	if (event_initialized(&wp->resize_timer))
 		event_del(&wp->resize_timer);
+	if (event_initialized(&wp->sync_timer))
+		event_del(&wp->sync_timer);
 	TAILQ_FOREACH_SAFE(r, &wp->resize_queue, entry, r1) {
 		TAILQ_REMOVE(&wp->resize_queue, r, entry);
 		free(r);
@@ -1068,6 +1070,8 @@ window_pane_resize(struct window_pane *wp, u_int sx, u_int sy)
 
 	if (sx == wp->sx && sy == wp->sy)
 		return;
+
+	screen_write_stop_sync(wp);
 
 	r = xmalloc(sizeof *r);
 	r->sx = sx;
@@ -1769,7 +1773,7 @@ window_pane_mode(struct window_pane *wp)
 int
 window_pane_show_scrollbar(struct window_pane *wp, int sb_option)
 {
-	if (SCREEN_IS_ALTERNATE(wp->screen))
+	if (SCREEN_IS_ALTERNATE(&wp->base))
 		return (0);
 	if (sb_option == PANE_SCROLLBARS_ALWAYS ||
 	    (sb_option == PANE_SCROLLBARS_MODAL &&
@@ -1922,21 +1926,24 @@ window_pane_get_theme(struct window_pane *wp)
 void
 window_pane_send_theme_update(struct window_pane *wp)
 {
+	if (wp == NULL || window_pane_exited(wp))
+		return;
 	if (~wp->flags & PANE_THEMECHANGED)
 		return;
 	if (~wp->screen->mode & MODE_THEME_UPDATES)
 		return;
-
 	switch (window_pane_get_theme(wp)) {
 	case THEME_LIGHT:
+		log_debug("%s: %%%u light theme", __func__, wp->id);
 		input_key_pane(wp, KEYC_REPORT_LIGHT_THEME, NULL);
 		break;
 	case THEME_DARK:
+		log_debug("%s: %%%u dark theme", __func__, wp->id);
 		input_key_pane(wp, KEYC_REPORT_DARK_THEME, NULL);
 		break;
 	case THEME_UNKNOWN:
+		log_debug("%s: %%%u unknown theme", __func__, wp->id);
 		break;
 	}
-
 	wp->flags &= ~PANE_THEMECHANGED;
 }

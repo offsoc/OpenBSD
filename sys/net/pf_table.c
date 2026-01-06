@@ -1,4 +1,4 @@
-/*	$OpenBSD: pf_table.c,v 1.145 2023/08/10 16:44:04 sashan Exp $	*/
+/*	$OpenBSD: pf_table.c,v 1.147 2025/11/11 04:06:20 dlg Exp $	*/
 
 /*
  * Copyright (c) 2002 Cedric Berger
@@ -48,7 +48,6 @@
 #include <netinet/udp.h>
 
 #ifdef INET6
-#include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #endif /* INET6 */
 
@@ -1153,6 +1152,26 @@ pfr_insert_kentry(struct pfr_ktable *kt, struct pfr_addr *ad, time_t tzero)
 		kt->pfrkt_refcntcost++;
 	kt->pfrkt_cnt++;
 	pfr_ktable_winfo_update(kt, p);
+
+	return (0);
+}
+
+int
+pfr_remove_kentry(struct pfr_ktable *kt, struct pfr_addr *ad)
+{
+	struct pfr_kentryworkq	 workq = SLIST_HEAD_INITIALIZER(workq);
+	struct pfr_kentry	*p;
+
+	p = pfr_lookup_addr(kt, ad, 1);
+	if (p == NULL || ISSET(p->pfrke_flags, PFRKE_FLAG_NOT))
+		return (ESRCH);
+
+	if (ISSET(p->pfrke_flags, PFRKE_FLAG_MARK))
+		return (0);
+
+	SET(p->pfrke_flags, PFRKE_FLAG_MARK);
+	SLIST_INSERT_HEAD(&workq, p, pfrke_workq);
+	pfr_remove_kentries(kt, &workq);
 
 	return (0);
 }

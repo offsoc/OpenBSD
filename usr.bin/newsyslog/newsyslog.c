@@ -1,4 +1,4 @@
-/*	$OpenBSD: newsyslog.c,v 1.116 2025/05/08 15:30:41 deraadt Exp $	*/
+/*	$OpenBSD: newsyslog.c,v 1.119 2025/09/15 18:51:22 jan Exp $	*/
 
 /*
  * Copyright (c) 1999, 2002, 2003 Todd C. Miller <millert@openbsd.org>
@@ -92,6 +92,7 @@
 #include <limits.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -474,6 +475,7 @@ parse_file(struct entrylist *list, int *nentries)
 	int lineno = 0;
 	int ret = 0;
 	FILE *f;
+	const char *errstr;
 	long l;
 
 	if (strcmp(conf, "-") == 0)
@@ -513,7 +515,14 @@ nextline:
 			if (*q == '\0') {
 				working->uid = (uid_t)-1;
 			} else if (isnumberstr(q)) {
-				working->uid = atoi(q);
+				working->uid = strtonum(q, 0, UID_MAX, &errstr);
+				if (errstr) {
+					warnx("%s:%d: invalid user %s (%s)"
+					    " --> skipping", conf, lineno, q,
+					    errstr);
+					ret = 1;
+					goto nextline;
+				}
 			} else if (uid_from_user(q, &working->uid) == -1) {
 				warnx("%s:%d: unknown user %s --> skipping",
 				    conf, lineno, q);
@@ -525,7 +534,14 @@ nextline:
 			if (*q == '\0') {
 				working->gid = (gid_t)-1;
 			} else if (isnumberstr(q)) {
-				working->gid = atoi(q);
+				working->gid = strtonum(q, 0, GID_MAX, &errstr);
+				if (errstr) {
+					warnx("%s:%d: invalid group %s (%s)"
+					    " --> skipping", conf, lineno, q,
+					    errstr);
+					ret = 1;
+					goto nextline;
+				}
 			} else if (gid_from_group(q, &working->gid) == -1) {
 				warnx("%s:%d: unknown group %s --> skipping",
 				    conf, lineno, q);
@@ -562,10 +578,18 @@ nextline:
 
 		q = parse = missing_field(sob(++parse), errline, lineno);
 		*(parse = son(parse)) = '\0';
-		if (isdigit((unsigned char)*q))
-			working->size = atoi(q) * 1024;
-		else
+		if (strcmp(q, "*") == 0) {
 			working->size = -1;
+		} else {
+			working->size = strtonum(q, 0, INT64_MAX/1024, &errstr);
+			if (errstr) {
+				warnx("%s:%d: invalid size %s (%s)"
+				    " --> skipping", conf, lineno, q, errstr);
+				ret = 1;
+				goto nextline;
+			}
+			working->size *= 1024;
+		}
 
 		working->flags = 0;
 		q = parse = missing_field(sob(++parse), errline, lineno);
@@ -1154,76 +1178,47 @@ lstat_log(char *file, size_t size, int flags)
 time_t
 parse8601(char *s)
 {
-	struct tm tm, *tmp;
-	char *t;
-	long l;
+	char		 format[16] = { 0 };
+	struct tm	 tm;
+	char		*t;
 
-	tmp = localtime(&timenow);
-	tm = *tmp;
+	if (localtime_r(&timenow, &tm) == NULL)
+		return -1;
 
 	tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
+	t = strchr(s, 'T');
 
-	l = strtol(s, &t, 10);
-	if (l < 0 || l >= INT_MAX || (*t != '\0' && *t != 'T'))
-		return (-1);
-
-	/*
-	 * Now t points either to the end of the string (if no time was
-	 * provided) or to the letter `T' which separates date and time in
-	 * ISO 8601.  The pointer arithmetic is the same for either case.
-	 */
-	switch (t - s) {
-	case 8:
-		tm.tm_year = ((l / 1000000) - 19) * 100;
-		l = l % 1000000;
-	case 6:
-		tm.tm_year -= tm.tm_year % 100;
-		tm.tm_year += l / 10000;
-		l = l % 10000;
-	case 4:
-		tm.tm_mon = (l / 100) - 1;
-		l = l % 100;
-	case 2:
-		tm.tm_mday = l;
-	case 0:
-		break;
-	default:
-		return (-1);
-	}
-
-	/* sanity check */
-	if (tm.tm_year < 70 || tm.tm_mon < 0 || tm.tm_mon > 12 ||
-	    tm.tm_mday < 1 || tm.tm_mday > 31)
-		return (-1);
-
-	if (*t != '\0') {
-		s = ++t;
-		l = strtol(s, &t, 10);
-		if (l < 0 || l >= INT_MAX ||
-		    (*t != '\0' && !isspace((unsigned char)*t)))
-			return (-1);
-
-		switch (t - s) {
-		case 6:
-			tm.tm_sec = l % 100;
-			l /= 100;
-		case 4:
-			tm.tm_min = l % 100;
-			l /= 100;
-		case 2:
-			tm.tm_hour = l;
+	if (s != t) {
+		switch (t == NULL ? strlen(s) : t - s) {
+		case 8: strlcat(format, "%C", sizeof format); /* FALLTHROUGH */
+		case 6: strlcat(format, "%y", sizeof format); /* FALLTHROUGH */
+		case 4: strlcat(format, "%m", sizeof format); /* FALLTHROUGH */
+		case 2: strlcat(format, "%d", sizeof format); /* FALLTHROUGH */
 		case 0:
 			break;
 		default:
-			return (-1);
+			return -1;
 		}
-
-		/* sanity check */
-		if (tm.tm_sec < 0 || tm.tm_sec > 60 || tm.tm_min < 0 ||
-		    tm.tm_min > 59 || tm.tm_hour < 0 || tm.tm_hour > 23)
-			return (-1);
 	}
-	return (mktime(&tm));
+
+	if (t != NULL) {
+		strlcat(format, "T", sizeof format);
+
+		switch (strlen(t)) {
+		case 7: strlcat(format, "%H", sizeof format); /* FALLTHROUGH */
+		case 5: strlcat(format, "%M", sizeof format); /* FALLTHROUGH */
+		case 3: strlcat(format, "%S", sizeof format); /* FALLTHROUGH */
+		case 1:
+			break;
+		default:
+			return -1;
+		}
+	}
+
+	if (strptime(s, format, &tm) == NULL)
+		return -1;
+
+	return mktime(&tm);
 }
 
 /*-
@@ -1245,12 +1240,12 @@ parseDWM(char *s)
 {
 	static int mtab[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 	int WMseen = 0, Dseen = 0, nd;
-	struct tm tm, *tmp;
+	struct tm tm;
 	char *t;
 	long l;
 
-	tmp = localtime(&timenow);
-	tm = *tmp;
+	if (localtime_r(&timenow, &tm) == NULL)
+		return -1;
 
 	/* set no. of days per month */
 

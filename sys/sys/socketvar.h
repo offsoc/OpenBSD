@@ -1,4 +1,4 @@
-/*	$OpenBSD: socketvar.h,v 1.158 2025/04/08 15:31:22 mvs Exp $	*/
+/*	$OpenBSD: socketvar.h,v 1.160 2025/10/24 15:09:56 bluhm Exp $	*/
 /*	$NetBSD: socketvar.h,v 1.18 1996/02/09 18:25:38 christos Exp $	*/
 
 /*-
@@ -74,6 +74,7 @@ struct sosplice {
 	struct	timeval ssp_idletv;	/* [I] idle timeout */
 	struct	timeout ssp_idleto;
 	struct	task ssp_task;		/* task for somove */
+	struct	taskq *ssp_queue;	/* [I] softnet queue where we add */
 };
 
 /*
@@ -387,7 +388,7 @@ soreadable(struct socket *so)
 	soassertlocked_readonly(so);
 	if (isspliced(so))
 		return 0;
-	return (so->so_rcv.sb_state & SS_CANTRCVMORE) || so->so_qlen ||
+	return (so->so_rcv.sb_state & SS_CANTRCVMORE) ||
 	    so->so_error || so->so_rcv.sb_cc >= so->so_rcv.sb_lowat;
 }
 

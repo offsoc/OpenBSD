@@ -2135,6 +2135,11 @@ static const struct pci_device_id pciidlist[] = {
 	{0x1002, 0x7410, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_ALDEBARAN},
 
 	/* CYAN_SKILLFISH */
+	{0x1002, 0x13DB, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYAN_SKILLFISH|AMD_IS_APU},
+	{0x1002, 0x13F9, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYAN_SKILLFISH|AMD_IS_APU},
+	{0x1002, 0x13FA, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYAN_SKILLFISH|AMD_IS_APU},
+	{0x1002, 0x13FB, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYAN_SKILLFISH|AMD_IS_APU},
+	{0x1002, 0x13FC, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYAN_SKILLFISH|AMD_IS_APU},
 	{0x1002, 0x13FE, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYAN_SKILLFISH|AMD_IS_APU},
 	{0x1002, 0x143F, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYAN_SKILLFISH|AMD_IS_APU},
 
@@ -3145,7 +3150,6 @@ MODULE_LICENSE("GPL and additional rights");
 
 #include <ddb/db_var.h>
 
-#include <drm/drm_drv.h>
 #include <drm/drm_utils.h>
 #include <drm/drm_fb_helper.h>
 
@@ -3270,7 +3274,6 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 	struct pci_attach_args	*pa = aux;
 	const struct pci_device_id *id_entry;
 	pcireg_t		 type;
-	int			 i;
 	uint8_t			 rmmio_bar;
 	paddr_t			 fb_aper;
 	pcireg_t		 addr, mask;
@@ -3403,6 +3406,7 @@ amdgpu_attach(struct device *parent, struct device *self, void *aux)
 		return;
 	}
 	adev->pdev = dev->pdev;
+	adev->flags = amdgpu_fix_asic_type(adev->pdev, adev->flags);
 
 	/* from amdgpu_pci_probe() */
 	if (amdgpu_aspm == -1 && !pcie_aspm_enabled(adev->pdev))
@@ -3634,8 +3638,6 @@ amdgpu_doswitch(void *v)
 {
 	struct rasops_info *ri = v;
 	struct amdgpu_device *adev = ri->ri_hw;
-	struct amdgpu_crtc *amdgpu_crtc;
-	int i, crtc;
 
 	rasops_show_screen(ri, adev->switchcookie, 0, NULL, NULL);
 	drm_fb_helper_restore_fbdev_mode_unlocked(adev_to_drm(adev)->fb_helper);
@@ -3703,7 +3705,7 @@ amdgpu_attachhook(struct device *self)
 	struct amdgpu_device *adev = (struct amdgpu_device *)self;
 	struct drm_device *dev = &adev->ddev;
 	struct pci_dev *pdev = adev->pdev;
-	int r, acpi_status;
+	int r;
 	struct rasops_info *ri = &adev->ro;
 	struct drm_fb_helper *fb_helper;
 	struct drm_framebuffer *fb;
@@ -3844,7 +3846,6 @@ int
 amdgpu_detach(struct device *self, int flags)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)self;
-	struct drm_device *dev = &adev->ddev;
 
 	if (adev == NULL)
 		return 0;
@@ -3892,6 +3893,14 @@ amdgpu_activate(struct device *self, int act)
 	switch (act) {
 	case DVACT_QUIESCE:
 		rv = config_activate_children(self, act);
+
+		if (acpi_softc && acpi_softc->sc_state != ACPI_STATE_S4) {
+			if (amdgpu_acpi_is_s0ix_active(adev))
+				adev->in_s0ix = true;
+			else if (amdgpu_acpi_is_s3_active(adev))
+				 adev->in_s3 = true;
+		}
+
 		amdgpu_pmops_prepare(self);
 		if (acpi_softc && acpi_softc->sc_state == ACPI_STATE_S4) {
 			adev->in_s4 = true;

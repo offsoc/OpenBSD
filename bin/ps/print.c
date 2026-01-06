@@ -1,4 +1,4 @@
-/*	$OpenBSD: print.c,v 1.90 2025/04/29 03:48:10 tedu Exp $	*/
+/*	$OpenBSD: print.c,v 1.93 2025/07/14 02:40:15 deraadt Exp $	*/
 /*	$NetBSD: print.c,v 1.27 1995/09/29 21:58:12 cgd Exp $	*/
 
 /*-
@@ -44,7 +44,6 @@
 #include <grp.h>
 #include <kvm.h>
 #include <math.h>
-#include <nlist.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,13 +55,14 @@
 #include "ps.h"
 
 extern kvm_t *kd;
-extern int needenv, needcomm, neednlist, commandonly;
+extern int needenv, needcomm, commandonly;
 
 int mbswprint(const char *, int, int);  /* utf8.c */
 
+static double getpmem(const struct kinfo_proc *);
 static char *cmdpart(char *);
 
-#define	min(a,b)	((a) < (b) ? (a) : (b))
+#define	MINIMUM(a,b)	((a) < (b) ? (a) : (b))
 
 static char *
 cmdpart(char *arg0)
@@ -230,7 +230,7 @@ logname(const struct pinfo *pi, VARENT *ve)
 
 	v = ve->var;
 	if (kp->p_login[0]) {
-		int n = min(v->width, LOGIN_NAME_MAX);
+		int n = MINIMUM(v->width, LOGIN_NAME_MAX);
 		mbswprint(kp->p_login, n, ve->next != NULL);
 		if (ve->next != NULL)
 			while (n++ < v->width)
@@ -558,7 +558,8 @@ lstarted(const struct pinfo *pi, VARENT *ve)
 	(void)printf("%-*s", v->width, buf);
 }
 
-void elapsed(const struct pinfo *pi, VARENT *ve)
+void
+elapsed(const struct pinfo *pi, VARENT *ve)
 {
 	const struct kinfo_proc *kp = pi->ki;
 	VAR *v;
@@ -693,7 +694,7 @@ pcpu(const struct pinfo *pi, VARENT *ve)
 	(void)printf("%*.1f", v->width, getpcpu(pi->ki));
 }
 
-double
+static double
 getpmem(const struct kinfo_proc *kp)
 {
 	double fracmem;

@@ -1,8 +1,8 @@
-# $OpenBSD: Makefile,v 1.3 2023/11/12 17:29:04 jca Exp $
+# $OpenBSD: Makefile,v 1.5 2025/08/21 10:42:46 rsadowski Exp $
 
 .include <bsd.own.mk>
 
-LLVM_V=		16
+LLVM_V=		19
 LIBDIR=		/usr/lib/clang/${LLVM_V}/lib
 
 .if ${COMPILER_VERSION:L} != "clang"
@@ -16,7 +16,7 @@ LIB=	clang_rt.profile
 NOPIC=
 NOPROFILE=
 
-CFLAGS+=	-fPIC -std=gnu99 -fvisibility=hidden -fno-stack-protector
+CFLAGS+=	-fPIC -std=gnu11 -fvisibility=hidden -fno-stack-protector
 CFLAGS+=	-DCOMPILER_RT_HAS_ATOMICS=1
 CFLAGS+=	-DCOMPILER_RT_HAS_FCNTL_LCK=1
 CFLAGS+=	-DCOMPILER_RT_HAS_UNAME=1

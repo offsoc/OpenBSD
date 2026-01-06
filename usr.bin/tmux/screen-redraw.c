@@ -1,4 +1,4 @@
-/* $OpenBSD: screen-redraw.c,v 1.105 2025/05/22 07:46:38 nicm Exp $ */
+/* $OpenBSD: screen-redraw.c,v 1.109 2025/12/17 11:49:29 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -86,6 +86,10 @@ screen_redraw_border_set(struct window *w, struct window_pane *wp,
 	case PANE_LINES_SIMPLE:
 		gc->attr &= ~GRID_ATTR_CHARSET;
 		utf8_set(&gc->data, SIMPLE_BORDERS[cell_type]);
+		break;
+	case PANE_LINES_SPACES:
+		gc->attr &= ~GRID_ATTR_CHARSET;
+		utf8_set(&gc->data, ' ');
 		break;
 	default:
 		gc->attr |= GRID_ATTR_CHARSET;
@@ -193,9 +197,11 @@ screen_redraw_pane_border(struct screen_redraw_ctx *ctx, struct window_pane *wp,
 		} else { /* sb_pos == PANE_SCROLLBARS_RIGHT */
 			if ((wp->xoff == 0 || px >= wp->xoff) &&
 			    (px <= ex || (sb_w != 0 && px < ex + sb_w))) {
-				if (wp->yoff != 0 && py == wp->yoff - 1)
+				if (pane_status != PANE_STATUS_BOTTOM &&
+				    wp->yoff != 0 &&
+				    py == wp->yoff - 1)
 					return (SCREEN_REDRAW_BORDER_TOP);
-				if (py == ey)
+				if (pane_status != PANE_STATUS_TOP && py == ey)
 					return (SCREEN_REDRAW_BORDER_BOTTOM);
 			}
 		}
@@ -376,7 +382,6 @@ screen_redraw_check_cell(struct screen_redraw_ctx *ctx, u_int px, u_int py,
 
 		/* Check if CELL_SCROLLBAR */
 		if (window_pane_show_scrollbar(wp, pane_scrollbars)) {
-
 			if (pane_status == PANE_STATUS_TOP)
 				line = wp->yoff - 1;
 			else
@@ -893,6 +898,9 @@ screen_redraw_draw_pane(struct screen_redraw_ctx *ctx, struct window_pane *wp)
 	struct grid_cell	 defaults;
 	u_int			 i, j, top, x, y, width;
 
+	if (wp->base.mode & MODE_SYNC)
+		screen_write_stop_sync(wp);
+
 	log_debug("%s: %s @%u %%%u", __func__, c->name, w->id, wp->id);
 
 	if (wp->xoff + wp->sx <= ctx->ox || wp->xoff >= ctx->ox + ctx->sx)
@@ -1019,6 +1027,11 @@ screen_redraw_draw_scrollbar(struct screen_redraw_ctx *ctx,
 	int			 px, py, ox = ctx->ox, oy = ctx->oy;
 	int			 sx = ctx->sx, sy = ctx->sy, xoff = wp->xoff;
 	int			 yoff = wp->yoff;
+
+	if (ctx->statustop) {
+		sb_y += ctx->statuslines;
+		sy += ctx->statuslines;
+	}
 
 	/* Set up style for slider. */
 	gc = sb_style->gc;

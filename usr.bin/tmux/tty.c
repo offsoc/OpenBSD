@@ -1,4 +1,4 @@
-/* $OpenBSD: tty.c,v 1.444 2025/05/12 09:50:00 nicm Exp $ */
+/* $OpenBSD: tty.c,v 1.452 2025/12/02 08:20:32 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -35,6 +35,8 @@
 
 static int	tty_log_fd = -1;
 
+static void	tty_start_timer_callback(int, short, void *);
+static void	tty_clipboard_query_callback(int, short, void *);
 static void	tty_set_italics(struct tty *);
 static int	tty_try_colour(struct tty *, int, const char *);
 static void	tty_force_cursor_colour(struct tty *, int);
@@ -44,11 +46,11 @@ static void	tty_cursor_pane_unless_wrap(struct tty *,
 		    const struct tty_ctx *, u_int, u_int);
 static void	tty_colours(struct tty *, const struct grid_cell *);
 static void	tty_check_fg(struct tty *, struct colour_palette *,
-    		    struct grid_cell *);
+		    struct grid_cell *);
 static void	tty_check_bg(struct tty *, struct colour_palette *,
-    		    struct grid_cell *);
+		    struct grid_cell *);
 static void	tty_check_us(struct tty *, struct colour_palette *,
-    		    struct grid_cell *);
+		    struct grid_cell *);
 static void	tty_colours_fg(struct tty *, const struct grid_cell *);
 static void	tty_colours_bg(struct tty *, const struct grid_cell *);
 static void	tty_colours_us(struct tty *, const struct grid_cell *);
@@ -291,6 +293,8 @@ tty_open(struct tty *tty, char **cause)
 	if (tty->out == NULL)
 		fatal("out of memory");
 
+	evtimer_set(&tty->clipboard_timer, tty_clipboard_query_callback, tty);
+	evtimer_set(&tty->start_timer, tty_start_timer_callback, tty);
 	evtimer_set(&tty->timer, tty_timer_callback, tty);
 
 	tty_start_tty(tty);
@@ -306,9 +310,23 @@ tty_start_timer_callback(__unused int fd, __unused short events, void *data)
 	struct client	*c = tty->client;
 
 	log_debug("%s: start timer fired", c->name);
+
 	if ((tty->flags & (TTY_HAVEDA|TTY_HAVEDA2|TTY_HAVEXDA)) == 0)
 		tty_update_features(tty);
 	tty->flags |= TTY_ALL_REQUEST_FLAGS;
+
+	tty->flags &= ~(TTY_WAITBG|TTY_WAITFG);
+}
+
+static void
+tty_start_start_timer(struct tty *tty)
+{
+	struct client	*c = tty->client;
+	struct timeval	 tv = { .tv_sec = TTY_QUERY_TIMEOUT };
+
+	log_debug("%s: start timer started", c->name);
+	evtimer_del(&tty->start_timer);
+	evtimer_add(&tty->start_timer, &tv);
 }
 
 void
@@ -316,7 +334,6 @@ tty_start_tty(struct tty *tty)
 {
 	struct client	*c = tty->client;
 	struct termios	 tio;
-	struct timeval	 tv = { .tv_sec = TTY_QUERY_TIMEOUT };
 
 	setblocking(c->fd, 0);
 	event_add(&tty->event_in, NULL);
@@ -356,8 +373,7 @@ tty_start_tty(struct tty *tty)
 		tty_puts(tty, "\033[?2031h\033[?996n");
 	}
 
-	evtimer_set(&tty->start_timer, tty_start_timer_callback, tty);
-	evtimer_add(&tty->start_timer, &tv);
+	tty_start_start_timer(tty);
 
 	tty->flags |= TTY_STARTED;
 	tty_invalidate(tty);
@@ -377,35 +393,43 @@ tty_send_requests(struct tty *tty)
 		return;
 
 	if (tty->term->flags & TERM_VT100LIKE) {
-		if (~tty->term->flags & TTY_HAVEDA)
+		if (~tty->flags & TTY_HAVEDA)
 			tty_puts(tty, "\033[c");
 		if (~tty->flags & TTY_HAVEDA2)
 			tty_puts(tty, "\033[>c");
 		if (~tty->flags & TTY_HAVEXDA)
 			tty_puts(tty, "\033[>q");
-		tty_puts(tty, "\033]10;?\033\\");
-		tty_puts(tty, "\033]11;?\033\\");
+		tty_puts(tty, "\033]10;?\033\\\033]11;?\033\\");
+		tty->flags |= (TTY_WAITBG|TTY_WAITFG);
 	} else
 		tty->flags |= TTY_ALL_REQUEST_FLAGS;
 	tty->last_requests = time(NULL);
 }
 
 void
-tty_repeat_requests(struct tty *tty)
+tty_repeat_requests(struct tty *tty, int force)
 {
-	time_t	t = time(NULL);
+	struct client	*c = tty->client;
+	time_t		 t = time(NULL);
+	u_int		 n = t - tty->last_requests;
 
 	if (~tty->flags & TTY_STARTED)
 		return;
 
-	if (t - tty->last_requests <= TTY_REQUEST_LIMIT)
+	if (!force && n <= TTY_REQUEST_LIMIT) {
+		log_debug("%s: not repeating requests (%u seconds)", c->name,
+		    n);
 		return;
+	}
+	log_debug("%s: %srepeating requests (%u seconds)", c->name,
+	    force ? "(force) " : "" , n);
 	tty->last_requests = t;
 
 	if (tty->term->flags & TERM_VT100LIKE) {
-		tty_puts(tty, "\033]10;?\033\\");
-		tty_puts(tty, "\033]11;?\033\\");
+		tty_puts(tty, "\033]10;?\033\\\033]11;?\033\\");
+		tty->flags |= (TTY_WAITBG|TTY_WAITFG);
 	}
+	tty_start_start_timer(tty);
 }
 
 void
@@ -419,6 +443,7 @@ tty_stop_tty(struct tty *tty)
 	tty->flags &= ~TTY_STARTED;
 
 	evtimer_del(&tty->start_timer);
+	evtimer_del(&tty->clipboard_timer);
 
 	event_del(&tty->timer);
 	tty->flags &= ~TTY_BLOCK;
@@ -1643,7 +1668,7 @@ tty_sync_end(struct tty *tty)
 	tty->flags &= ~TTY_SYNCING;
 
 	if (tty_term_has(tty->term, TTYC_SYNC)) {
- 		log_debug("%s sync end", tty->client->name);
+		log_debug("%s sync end", tty->client->name);
 		tty_putcode_i(tty, TTYC_SYNC, 2);
 	}
 }
@@ -3065,12 +3090,6 @@ static void
 tty_clipboard_query_callback(__unused int fd, __unused short events, void *data)
 {
 	struct tty	*tty = data;
-	struct client	*c = tty->client;
-
-	c->flags &= ~CLIENT_CLIPBOARDBUFFER;
-	free(c->clipboard_panes);
-	c->clipboard_panes = NULL;
-	c->clipboard_npanes = 0;
 
 	tty->flags &= ~TTY_OSC52QUERY;
 }
@@ -3080,11 +3099,9 @@ tty_clipboard_query(struct tty *tty)
 {
 	struct timeval	 tv = { .tv_sec = TTY_QUERY_TIMEOUT };
 
-	if ((~tty->flags & TTY_STARTED) || (tty->flags & TTY_OSC52QUERY))
-		return;
-	tty_putcode_ss(tty, TTYC_MS, "", "?");
-
-	tty->flags |= TTY_OSC52QUERY;
-	evtimer_set(&tty->clipboard_timer, tty_clipboard_query_callback, tty);
-	evtimer_add(&tty->clipboard_timer, &tv);
+	if ((tty->flags & TTY_STARTED) && (~tty->flags & TTY_OSC52QUERY)) {
+		tty_putcode_ss(tty, TTYC_MS, "", "?");
+		tty->flags |= TTY_OSC52QUERY;
+		evtimer_add(&tty->clipboard_timer, &tv);
+	}
 }

@@ -1,4 +1,4 @@
-#       $OpenBSD: BSD.x11.dist,v 1.59 2025/05/24 02:46:02 jsg Exp $
+#       $OpenBSD: BSD.x11.dist,v 1.61 2025/11/23 13:50:06 matthieu Exp $
 
 /set type=dir uname=root gname=wheel mode=0755
 .
@@ -345,8 +345,6 @@
                 ..
                 doc
                     fontconfig
-                        fontconfig-devel
-                        ..
                     ..
                     libICE
                     ..
@@ -412,7 +410,7 @@
     ..
     var
         cache
-            fontconfig
+            fontconfig uname=_fc-cache gname=_fc-cache
             ..
         ..
         db

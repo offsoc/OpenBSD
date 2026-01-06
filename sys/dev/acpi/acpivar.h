@@ -1,4 +1,4 @@
-/*	$OpenBSD: acpivar.h,v 1.135 2025/05/24 14:51:52 tedu Exp $	*/
+/*	$OpenBSD: acpivar.h,v 1.139 2025/11/14 01:55:07 jcs Exp $	*/
 /*
  * Copyright (c) 2005 Thorsten Lockert <tholo@sigmasoft.com>
  *
@@ -249,6 +249,7 @@ struct acpi_softc {
 	}			sc_sleeptype[6];
 	int			sc_lastgpe;
 	int			sc_wakegpe;
+	int			sc_wakegpio;
 
 	struct gpe_block	*gpe_table;
 
@@ -267,7 +268,6 @@ struct acpi_softc {
 	int			sc_state;
 	int			sc_wakeup;
 	int			sc_wakeups;
-	time_t			sc_resume_time;
 	struct acpiec_softc	*sc_ec;		/* XXX assume single EC */
 
 	struct acpi_ac_head	sc_ac;
@@ -314,6 +314,8 @@ int	 acpi_bus_space_map(bus_space_tag_t, bus_addr_t, bus_size_t, int,
 	     bus_space_handle_t *);
 void	 acpi_bus_space_unmap(bus_space_tag_t, bus_space_handle_t, bus_size_t);
 
+struct aml_node *acpi_pci_match(struct device *, struct pci_attach_args *);
+
 struct	 bios_attach_args;
 int	 acpi_probe(struct device *, struct cfdata *, struct bios_attach_args *);
 u_int	 acpi_checksum(const void *, size_t);
@@ -327,7 +329,6 @@ int	 acpi_sleep_cpu(struct acpi_softc *, int);
 void	 acpi_sleep_pm(struct acpi_softc *, int);
 void	 acpi_resume_pm(struct acpi_softc *, int);
 void	 acpi_resume_cpu(struct acpi_softc *, int);
-int	 acpi_resuming(struct acpi_softc *);
 
 #define ACPI_IOREAD 0
 #define ACPI_IOWRITE 1
@@ -379,7 +380,6 @@ int	acpi_record_event(struct acpi_softc *, u_int);
 void	acpi_addtask(struct acpi_softc *, void (*)(void *, int), void *, int);
 int	acpi_dotask(struct acpi_softc *);
 
-void	acpi_powerdown_task(void *, int);
 void	acpi_sleep_task(void *, int);
 
 /* Section 5.2.10.1: global lock acquire/release functions */

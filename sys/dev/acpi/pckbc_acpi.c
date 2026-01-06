@@ -1,4 +1,4 @@
-/*	$OpenBSD: pckbc_acpi.c,v 1.4 2025/05/28 07:04:27 tedu Exp $	*/
+/*	$OpenBSD: pckbc_acpi.c,v 1.6 2025/06/16 15:44:35 kettenis Exp $	*/
 /*
  * Copyright (c) 2024, 2025, Miodrag Vallat.
  *
@@ -107,7 +107,6 @@ void	pckbc_acpi_crs_walk(struct device *, struct aml_node *,
 int	pckbc_acpi_getgpioirqcount(int, union acpi_resource *, void *);
 int	pckbc_acpi_getgpioirqdata(int, union acpi_resource *, void *);
 void	pckbc_acpi_register_gpio_intrs(struct device *);
-int	pckbc_acpi_gpio_intr_wrapper(void *);
 
 int
 pckbc_acpi_match(struct device *parent, void *match, void *aux)
@@ -290,8 +289,8 @@ pckbc_acpi_attach_kbd(struct device *parent, struct device *self, void *aux)
 			if (pasc->sc_nints == nitems(pasc->sc_ih))
 				break;
 			pasc->sc_ih[pasc->sc_nints] = acpi_intr_establish(
-			    aaa->aaa_irq[irq], aaa->aaa_irq_flags[irq], IPL_TTY,
-			    pckbcintr, pasc, self->dv_xname);
+			    aaa->aaa_irq[irq], aaa->aaa_irq_flags[irq],
+			    IPL_TTY, pckbcintr, pasc, self->dv_xname);
 			if (pasc->sc_ih[pasc->sc_nints] == NULL) {
 				printf("%s: can't establish interrupt %d\n",
 				    self->dv_xname, aaa->aaa_irq[irq]);
@@ -392,8 +391,8 @@ pckbc_acpi_attach_mouse(struct device *parent, struct device *self, void *aux)
 			if (pasc->sc_nints == nitems(pasc->sc_ih))
 				break;
 			pasc->sc_ih[pasc->sc_nints] = acpi_intr_establish(
-			    aaa->aaa_irq[irq], aaa->aaa_irq_flags[irq], IPL_TTY,
-			    pckbcintr, pasc, self->dv_xname);
+			    aaa->aaa_irq[irq], aaa->aaa_irq_flags[irq],
+			    IPL_TTY, pckbcintr, pasc, self->dv_xname);
 			if (pasc->sc_ih[pasc->sc_nints] == NULL) {
 				printf("%s: can't establish interrupt %d\n",
 				    self->dv_xname, aaa->aaa_irq[irq]);
@@ -431,9 +430,8 @@ pckbc_acpi_register_gpio_intrs(struct device *dev)
 			    dev->dv_xname, sc->sc_gpioint[irq].pin);
 			continue;
 		}
-		gpio->intr_establish(gpio->cookie,
-		    sc->sc_gpioint[irq].pin, sc->sc_gpioint[irq].flags,
-		    pckbc_acpi_gpio_intr_wrapper, sc);
+		gpio->intr_establish(gpio->cookie, sc->sc_gpioint[irq].pin,
+		    sc->sc_gpioint[irq].flags, IPL_TTY, pckbcintr, sc);
 	}
 }
 
@@ -537,18 +535,4 @@ pckbc_acpi_getgpioirqdata(int crsidx, union acpi_resource *crs, void *arg)
 		break;
 	}
 	return 0;
-}
-
-/*
- * Wrapper for GPIO interrupts, to enforce IPL_TTY.
- */
-int
-pckbc_acpi_gpio_intr_wrapper(void *arg)
-{
-	int s, rv;
-
-	s = spltty();
-	rv = pckbcintr(arg);
-	splx(s);
-	return rv;
 }

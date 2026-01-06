@@ -1,4 +1,4 @@
-/*	$Id: test-cert.c,v 1.24 2024/04/22 05:54:01 claudio Exp $ */
+/*	$Id: test-cert.c,v 1.27 2025/10/23 05:26:25 tb Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -34,7 +34,7 @@
 
 int outformats;
 int verbose;
-int filemode;
+int filemode = 1;
 int experimental;
 
 int
@@ -43,9 +43,6 @@ main(int argc, char *argv[])
 	int		 c, i, verb = 0, ta = 0;
 	struct cert	*p;
 
-	ERR_load_crypto_strings();
-	OpenSSL_add_all_ciphers();
-	OpenSSL_add_all_digests();
 	x509_init_oid();
 
 	while ((c = getopt(argc, argv, "tv")) != -1)
@@ -84,7 +81,7 @@ main(int argc, char *argv[])
 				break;
 
 			buf = load_file(cert_path, &len);
-			p = cert_parse_pre(cert_path, buf, len);
+			p = cert_parse(cert_path, buf, len);
 			free(buf);
 			if (p == NULL)
 				break;
@@ -103,11 +100,8 @@ main(int argc, char *argv[])
 			size_t		 len;
 
 			buf = load_file(argv[i], &len);
-			p = cert_parse_pre(argv[i], buf, len);
+			p = cert_parse(argv[i], buf, len);
 			free(buf);
-			if (p == NULL)
-				break;
-			p = cert_parse(argv[i], p);
 			if (p == NULL)
 				break;
 			if (verb)
@@ -115,10 +109,6 @@ main(int argc, char *argv[])
 			cert_free(p);
 		}
 	}
-
-	EVP_cleanup();
-	CRYPTO_cleanup_all_ex_data();
-	ERR_free_strings();
 
 	if (i < argc)
 		errx(1, "test failed for %s", argv[i]);

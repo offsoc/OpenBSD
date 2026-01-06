@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ix.c,v 1.220 2025/05/22 10:50:10 jan Exp $	*/
+/*	$OpenBSD: if_ix.c,v 1.222 2025/11/11 17:43:18 bluhm Exp $	*/
 
 /******************************************************************************
 
@@ -36,6 +36,8 @@
 
 #include <dev/pci/if_ix.h>
 #include <dev/pci/ixgbe_type.h>
+
+#define IX_MAX_VECTORS			64
 
 /*
  * Our TCP/IP Stack is unable to handle packets greater than MAXMCLBYTES.
@@ -1851,10 +1853,12 @@ ixgbe_setup_msix(struct ix_softc *sc)
 	/* give one vector to events */
 	nmsix--;
 
+	maxq = IX_MAX_VECTORS;
 	/* XXX the number of queues is limited to what we can keep stats on */
-	maxq = (sc->hw.mac.type == ixgbe_mac_82598EB) ? 8 : 16;
-
-	sc->sc_intrmap = intrmap_create(&sc->dev, nmsix, maxq, 0);
+	if (sc->hw.mac.type == ixgbe_mac_82598EB)
+		maxq = 8;
+	sc->sc_intrmap = intrmap_create(&sc->dev, nmsix,
+	    MIN(maxq, IF_MAX_VECTORS), 0);
 	sc->num_queues = intrmap_count(sc->sc_intrmap);
 }
 
@@ -2641,6 +2645,7 @@ ixgbe_txeof(struct ix_txring *txr)
 	unsigned int			 head, tail, last;
 	struct ixgbe_tx_buf		*tx_buffer;
 	struct ixgbe_legacy_tx_desc	*tx_desc;
+	int done = 0;
 
 	if (!ISSET(ifp->if_flags, IFF_RUNNING))
 		return FALSE;
@@ -2673,6 +2678,7 @@ ixgbe_txeof(struct ix_txring *txr)
 		tx_buffer->m_head = NULL;
 		tx_buffer->eop_index = -1;
 
+		done = 1;
 		tail = last + 1;
 		if (tail == sc->num_tx_desc)
 			tail = 0;
@@ -2691,7 +2697,7 @@ ixgbe_txeof(struct ix_txring *txr)
 
 	txr->next_to_clean = tail;
 
-	if (ifq_is_oactive(ifq))
+	if (done && ifq_is_oactive(ifq))
 		ifq_restart(ifq);
 
 	return TRUE;

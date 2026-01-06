@@ -1,4 +1,4 @@
-/*	$OpenBSD: dkio.h,v 1.12 2017/10/24 09:36:13 jsg Exp $	*/
+/*	$OpenBSD: dkio.h,v 1.14 2025/11/13 20:59:14 deraadt Exp $	*/
 /*	$NetBSD: dkio.h,v 1.1 1996/01/30 18:21:48 thorpej Exp $	*/
 
 /*
@@ -49,6 +49,10 @@
 
 #define DIOCGPDINFO	_IOR('d', 114, struct disklabel)/* get physical */
 #define DIOCRLDINFO	_IO('d', 115)			/* reload disklabel */
+
+/* XXX temporary to support the transition to more partitions */
+#define O_disklabel offsetof(struct disklabel, d_partitions[MAXPARTITIONS16])
+#define O_DIOCGDINFO _IOC(IOC_OUT, 'd', 101, O_disklabel)
 
 struct dk_inquiry {
 	char		vendor[64];

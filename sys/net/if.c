@@ -1,4 +1,4 @@
-/*	$OpenBSD: if.c,v 1.734 2025/05/09 03:12:36 dlg Exp $	*/
+/*	$OpenBSD: if.c,v 1.762 2026/01/03 14:10:04 bluhm Exp $	*/
 /*	$NetBSD: if.c,v 1.35 1996/05/07 05:26:04 thorpej Exp $	*/
 
 /*
@@ -73,16 +73,13 @@
 #include <sys/systm.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 #include <sys/timeout.h>
 #include <sys/protosw.h>
 #include <sys/kernel.h>
 #include <sys/ioctl.h>
-#include <sys/domain.h>
 #include <sys/task.h>
 #include <sys/atomic.h>
 #include <sys/percpu.h>
-#include <sys/proc.h>
 #include <sys/stdint.h>	/* uintptr_t */
 #include <sys/rwlock.h>
 #include <sys/smr.h>
@@ -92,11 +89,6 @@
 #include <net/if_types.h>
 #include <net/route.h>
 #include <net/netisr.h>
-
-#include "vlan.h"
-#if NVLAN > 0
-#include <net/if_vlan_var.h>
-#endif
 
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
@@ -112,7 +104,6 @@
 #include <netinet6/in6_var.h>
 #include <netinet6/in6_ifattach.h>
 #include <netinet6/nd6.h>
-#include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
 #endif
 
@@ -126,10 +117,6 @@
 
 #if NBRIDGE > 0
 #include <net/if_bridge.h>
-#endif
-
-#if NCARP > 0
-#include <netinet/ip_carp.h>
 #endif
 
 #if NPF > 0
@@ -200,8 +187,6 @@ struct softnet *
  * if_get(0) returns NULL.
  */
 
-struct ifnet *if_ref(struct ifnet *);
-
 /*
  * struct if_idxmap
  *
@@ -252,7 +237,11 @@ struct softnet {
 	struct taskq	*sn_taskq;
 	struct netstack	 sn_netstack;
 } __aligned(64);
-#define NET_TASKQ	4
+#ifdef MULTIPROCESSOR
+#define NET_TASKQ	8
+#else
+#define NET_TASKQ	1
+#endif
 struct softnet	softnets[NET_TASKQ];
 
 struct task	if_input_task_locked = TASK_INITIALIZER(if_netisr, NULL);
@@ -261,7 +250,8 @@ struct task	if_input_task_locked = TASK_INITIALIZER(if_netisr, NULL);
  * Serialize socket operations to ensure no new sleeping points
  * are introduced in IP output paths.
  */
-struct rwlock netlock = RWLOCK_INITIALIZER("netlock");
+struct rwlock netlock = RWLOCK_INITIALIZER_TRACE("netlock",
+    DT_RWLOCK_IDX_NETLOCK);
 
 /*
  * Network interface utility routines.
@@ -269,22 +259,44 @@ struct rwlock netlock = RWLOCK_INITIALIZER("netlock");
 void
 ifinit(void)
 {
-	unsigned int	i;
-
 	/*
 	 * most machines boot with 4 or 5 interfaces, so size the initial map
 	 * to accommodate this
 	 */
 	if_idxmap_init(8); /* 8 is a nice power of 2 for malloc */
+}
 
+void
+softnet_init(void)
+{
+	unsigned int i;
+
+	/* Number of CPU is unknown, but driver attach needs softnet tasks. */
 	for (i = 0; i < NET_TASKQ; i++) {
 		struct softnet *sn = &softnets[i];
+
 		snprintf(sn->sn_name, sizeof(sn->sn_name), "softnet%u", i);
 		sn->sn_taskq = taskq_create(sn->sn_name, 1, IPL_NET,
 		    TASKQ_MPSAFE);
 		if (sn->sn_taskq == NULL)
 			panic("unable to create network taskq %d", i);
 	}
+}
+
+void
+softnet_percpu(void)
+{
+#ifdef MULTIPROCESSOR
+	unsigned int i;
+
+	/* After attaching all CPUs and interfaces, remove useless threads. */
+	for (i = softnet_count(); i < NET_TASKQ; i++) {
+		struct softnet *sn = &softnets[i];
+
+		taskq_destroy(sn->sn_taskq);
+		sn->sn_taskq = NULL;
+	}
+#endif /* MULTIPROCESSOR */
 }
 
 static struct if_idxmap if_idxmap;
@@ -465,6 +477,22 @@ if_idxmap_remove(struct ifnet *ifp)
 
 	smr_barrier();
 	if_put(ifp);
+}
+
+static inline struct ifnet *
+if_idxmap_get(unsigned int index)
+{
+	struct ifnet **if_map;
+	struct ifnet *ifp = NULL;
+
+	if (index == 0)
+		return (NULL);
+
+	if_map = SMR_PTR_GET(&if_idxmap.map);
+	if (index < if_idxmap_limit(if_map))
+		ifp = SMR_PTR_GET(&if_map[index]);
+
+	return (ifp);
 }
 
 /*
@@ -783,6 +811,7 @@ int
 if_input_local(struct ifnet *ifp, struct mbuf *m, sa_family_t af,
     struct netstack *ns)
 {
+	void (*input)(struct ifnet *, struct mbuf *, struct netstack *);
 	int keepflags, keepcksum;
 	uint16_t keepmss;
 	uint16_t keepflowid;
@@ -852,16 +881,16 @@ if_input_local(struct ifnet *ifp, struct mbuf *m, sa_family_t af,
 	case AF_INET:
 		if (ISSET(keepcksum, M_IPV4_CSUM_OUT))
 			m->m_pkthdr.csum_flags |= M_IPV4_CSUM_IN_OK;
-		ipv4_input(ifp, m, ns);
+		input = ipv4_input;
 		break;
 #ifdef INET6
 	case AF_INET6:
-		ipv6_input(ifp, m, ns);
+		input = ipv6_input;
 		break;
 #endif /* INET6 */
 #ifdef MPLS
 	case AF_MPLS:
-		mpls_input(ifp, m, ns);
+		input = mpls_input;
 		break;
 #endif /* MPLS */
 	default:
@@ -870,6 +899,7 @@ if_input_local(struct ifnet *ifp, struct mbuf *m, sa_family_t af,
 		return (EAFNOSUPPORT);
 	}
 
+	if_input_proto(ifp, m, input, ns);
 	return (0);
 }
 
@@ -971,8 +1001,6 @@ if_output_local(struct ifnet *ifp, struct mbuf *m, sa_family_t af)
 	unsigned int flow = 0;
 
 	m->m_pkthdr.ph_family = af;
-	m->m_pkthdr.ph_ifidx = ifp->if_index;
-	m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
 
 	if (ISSET(m->m_pkthdr.csum_flags, M_FLOWID))
 		flow = m->m_pkthdr.ph_flowid;
@@ -983,10 +1011,27 @@ if_output_local(struct ifnet *ifp, struct mbuf *m, sa_family_t af)
 }
 
 void
+if_input_proto(struct ifnet *ifp, struct mbuf *m, 
+    void (*input)(struct ifnet *, struct mbuf *, struct netstack *),
+    struct netstack *ns)
+{
+	if (ns == NULL) {
+		NET_ASSERT_LOCKED();
+		(*input)(ifp, m, NULL);
+		return;
+	}
+
+	m->m_pkthdr.ph_ifidx = ifp->if_index;
+	m->m_pkthdr.ph_cookie = input;
+	ml_enqueue(&ns->ns_proto, m);
+}
+
+void
 if_input_process(struct ifnet *ifp, struct mbuf_list *ml, unsigned int idx)
 {
 	struct mbuf *m;
 	struct softnet *sn;
+	struct netstack *ns;
 
 	if (ml_empty(ml))
 		return;
@@ -1002,21 +1047,46 @@ if_input_process(struct ifnet *ifp, struct mbuf_list *ml, unsigned int idx)
 	 */
 
 	sn = net_sn(idx);
-	ml_init(&sn->sn_netstack.ns_tcp_ml);
+	ns = &sn->sn_netstack;
+	ml_init(&ns->ns_input);
+	ml_init(&ns->ns_proto);
+
+	ml_init(&ns->ns_tcp_ml);
 #ifdef INET6
-	ml_init(&sn->sn_netstack.ns_tcp6_ml);
+	ml_init(&ns->ns_tcp6_ml);
 #endif
 
 	NET_LOCK_SHARED();
-
 	while ((m = ml_dequeue(ml)) != NULL)
-		(*ifp->if_input)(ifp, m, &sn->sn_netstack);
+		(*ifp->if_input)(ifp, m, ns);
 
-	tcp_input_mlist(&sn->sn_netstack.ns_tcp_ml, AF_INET);
+	do {
+		while ((m = ml_dequeue(&ns->ns_input)) != NULL) {
+			smr_read_enter();
+			ifp = if_idxmap_get(m->m_pkthdr.ph_ifidx);
+			smr_read_leave();
+			if (ifp != NULL)
+				(*ifp->if_input)(ifp, m, ns);
+			else
+				m_freem(m);
+		}
+
+		while ((m = ml_dequeue(&ns->ns_proto)) != NULL) {
+			smr_read_enter();
+			ifp = if_idxmap_get(m->m_pkthdr.ph_ifidx);
+			smr_read_leave();
+			if (ifp != NULL)
+				if_input_process_proto(ifp, m, ns);
+			else
+				m_freem(m);
+
+		}
+
+		tcp_input_mlist(&ns->ns_tcp_ml, AF_INET);
 #ifdef INET6
-	tcp_input_mlist(&sn->sn_netstack.ns_tcp6_ml, AF_INET6);
+		tcp_input_mlist(&ns->ns_tcp6_ml, AF_INET6);
 #endif
-
+	} while (!ml_empty(&ns->ns_input));
 	NET_UNLOCK_SHARED();
 }
 
@@ -1027,15 +1097,20 @@ if_vinput(struct ifnet *ifp, struct mbuf *m, struct netstack *ns)
 	caddr_t if_bpf;
 #endif
 
+#if NPF > 0
+	pf_pkt_addr_changed(m);
+#endif
+
+	if (ns == NULL) {
+		ifiq_enqueue(&ifp->if_rcv, m);
+		return;
+	}
+
 	m->m_pkthdr.ph_ifidx = ifp->if_index;
 	m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
 
 	counters_pkt(ifp->if_counters,
 	    ifc_ipackets, ifc_ibytes, m->m_pkthdr.len);
-
-#if NPF > 0
-	pf_pkt_addr_changed(m);
-#endif
 
 #if NBPFILTER > 0
 	if_bpf = ifp->if_bpf;
@@ -1048,7 +1123,7 @@ if_vinput(struct ifnet *ifp, struct mbuf *m, struct netstack *ns)
 #endif
 
 	if (__predict_true(!ISSET(ifp->if_xflags, IFXF_MONITOR)))
-		(*ifp->if_input)(ifp, m, ns);
+		ml_enqueue(&ns->ns_input, m);
 	else
 		m_freem(m);
 }
@@ -1090,10 +1165,6 @@ if_netisr(void *unused)
 #if NBRIDGE > 0
 		if (n & (1 << NETISR_BRIDGE))
 			bridgeintr();
-#endif
-#ifdef PIPEX
-		if (n & (1 << NETISR_PIPEX))
-			pipexintr();
 #endif
 #if NPPPOE > 0
 		if (n & (1 << NETISR_PPPOE)) {
@@ -1147,6 +1218,9 @@ if_remove(struct ifnet *ifp)
 
 	/* Remove the interface from the interface index map. */
 	if_idxmap_remove(ifp);
+
+	/* Make sure softnet threads have finished with it */
+	net_tq_barriers("ifrmnet");
 
 	/* Sleep until the last reference is released. */
 	refcnt_finalize(&ifp->if_refcnt, "ifrm");
@@ -1202,8 +1276,10 @@ if_detach(struct ifnet *ifp)
 	ifp->if_qstart = if_detached_qstart;
 
 	/* Wait until the start routines finished. */
-	ifq_barrier(&ifp->if_snd);
-	ifq_clr_oactive(&ifp->if_snd);
+	for (i = 0; i < ifp->if_nifqs; i++) {
+		ifq_barrier(ifp->if_ifqs[i]);
+		ifq_clr_oactive(ifp->if_ifqs[i]);
+	}
 
 #if NBPFILTER > 0
 	bpfdetach(ifp);
@@ -1379,6 +1455,7 @@ if_clone_destroy(const char *name)
 	if (ifc->ifc_destroy == NULL)
 		return (EOPNOTSUPP);
 
+	KERNEL_ASSERT_LOCKED();
 	rw_enter_write(&if_cloners_lock);
 
 	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
@@ -1718,7 +1795,7 @@ p2p_input(struct ifnet *ifp, struct mbuf *m, struct netstack *ns)
 		return;
 	}
 
-	(*input)(ifp, m, ns);
+	if_input_proto(ifp, m, input, ns);
 }
 
 /*
@@ -1901,27 +1978,31 @@ if_unit(const char *name)
 /*
  * Map interface index to interface structure pointer.
  */
+
 struct ifnet *
 if_get(unsigned int index)
 {
-	struct ifnet **if_map;
-	struct ifnet *ifp = NULL;
+	struct ifnet *ifp;
 
 	if (index == 0)
 		return (NULL);
 
 	smr_read_enter();
-	if_map = SMR_PTR_GET(&if_idxmap.map);
-	if (index < if_idxmap_limit(if_map)) {
-		ifp = SMR_PTR_GET(&if_map[index]);
-		if (ifp != NULL) {
-			KASSERT(ifp->if_index == index);
-			if_ref(ifp);
-		}
+	ifp = if_idxmap_get(index);
+	if (ifp != NULL) {
+		KASSERT(ifp->if_index == index);
+		if_ref(ifp);
 	}
 	smr_read_leave();
 
 	return (ifp);
+}
+
+struct ifnet *
+if_get_smr(unsigned int index)
+{
+	SMR_ASSERT_CRITICAL();
+	return if_idxmap_get(index);
 }
 
 struct ifnet *
@@ -2443,11 +2524,14 @@ forceup:
 	case SIOCBRDGADDS:
 	case SIOCBRDGDELS:
 	case SIOCBRDGSADDR:
+	case SIOCBRDGSVADDR:
 	case SIOCBRDGSTO:
 	case SIOCBRDGDADDR:
+	case SIOCBRDGDVADDR:
 	case SIOCBRDGFLUSH:
 	case SIOCBRDGADDL:
 	case SIOCBRDGSIFPROT:
+	case SIOCBRDGSPVID:
 	case SIOCBRDGARL:
 	case SIOCBRDGFRL:
 	case SIOCBRDGSPRI:
@@ -2458,6 +2542,9 @@ forceup:
 	case SIOCBRDGSIFCOST:
 	case SIOCBRDGSTXHC:
 	case SIOCBRDGSPROTO:
+	case SIOCBRDGSVMAP:
+	case SIOCBRDGADDPV:
+	case SIOCBRDGDELPV:
 #endif
 		if ((error = suser(p)) != 0)
 			break;
@@ -2517,24 +2604,18 @@ ifioctl_get(u_long cmd, caddr_t data)
 
 	switch(cmd) {
 	case SIOCGIFCONF:
-		NET_LOCK_SHARED();
-		error = ifconf(data);
-		NET_UNLOCK_SHARED();
-		return (error);
+		return (ifconf(data));
 	case SIOCIFGCLONERS:
-		error = if_clone_list((struct if_clonereq *)data);
-		return (error);
+		return (if_clone_list((struct if_clonereq *)data));
 	case SIOCGIFGMEMB:
-		error = if_getgroupmembers(data);
-		return (error);
+		return (if_getgroupmembers(data));
 	case SIOCGIFGATTR:
 		NET_LOCK_SHARED();
 		error = if_getgroupattribs(data);
 		NET_UNLOCK_SHARED();
 		return (error);
 	case SIOCGIFGLIST:
-		error = if_getgrouplist(data);
-		return (error);
+		return (if_getgrouplist(data));
 	}
 
 	KERNEL_LOCK();
@@ -2716,6 +2797,8 @@ if_rxhprio_l3_check(int hdrprio)
 int
 ifconf(caddr_t data)
 {
+	TAILQ_HEAD(, ifnet) if_tmplist;
+	TAILQ_HEAD(, ifaddr) addr_tmplist;
 	struct ifconf *ifc = (struct ifconf *)data;
 	struct ifnet *ifp;
 	struct ifaddr *ifa;
@@ -2724,6 +2807,7 @@ ifconf(caddr_t data)
 
 	/* If ifc->ifc_len is 0, fill it in with the needed size and return. */
 	if (space == 0) {
+		NET_LOCK_SHARED();
 		TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
 			struct sockaddr *sa;
 
@@ -2739,53 +2823,106 @@ ifconf(caddr_t data)
 					space += sizeof(ifr);
 				}
 		}
+		NET_UNLOCK_SHARED();
 		ifc->ifc_len = space;
 		return (0);
 	}
 
+	TAILQ_INIT(&if_tmplist);
+	TAILQ_INIT(&addr_tmplist);
+
 	ifrp = ifc->ifc_req;
+	memset(&ifr, 0, sizeof(ifr));
+
+	rw_enter_write(&if_tmplist_lock);
+	NET_LOCK_SHARED();
 	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
+		if_ref(ifp);
+		TAILQ_INSERT_TAIL(&if_tmplist, ifp, if_tmplist);
+	}
+	NET_UNLOCK_SHARED();
+
+	TAILQ_FOREACH(ifp, &if_tmplist, if_tmplist) {
 		if (space < sizeof(ifr))
-			break;
-		bcopy(ifp->if_xname, ifr.ifr_name, IFNAMSIZ);
-		if (TAILQ_EMPTY(&ifp->if_addrlist)) {
-			bzero((caddr_t)&ifr.ifr_addr, sizeof(ifr.ifr_addr));
+			goto free;
+		memcpy(ifr.ifr_name, ifp->if_xname, IFNAMSIZ);
+
+		NET_LOCK_SHARED();
+		TAILQ_FOREACH(ifa, &ifp->if_addrlist, ifa_list) {
+			ifaref(ifa);
+			TAILQ_INSERT_TAIL(&addr_tmplist, ifa, ifa_tmplist);
+		}
+		NET_UNLOCK_SHARED();
+
+		if (TAILQ_EMPTY(&addr_tmplist)) {
+			memset(&ifr.ifr_addr, 0, sizeof(ifr.ifr_addr));
 			error = copyout((caddr_t)&ifr, (caddr_t)ifrp,
 			    sizeof(ifr));
 			if (error)
-				break;
-			space -= sizeof (ifr), ifrp++;
-		} else
-			TAILQ_FOREACH(ifa, &ifp->if_addrlist, ifa_list) {
+				goto free;
+
+			space -= sizeof(ifr);
+			ifrp++;
+		} else {
+			TAILQ_FOREACH(ifa, &addr_tmplist, ifa_tmplist) {
 				struct sockaddr *sa = ifa->ifa_addr;
 
 				if (space < sizeof(ifr))
-					break;
+					goto free;
 				if (sa->sa_len <= sizeof(*sa)) {
-					ifr.ifr_addr = *sa;
+					memset(&ifr.ifr_addr, 0,
+					    sizeof(ifr.ifr_addr));
+					memcpy(&ifr.ifr_addr, sa, sa->sa_len);
 					error = copyout((caddr_t)&ifr,
 					    (caddr_t)ifrp, sizeof (ifr));
+					if (error)
+						goto free;
+
+					space -= sizeof(ifr);
 					ifrp++;
 				} else {
-					space -= sa->sa_len - sizeof(*sa);
-					if (space < sizeof (ifr))
-						break;
+					int total = sizeof(ifr.ifr_name) +
+					    sa->sa_len;
+
+					if (space < total)
+						goto free;
 					error = copyout((caddr_t)&ifr,
 					    (caddr_t)ifrp,
 					    sizeof(ifr.ifr_name));
-					if (error == 0)
-						error = copyout((caddr_t)sa,
-						    (caddr_t)&ifrp->ifr_addr,
-						    sa->sa_len);
-					ifrp = (struct ifreq *)(sa->sa_len +
-					    (caddr_t)&ifrp->ifr_addr);
+					if (error)
+						goto free;
+					error = copyout((caddr_t)sa,
+					    (caddr_t)&ifrp->ifr_addr,
+					    sa->sa_len);
+					if (error)
+						goto free;
+
+					space -= total;
+					ifrp = (struct ifreq *)(
+					    (caddr_t)ifrp + total);
 				}
-				if (error)
-					break;
-				space -= sizeof (ifr);
 			}
+		}
+
+		while((ifa = TAILQ_FIRST(&addr_tmplist))) {
+			TAILQ_REMOVE(&addr_tmplist, ifa, ifa_tmplist);
+			ifafree(ifa);
+		}
 	}
-	ifc->ifc_len -= space;
+
+free:
+	while((ifa = TAILQ_FIRST(&addr_tmplist))) {
+		TAILQ_REMOVE(&addr_tmplist, ifa, ifa_tmplist);
+		ifafree(ifa);
+	}
+	while ((ifp = TAILQ_FIRST(&if_tmplist))) {
+		TAILQ_REMOVE(&if_tmplist, ifp, if_tmplist);
+		if_put(ifp);
+	}
+	rw_exit_write(&if_tmplist_lock);
+
+	if (error == 0)
+		ifc->ifc_len -= space;
 	return (error);
 }
 
@@ -3394,10 +3531,12 @@ ifsetlro(struct ifnet *ifp, int on)
 	}
 
 	if (on && !ISSET(ifp->if_xflags, IFXF_LRO)) {
+#if NETHER > 0
 		if (ifp->if_type == IFT_ETHER && ether_brport_isset(ifp)) {
 			error = EBUSY;
 			goto out;
 		}
+#endif
 		SET(ifp->if_xflags, IFXF_LRO);
 	} else if (!on && ISSET(ifp->if_xflags, IFXF_LRO))
 		CLR(ifp->if_xflags, IFXF_LRO);
@@ -3634,13 +3773,6 @@ if_rxr_ioctl(struct if_rxrinfo *ifri, const char *name, u_int size,
  * Network stack input queues.
  */
 
-void
-niq_init(struct niqueue *niq, u_int maxlen, u_int isr)
-{
-	mq_init(&niq->ni_q, maxlen, IPL_NET);
-	niq->ni_isr = isr;
-}
-
 int
 niq_enqueue(struct niqueue *niq, struct mbuf *m)
 {
@@ -3655,30 +3787,16 @@ niq_enqueue(struct niqueue *niq, struct mbuf *m)
 	return (rv);
 }
 
-int
-niq_enlist(struct niqueue *niq, struct mbuf_list *ml)
-{
-	int rv;
-
-	rv = mq_enlist(&niq->ni_q, ml);
-	if (rv == 0)
-		schednetisr(niq->ni_isr);
-	else
-		if_congestion();
-
-	return (rv);
-}
-
 __dead void
 unhandled_af(int af)
 {
 	panic("unhandled af %d", af);
 }
 
-int
-net_sn_count(void)
+unsigned int
+softnet_count(void)
 {
-	static int nsoftnets;
+	static unsigned int nsoftnets;
 
 	if (nsoftnets == 0)
 		nsoftnets = min(NET_TASKQ, ncpus);
@@ -3689,7 +3807,7 @@ net_sn_count(void)
 struct softnet *
 net_sn(unsigned int ifindex)
 {
-	return (&softnets[ifindex % net_sn_count()]);
+	return (&softnets[ifindex % softnet_count()]);
 }
 
 struct taskq *
@@ -3705,7 +3823,7 @@ net_tq_barriers(const char *wmesg)
 	struct refcnt r = REFCNT_INITIALIZER();
 	int i;
 
-	for (i = 0; i < nitems(barriers); i++) {
+	for (i = 0; i < softnet_count(); i++) {
 		task_set(&barriers[i], (void (*)(void *))refcnt_rele_wake, &r);
 		refcnt_take(&r);
 		task_add(softnets[i].sn_taskq, &barriers[i]);

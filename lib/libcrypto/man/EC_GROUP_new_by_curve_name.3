@@ -1,4 +1,4 @@
-.\" $OpenBSD: EC_GROUP_new_by_curve_name.3,v 1.2 2025/04/28 17:41:55 tb Exp $
+.\" $OpenBSD: EC_GROUP_new_by_curve_name.3,v 1.4 2025/06/13 18:34:00 schwarze Exp $
 .\"
 .\" Copyright (c) 2024, 2025 Theo Buehler <tb@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: April 28 2025 $
+.Dd $Mdocdate: June 13 2025 $
 .Dt EC_GROUP_NEW_BY_CURVE_NAME 3
 .Os
 .Sh NAME
@@ -27,10 +27,11 @@
 .Nm EC_curve_nist2nid
 .Nd instantiate named curves built into libcrypto
 .Sh SYNOPSIS
+.Lb libcrypto
 .In openssl/bn.h
 .In openssl/ec.h
 .In openssl/objects.h
-.Ft "EC_GROUP *"
+.Ft EC_GROUP *
 .Fo EC_GROUP_new_by_curve_name
 .Fa "int nid"
 .Fc
@@ -64,7 +65,7 @@ typedef struct {
 .Fo EC_curve_nist2nid
 .Fa "const char *name"
 .Fc
-.Ft "const char *"
+.Ft const char *
 .Fo EC_curve_nid2nist
 .Fa "int nid"
 .Fc

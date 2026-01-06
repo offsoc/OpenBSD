@@ -1,4 +1,4 @@
-/* $OpenBSD: menu.c,v 1.54 2024/10/17 17:10:41 nicm Exp $ */
+/* $OpenBSD: menu.c,v 1.57 2025/11/25 20:27:23 nicm Exp $ */
 
 /*
  * Copyright (c) 2019 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -298,6 +298,7 @@ menu_key_cb(struct client *c, void *data, struct key_event *event)
 		}
 	}
 	switch (event->key & ~KEYC_MASK_FLAGS) {
+	case KEYC_BTAB:
 	case KEYC_UP:
 	case 'k':
 		if (old == -1)
@@ -363,7 +364,7 @@ menu_key_cb(struct client *c, void *data, struct key_event *event)
 				name = menu->items[md->choice].name;
 				if (md->choice != count - 1 &&
 				    (name != NULL && *name != '-'))
-					i++;
+					i--;
 				else if (md->choice == count - 1)
 					break;
 			}
@@ -435,6 +436,38 @@ chosen:
 	cmdq_free_state(state);
 
 	return (1);
+}
+
+static void
+menu_resize_cb(struct client *c, void *data)
+{
+	struct menu_data	*md = data;
+	u_int			 nx, ny, w, h;
+
+	if (md == NULL)
+		return;
+
+	nx = md->px;
+	ny = md->py;
+
+	w = md->menu->width + 4;
+	h = md->menu->count + 2;
+
+	if (nx + w > c->tty.sx) {
+		if (c->tty.sx <= w)
+			nx = 0;
+		else
+			nx = c->tty.sx - w;
+	}
+
+	if (ny + h > c->tty.sy) {
+		if (c->tty.sy <= h)
+			ny = 0;
+		else
+			ny = c->tty.sy - h;
+	}
+	md->px = nx;
+	md->py = ny;
 }
 
 static void
@@ -550,6 +583,6 @@ menu_display(struct menu *menu, int flags, int starting_choice,
 	if (md == NULL)
 		return (-1);
 	server_client_set_overlay(c, 0, NULL, menu_mode_cb, menu_draw_cb,
-	    menu_key_cb, menu_free_cb, NULL, md);
+	    menu_key_cb, menu_free_cb, menu_resize_cb, md);
 	return (0);
 }

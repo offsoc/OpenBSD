@@ -1,4 +1,4 @@
-/*	$OpenBSD: in_pcb.c,v 1.314 2025/05/20 05:51:43 bluhm Exp $	*/
+/*	$OpenBSD: in_pcb.c,v 1.322 2025/12/02 15:52:04 bluhm Exp $	*/
 /*	$NetBSD: in_pcb.c,v 1.25 1996/02/13 23:41:53 christos Exp $	*/
 
 /*
@@ -75,9 +75,7 @@
 #include <sys/mbuf.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 #include <sys/domain.h>
-#include <sys/mount.h>
 #include <sys/pool.h>
 #include <sys/proc.h>
 
@@ -101,6 +99,11 @@
 #include <net/toeplitz.h>
 #endif
 
+/*
+ * Locks used to protect data:
+ *	a	atomic
+ */
+
 const struct in_addr zeroin_addr;
 const union inpaddru zeroin46_addr;
 
@@ -108,10 +111,10 @@ const union inpaddru zeroin46_addr;
  * These configure the range of local port addresses assigned to
  * "unspecified" outgoing connections/packets/whatever.
  */
-int ipport_firstauto = IPPORT_RESERVED;
-int ipport_lastauto = IPPORT_USERRESERVED;
-int ipport_hifirstauto = IPPORT_HIFIRSTAUTO;
-int ipport_hilastauto = IPPORT_HILASTAUTO;
+int ipport_firstauto = IPPORT_RESERVED;		/* [a] */
+int ipport_lastauto = IPPORT_USERRESERVED;	/* [a] */
+int ipport_hifirstauto = IPPORT_HIFIRSTAUTO;	/* [a] */
+int ipport_hilastauto = IPPORT_HILASTAUTO;	/* [a] */
 
 struct baddynamicports baddynamicports;
 struct baddynamicports rootonlyports;
@@ -202,7 +205,7 @@ in_baddynamic(u_int16_t port, u_int16_t proto)
 	case IPPROTO_UDP:
 #ifdef IPSEC
 		/* Cannot preset this as it is a sysctl */
-		if (port == udpencap_port)
+		if (port == atomic_load_int(&udpencap_port))
 			return (1);
 #endif
 		return (DP_ISSET(baddynamicports.udp, port));
@@ -236,8 +239,7 @@ in_pcballoc(struct socket *so, struct inpcbtable *table, int wait)
 	if (inp == NULL)
 		return (ENOBUFS);
 	inp->inp_table = table;
-	inp->inp_socket = so;
-	mtx_init(&inp->inp_sofree_mtx, IPL_SOFTNET);
+	inp->inp_socket = soref(so);
 	refcnt_init_trace(&inp->inp_refcnt, DT_REFCNT_IDX_INPCB);
 	inp->inp_seclevel.sl_auth = IPSEC_AUTH_LEVEL_DEFAULT;
 	inp->inp_seclevel.sl_esp_trans = IPSEC_ESP_TRANS_LEVEL_DEFAULT;
@@ -451,16 +453,16 @@ in_pcbpickport(u_int16_t *lport, const void *laddr, int wild,
 	MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
 
 	if (inp->inp_flags & INP_HIGHPORT) {
-		first = ipport_hifirstauto;	/* sysctl */
-		last = ipport_hilastauto;
+		first = atomic_load_int(&ipport_hifirstauto);	/* sysctl */
+		last = atomic_load_int(&ipport_hilastauto);
 	} else if (inp->inp_flags & INP_LOWPORT) {
 		if (suser(p))
 			return (EACCES);
 		first = IPPORT_RESERVED-1; /* 1023 */
 		last = 600;		   /* not IPPORT_RESERVED/2 */
 	} else {
-		first = ipport_firstauto;	/* sysctl */
-		last = ipport_lastauto;
+		first = atomic_load_int(&ipport_firstauto);	/* sysctl */
+		last = atomic_load_int(&ipport_lastauto);
 	}
 	if (first < last) {
 		lower = first;
@@ -584,15 +586,9 @@ in_pcbdetach(struct inpcb *inp)
 	struct socket *so = inp->inp_socket;
 	struct inpcbtable *table = inp->inp_table;
 
+	soassertlocked(so);
+
 	so->so_pcb = NULL;
-	mtx_enter(&inp->inp_sofree_mtx);
-	inp->inp_socket = NULL;
-	mtx_leave(&inp->inp_sofree_mtx);
-	/*
-	 * As long as the NET_LOCK() is the default lock for Internet
-	 * sockets, do not release it to not introduce new sleeping
-	 * points.
-	 */
 	sofree(so, 1);
 	if (inp->inp_route.ro_rt) {
 		rtfree(inp->inp_route.ro_rt);
@@ -623,22 +619,17 @@ in_pcbdetach(struct inpcb *inp)
 }
 
 struct socket *
-in_pcbsolock_ref(struct inpcb *inp)
+in_pcbsolock(struct inpcb *inp)
 {
-	struct socket *so;
+	struct socket *so = inp->inp_socket;
 
 	NET_ASSERT_LOCKED();
 
-	mtx_enter(&inp->inp_sofree_mtx);
-	so = soref(inp->inp_socket);
-	mtx_leave(&inp->inp_sofree_mtx);
 	if (so == NULL)
 		return NULL;
 	rw_enter_write(&so->so_lock);
-	/* between mutex and rwlock inpcb could be detached */
 	if (so->so_pcb == NULL) {
 		rw_exit_write(&so->so_lock);
-		sorele(so);
 		return NULL;
 	}
 	KASSERT(inp->inp_socket == so && sotoinpcb(so) == inp);
@@ -646,12 +637,13 @@ in_pcbsolock_ref(struct inpcb *inp)
 }
 
 void
-in_pcbsounlock_rele(struct inpcb *inp, struct socket *so)
+in_pcbsounlock(struct inpcb *inp, struct socket *so)
 {
 	if (so == NULL)
 		return;
+	if (inp != NULL && so->so_pcb != NULL)
+		KASSERT(inp->inp_socket == so && sotoinpcb(so) == inp);
 	rw_exit_write(&so->so_lock);
-	sorele(so);
 }
 
 struct inpcb *
@@ -670,6 +662,7 @@ in_pcbunref(struct inpcb *inp)
 		return;
 	if (refcnt_rele(&inp->inp_refcnt) == 0)
 		return;
+	sorele(inp->inp_socket);
 	KASSERT((LIST_NEXT(inp, inp_hash) == NULL) ||
 	    (LIST_NEXT(inp, inp_hash) == _Q_INVALID));
 	KASSERT((LIST_NEXT(inp, inp_lhash) == NULL) ||
@@ -786,6 +779,17 @@ in_peeraddr(struct socket *so, struct mbuf *nam)
 	return (0);
 }
 
+int
+in_flowid(struct socket *so)
+{
+	struct inpcb *inp;
+
+	inp = sotoinpcb(so);
+	if (inp == NULL)
+		return (0);
+	return (inp->inp_flowid);
+}
+
 /*
  * Pass some notification to all connections of a protocol
  * associated with address dst.  The "usual action" will be
@@ -819,10 +823,10 @@ in_pcbnotifyall(struct inpcbtable *table, const struct sockaddr_in *dst,
 			continue;
 		}
 		mtx_leave(&table->inpt_mtx);
-		so = in_pcbsolock_ref(inp);
+		so = in_pcbsolock(inp);
 		if (so != NULL)
 			(*notify)(inp, errno);
-		in_pcbsounlock_rele(inp, so);
+		in_pcbsounlock(inp, so);
 		mtx_enter(&table->inpt_mtx);
 	}
 	mtx_leave(&table->inpt_mtx);
@@ -1020,7 +1024,7 @@ in_pcbselsrc(struct in_addr *insrc, const struct sockaddr_in *dstsock,
 		ifp = if_get(mopts->imo_ifidx);
 		if (ifp != NULL) {
 			if (ifp->if_rdomain == rtable_l2(rtableid))
-				IFP_TO_IA(ifp, ia);
+				ia = in_ifp2ia(ifp);
 			if (ia == NULL) {
 				if_put(ifp);
 				return (EADDRNOTAVAIL);
@@ -1051,8 +1055,7 @@ in_pcbselsrc(struct in_addr *insrc, const struct sockaddr_in *dstsock,
 	 * - preferred source address is set
 	 * - output interface is UP
 	 */
-	if (rt != NULL && !(rt->rt_flags & RTF_LLINFO) &&
-	    !(rt->rt_flags & RTF_HOST)) {
+	if (rt != NULL && ISSET(rt->rt_flags, RTF_GATEWAY)) {
 		ip4_source = rtable_getsource(rtableid, AF_INET);
 		if (ip4_source != NULL) {
 			struct ifaddr *ifa;

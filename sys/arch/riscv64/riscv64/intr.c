@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.c,v 1.14 2025/04/26 11:01:55 visa Exp $	*/
+/*	$OpenBSD: intr.c,v 1.16 2025/09/14 15:09:36 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2011 Dale Rahn <drahn@openbsd.org>
@@ -220,10 +220,10 @@ riscv_intr_prereg_disestablish_fdt(void *cookie)
 	struct intr_prereg *ip = cookie;
 	struct interrupt_controller *ic = ip->ip_ic;
 
-	if (ip->ip_ic != NULL && ip->ip_ih != NULL)
+	if (ic != NULL && ip->ip_ih != NULL)
 		ic->ic_disestablish(ip->ip_ih);
 
-	if (ip->ip_ic != NULL)
+	if (ic == NULL)
 		LIST_REMOVE(ip, ip_list);
 
 	free(ip, M_DEVBUF, sizeof(*ip));
@@ -492,6 +492,8 @@ riscv_intr_establish_fdt_msi_cpu(int node, uint64_t *addr, uint64_t *data,
 
 	val = ic->ic_establish_msi(ic->ic_cookie, addr, data,
 	    level, ci, func, cookie, name);
+	if (val == NULL)
+		return NULL;
 
 	ih = malloc(sizeof(*ih), M_DEVBUF, M_WAITOK);
 	ih->ih_ic = ic;

@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.308 2025/04/25 19:57:12 tb Exp $
+# $OpenBSD: Makefile,v 1.312 2025/07/17 10:31:50 schwarze Exp $
 
 .include <bsd.own.mk>
 
@@ -216,7 +216,6 @@ MAN=	\
 	IPAddressRange_new.3 \
 	MD5.3 \
 	NAME_CONSTRAINTS_new.3 \
-	OBJ_NAME_add.3 \
 	OBJ_create.3 \
 	OBJ_find_sigid_algs.3 \
 	OBJ_nid2obj.3 \
@@ -232,12 +231,11 @@ MAN=	\
 	OPENSSL_cleanse.3 \
 	OPENSSL_config.3 \
 	OPENSSL_init_crypto.3 \
-	OPENSSL_load_builtin_modules.3 \
 	OPENSSL_malloc.3 \
 	OPENSSL_sk_new.3 \
 	OpenSSL_add_all_algorithms.3 \
 	PEM_ASN1_read.3 \
-	PEM_X509_INFO_read.3 \
+	PEM_X509_INFO_read_bio.3 \
 	PEM_bytes_read_bio.3 \
 	PEM_read.3 \
 	PEM_read_bio_PrivateKey.3 \
@@ -293,11 +291,9 @@ MAN=	\
 	RSA_size.3 \
 	SHA1.3 \
 	SMIME_crlf_copy.3 \
-	SMIME_read_ASN1.3 \
 	SMIME_read_CMS.3 \
 	SMIME_read_PKCS7.3 \
 	SMIME_text.3 \
-	SMIME_write_ASN1.3 \
 	SMIME_write_CMS.3 \
 	SMIME_write_PKCS7.3 \
 	STACK_OF.3 \
@@ -330,7 +326,6 @@ MAN=	\
 	X509_NAME_new.3 \
 	X509_NAME_print_ex.3 \
 	X509_OBJECT_get0_X509.3 \
-	X509_PKEY_new.3 \
 	X509_PUBKEY_new.3 \
 	X509_PURPOSE_set.3 \
 	X509_REQ_add1_attr.3 \

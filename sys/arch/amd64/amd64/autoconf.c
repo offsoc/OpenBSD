@@ -1,4 +1,4 @@
-/*	$OpenBSD: autoconf.c,v 1.56 2024/05/14 01:42:07 guenther Exp $	*/
+/*	$OpenBSD: autoconf.c,v 1.59 2025/11/12 10:00:27 hshoexer Exp $	*/
 /*	$NetBSD: autoconf.c,v 1.1 2003/04/26 18:39:26 fvdl Exp $	*/
 
 /*-
@@ -52,6 +52,7 @@
 #include <sys/socketvar.h>
 #include <sys/timeout.h>
 #include <sys/hibernate.h>
+#include <sys/disklabel.h>
 #include <uvm/uvm_extern.h>
 
 #include <net/if.h>
@@ -185,10 +186,11 @@ diskconf(void)
 		unit = B_UNIT(bootdev);
 		part = B_PARTITION(bootdev);
 		snprintf(buf, sizeof buf, "%s%d%c", findblkname(majdev),
-		    unit, part + 'a');
+		    unit, DL_PARTNUM2NAME(part));
 		bootdv = parsedisk(buf, strlen(buf), part, &tmpdev);
 	}
 
+#if defined(NFSCLIENT)
 	if (bios_bootmac) {
 		struct ifnet *ifp;
 
@@ -202,15 +204,14 @@ diskconf(void)
 		if (ifp) {
 			printf("PXE boot MAC address %s, interface %s\n",
 			    ether_sprintf(bios_bootmac->mac), ifp->if_xname);
-#if defined(NFSCLIENT)
 			bootdv = parsedisk(ifp->if_xname, strlen(ifp->if_xname),
 			    0, &tmpdev);
 			part = 0;
-#endif
 		} else
 			printf("PXE boot MAC address %s, interface %s\n",
 			    ether_sprintf(bios_bootmac->mac), "unknown");
 	}
+#endif
 
 	setroot(bootdv, part, RB_USERREQ);
 	dumpconf();

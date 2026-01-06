@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_esp.c,v 1.198 2025/05/14 14:32:15 mvs Exp $ */
+/*	$OpenBSD: ip_esp.c,v 1.200 2025/12/11 05:06:02 dlg Exp $ */
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr) and
@@ -48,7 +48,6 @@
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
-#include <netinet/ip_var.h>
 
 #ifdef INET6
 #include <netinet/ip6.h>
@@ -708,12 +707,11 @@ esp_output(struct mbuf *m, struct tdb *tdb, int skip, int protoff)
 		encif->if_obytes += m->m_pkthdr.len;
 
 		if (encif->if_bpf) {
-			struct enchdr hdr;
+			struct enchdr hdr = {
+				.af = htonl(tdb->tdb_dst.sa.sa_family),
+				.spi = tdb->tdb_spi,
+			};
 
-			memset(&hdr, 0, sizeof(hdr));
-
-			hdr.af = tdb->tdb_dst.sa.sa_family;
-			hdr.spi = tdb->tdb_spi;
 			if (espx)
 				hdr.flags |= M_CONF;
 			if (esph)

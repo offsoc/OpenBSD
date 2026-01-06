@@ -1,4 +1,4 @@
-/*	$OpenBSD: bpf_filter.c,v 1.34 2020/08/03 03:21:24 dlg Exp $	*/
+/*	$OpenBSD: bpf_filter.c,v 1.36 2025/11/16 02:20:08 dlg Exp $	*/
 /*	$NetBSD: bpf_filter.c,v 1.12 1996/02/13 22:00:00 christos Exp $	*/
 
 /*
@@ -38,7 +38,6 @@
  */
 
 #include <sys/param.h>
-#include <sys/time.h>
 #ifndef _KERNEL
 #include <stdlib.h>
 #include <string.h>
@@ -46,8 +45,6 @@
 #else
 #include <sys/systm.h>
 #endif
-
-#include <sys/endian.h>
 
 #ifdef _KERNEL
 extern int bpf_maxbufsize;
@@ -310,12 +307,22 @@ _bpf_filter(const struct bpf_insn *pc, const struct bpf_ops *ops,
 			A /= X;
 			continue;
 
+		case BPF_ALU|BPF_MOD|BPF_X:
+			if (X == 0)
+				return 0;
+			A %= X;
+			continue;
+
 		case BPF_ALU|BPF_AND|BPF_X:
 			A &= X;
 			continue;
 
 		case BPF_ALU|BPF_OR|BPF_X:
 			A |= X;
+			continue;
+
+		case BPF_ALU|BPF_XOR|BPF_X:
+			A ^= X;
 			continue;
 
 		case BPF_ALU|BPF_LSH|BPF_X:
@@ -342,12 +349,20 @@ _bpf_filter(const struct bpf_insn *pc, const struct bpf_ops *ops,
 			A /= pc->k;
 			continue;
 
+		case BPF_ALU|BPF_MOD|BPF_K:
+			A %= pc->k;
+			continue;
+
 		case BPF_ALU|BPF_AND|BPF_K:
 			A &= pc->k;
 			continue;
 
 		case BPF_ALU|BPF_OR|BPF_K:
 			A |= pc->k;
+			continue;
+
+		case BPF_ALU|BPF_XOR|BPF_K:
+			A ^= pc->k;
 			continue;
 
 		case BPF_ALU|BPF_LSH|BPF_K:
@@ -435,12 +450,14 @@ bpf_validate(struct bpf_insn *f, int len)
 			case BPF_SUB:
 			case BPF_MUL:
 			case BPF_OR:
+			case BPF_XOR:
 			case BPF_AND:
 			case BPF_LSH:
 			case BPF_RSH:
 			case BPF_NEG:
 				break;
 			case BPF_DIV:
+			case BPF_MOD:
 				/*
 				 * Check for constant division by 0.
 				 */

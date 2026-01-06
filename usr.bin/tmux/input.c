@@ -1,4 +1,4 @@
-/* $OpenBSD: input.c,v 1.233 2025/03/04 08:45:04 nicm Exp $ */
+/* $OpenBSD: input.c,v 1.246 2026/01/06 09:11:15 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -51,6 +51,29 @@
  *   be passed to the underlying terminals.
  */
 
+/* Type of terminator. */
+enum input_end_type {
+	INPUT_END_ST,
+	INPUT_END_BEL
+};
+
+/* Request sent by a pane. */
+struct input_request {
+	struct client			*c;
+	struct input_ctx		*ictx;
+
+	enum input_request_type		 type;
+	time_t				 t;
+	enum input_end_type              end;
+
+	int				 idx;
+	void				*data;
+
+	TAILQ_ENTRY(input_request)	 entry;
+	TAILQ_ENTRY(input_request)	 centry;
+};
+#define INPUT_REQUEST_TIMEOUT 2
+
 /* Input parser cell. */
 struct input_cell {
 	struct grid_cell	cell;
@@ -74,62 +97,66 @@ struct input_param {
 
 /* Input parser context. */
 struct input_ctx {
-	struct window_pane     *wp;
-	struct bufferevent     *event;
-	struct screen_write_ctx ctx;
-	struct colour_palette  *palette;
+	struct window_pane	       *wp;
+	struct bufferevent	       *event;
+	struct screen_write_ctx		ctx;
+	struct colour_palette	       *palette;
 
-	struct input_cell	cell;
+	struct input_cell		cell;
+	struct input_cell		old_cell;
+	u_int				old_cx;
+	u_int				old_cy;
+	int				old_mode;
 
-	struct input_cell	old_cell;
-	u_int			old_cx;
-	u_int			old_cy;
-	int			old_mode;
+	u_char				interm_buf[4];
+	size_t				interm_len;
 
-	u_char			interm_buf[4];
-	size_t			interm_len;
-
-	u_char			param_buf[64];
-	size_t			param_len;
+	u_char				param_buf[64];
+	size_t				param_len;
 
 #define INPUT_BUF_START 32
-	u_char		       *input_buf;
-	size_t			input_len;
-	size_t			input_space;
-	enum {
-		INPUT_END_ST,
-		INPUT_END_BEL
-	}			input_end;
+	u_char			       *input_buf;
+	size_t				input_len;
+	size_t				input_space;
+	enum input_end_type		input_end;
 
-	struct input_param	param_list[24];
-	u_int			param_list_len;
+	struct input_param		param_list[24];
+	u_int				param_list_len;
 
-	struct utf8_data	utf8data;
-	int			utf8started;
+	struct utf8_data		utf8data;
+	int				utf8started;
 
-	int			ch;
-	struct utf8_data	last;
+	int				ch;
+	struct utf8_data		last;
 
-	int			flags;
+	const struct input_state       *state;
+	int				flags;
 #define INPUT_DISCARD 0x1
 #define INPUT_LAST 0x2
 
-	const struct input_state *state;
-
-	struct event		timer;
+	struct input_requests		 requests;
+	u_int				 request_count;
+	struct event			 request_timer;
 
 	/*
 	 * All input received since we were last in the ground state. Sent to
 	 * control clients on connection.
 	 */
-	struct evbuffer		*since_ground;
+	struct evbuffer			*since_ground;
+	struct event			 ground_timer;
 };
 
 /* Helper functions. */
 struct input_transition;
+static void 	input_request_timer_callback(int, short, void *);
+static void	input_start_request_timer(struct input_ctx *);
+static struct input_request *input_make_request(struct input_ctx *,
+		    enum input_request_type);
+static void	input_free_request(struct input_request *);
+static int	input_add_request(struct input_ctx *, enum input_request_type,
+		    int);
 static int	input_split(struct input_ctx *);
 static int	input_get(struct input_ctx *, u_int, int, int);
-static void printflike(2, 3) input_reply(struct input_ctx *, const char *, ...);
 static void	input_set_state(struct input_ctx *,
 		    const struct input_transition *);
 static void	input_reset_cell(struct input_ctx *);
@@ -747,12 +774,26 @@ input_table_compare(const void *key, const void *value)
 	return (strcmp(ictx->interm_buf, entry->interm));
 }
 
+/* Stop UTF-8 and enter an invalid character. */
+static void
+input_stop_utf8(struct input_ctx *ictx)
+{
+	struct screen_write_ctx	*sctx = &ictx->ctx;
+	static struct utf8_data	 rc = { "\357\277\275", 3, 3, 1 };
+
+	if (ictx->utf8started) {
+		utf8_copy(&ictx->cell.cell.data, &rc);
+		screen_write_collect_add(sctx, &ictx->cell.cell);
+	}
+	ictx->utf8started = 0;
+}
+
 /*
  * Timer - if this expires then have been waiting for a terminator for too
  * long, so reset to ground.
  */
 static void
-input_timer_callback(__unused int fd, __unused short events, void *arg)
+input_ground_timer_callback(__unused int fd, __unused short events, void *arg)
 {
 	struct input_ctx	*ictx = arg;
 
@@ -762,12 +803,12 @@ input_timer_callback(__unused int fd, __unused short events, void *arg)
 
 /* Start the timer. */
 static void
-input_start_timer(struct input_ctx *ictx)
+input_start_ground_timer(struct input_ctx *ictx)
 {
 	struct timeval	tv = { .tv_sec = 5, .tv_usec = 0 };
 
-	event_del(&ictx->timer);
-	event_add(&ictx->timer, &tv);
+	event_del(&ictx->ground_timer);
+	event_add(&ictx->ground_timer, &tv);
 }
 
 /* Reset cell state to default. */
@@ -828,8 +869,10 @@ input_init(struct window_pane *wp, struct bufferevent *bev,
 	ictx->since_ground = evbuffer_new();
 	if (ictx->since_ground == NULL)
 		fatalx("out of memory");
+	evtimer_set(&ictx->ground_timer, input_ground_timer_callback, ictx);
 
-	evtimer_set(&ictx->timer, input_timer_callback, ictx);
+	TAILQ_INIT(&ictx->requests);
+	evtimer_set(&ictx->request_timer, input_request_timer_callback, ictx);
 
 	input_reset(ictx, 0);
 	return (ictx);
@@ -839,17 +882,23 @@ input_init(struct window_pane *wp, struct bufferevent *bev,
 void
 input_free(struct input_ctx *ictx)
 {
-	u_int	i;
+	struct input_request	*ir, *ir1;
+	u_int			 i;
 
 	for (i = 0; i < ictx->param_list_len; i++) {
 		if (ictx->param_list[i].type == INPUT_STRING)
 			free(ictx->param_list[i].str);
 	}
 
-	event_del(&ictx->timer);
+	TAILQ_FOREACH_SAFE(ir, &ictx->requests, entry, ir1)
+		input_free_request(ir);
+	event_del(&ictx->request_timer);
 
 	free(ictx->input_buf);
 	evbuffer_free(ictx->since_ground);
+	event_del(&ictx->ground_timer);
+
+	screen_write_stop_sync(ictx->wp);
 
 	free(ictx);
 }
@@ -1084,31 +1133,44 @@ input_get(struct input_ctx *ictx, u_int validx, int minval, int defval)
 	return (retval);
 }
 
-/* Reply to terminal query. */
+/* Send reply. */
 static void
-input_reply(struct input_ctx *ictx, const char *fmt, ...)
+input_send_reply(struct input_ctx *ictx, const char *reply)
 {
 	struct bufferevent	*bev = ictx->event;
+
+	if (bev != NULL) {
+		log_debug("%s: %s", __func__, reply);
+		bufferevent_write(bev, reply, strlen(reply));
+	}
+}
+
+/* Reply to terminal query. */
+static void printflike(3, 4)
+input_reply(struct input_ctx *ictx, int add, const char *fmt, ...)
+{
+	struct input_request	*ir;
 	va_list			 ap;
 	char			*reply;
-
-	if (bev == NULL)
-		return;
 
 	va_start(ap, fmt);
 	xvasprintf(&reply, fmt, ap);
 	va_end(ap);
 
-	log_debug("%s: %s", __func__, reply);
-	bufferevent_write(bev, reply, strlen(reply));
-	free(reply);
+	if (add && !TAILQ_EMPTY(&ictx->requests)) {
+		ir = input_make_request(ictx, INPUT_REQUEST_QUEUE);
+		ir->data = reply;
+	} else {
+		input_send_reply(ictx, reply);
+		free(reply);
+	}
 }
 
 /* Clear saved state. */
 static void
 input_clear(struct input_ctx *ictx)
 {
-	event_del(&ictx->timer);
+	event_del(&ictx->ground_timer);
 
 	*ictx->interm_buf = '\0';
 	ictx->interm_len = 0;
@@ -1128,7 +1190,7 @@ input_clear(struct input_ctx *ictx)
 static void
 input_ground(struct input_ctx *ictx)
 {
-	event_del(&ictx->timer);
+	event_del(&ictx->ground_timer);
 	evbuffer_drain(ictx->since_ground, EVBUFFER_LENGTH(ictx->since_ground));
 
 	if (ictx->input_space > INPUT_BUF_START) {
@@ -1144,7 +1206,7 @@ input_print(struct input_ctx *ictx)
 	struct screen_write_ctx	*sctx = &ictx->ctx;
 	int			 set;
 
-	ictx->utf8started = 0; /* can't be valid UTF-8 */
+	input_stop_utf8(ictx); /* can't be valid UTF-8 */
 
 	set = ictx->cell.set == 0 ? ictx->cell.g0set : ictx->cell.g1set;
 	if (set == 1)
@@ -1220,11 +1282,11 @@ input_c0_dispatch(struct input_ctx *ictx)
 	struct window_pane	*wp = ictx->wp;
 	struct screen		*s = sctx->s;
 	struct grid_cell	 gc, first_gc;
-	u_int			 cx = s->cx, line = s->cy + s->grid->hsize;
+	u_int			 cx, line;
 	u_int			 width;
 	int			 has_content = 0;
 
-	ictx->utf8started = 0; /* can't be valid UTF-8 */
+	input_stop_utf8(ictx); /* can't be valid UTF-8 */
 
 	log_debug("%s: '%c'", __func__, ictx->ch);
 
@@ -1240,11 +1302,13 @@ input_c0_dispatch(struct input_ctx *ictx)
 		break;
 	case '\011':	/* HT */
 		/* Don't tab beyond the end of the line. */
-		if (s->cx >= screen_size_x(s) - 1)
+		cx = s->cx;
+		if (cx >= screen_size_x(s) - 1)
 			break;
 
 		/* Find the next tab point, or use the last column if none. */
-		grid_get_cell(s->grid, s->cx, line, &first_gc);
+		line = s->cy + s->grid->hsize;
+		grid_get_cell(s->grid, cx, line, &first_gc);
 		do {
 			if (!has_content) {
 				grid_get_cell(s->grid, cx, line, &gc);
@@ -1375,7 +1439,8 @@ input_csi_dispatch(struct input_ctx *ictx)
 	struct screen_write_ctx	       *sctx = &ictx->ctx;
 	struct screen		       *s = sctx->s;
 	struct input_table_entry       *entry;
-	int				i, n, m, ek, set;
+	struct options		       *oo;
+	int				i, n, m, ek, set, p;
 	u_int				cx, bg = ictx->cell.cell.bg;
 
 	if (ictx->flags & INPUT_DISCARD)
@@ -1491,7 +1556,7 @@ input_csi_dispatch(struct input_ctx *ictx)
 		case -1:
 			break;
 		case 0:
-			input_reply(ictx, "\033[?1;2c");
+			input_reply(ictx, 1, "\033[?1;2c");
 			break;
 		default:
 			log_debug("%s: unknown '%c'", __func__, ictx->ch);
@@ -1503,7 +1568,7 @@ input_csi_dispatch(struct input_ctx *ictx)
 		case -1:
 			break;
 		case 0:
-			input_reply(ictx, "\033[>84;0;0c");
+			input_reply(ictx, 1, "\033[>84;0;0c");
 			break;
 		default:
 			log_debug("%s: unknown '%c'", __func__, ictx->ch);
@@ -1540,8 +1605,36 @@ input_csi_dispatch(struct input_ctx *ictx)
 		break;
 	case INPUT_CSI_QUERY_PRIVATE:
 		switch (input_get(ictx, 0, 0, 0)) {
+		case 12: /* cursor blink: 1 = blink, 2 = steady */
+			if (s->cstyle != SCREEN_CURSOR_DEFAULT ||
+			    s->mode & MODE_CURSOR_BLINKING_SET)
+				n = (s->mode & MODE_CURSOR_BLINKING) ? 1 : 2;
+			else {
+				if (ictx->wp != NULL)
+					oo = ictx->wp->options;
+				else
+					oo = global_options;
+				p = options_get_number(oo, "cursor-style");
+
+				/* blink for 1,3,5; steady for 0,2,4,6 */
+ 				n = (p == 1 || p == 3 || p == 5) ? 1 : 2;
+			}
+			input_reply(ictx, 1, "\033[?12;%d$y", n);
+			break;
+		case 2004: /* bracketed paste */
+			n = (s->mode & MODE_BRACKETPASTE) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?2004;%d$y", n);
+			break;
+		case 1004: /* focus reporting */
+			n = (s->mode & MODE_FOCUSON) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?1004;%d$y", n);
+			break;
+		case 1006: /* SGR mouse */
+			n = (s->mode & MODE_MOUSE_SGR) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?1006;%d$y", n);
+			break;
 		case 2031:
-			input_reply(ictx, "\033[?2031;2$y");
+			input_reply(ictx, 1, "\033[?2031;2$y");
 			break;
 		}
 		break;
@@ -1550,10 +1643,11 @@ input_csi_dispatch(struct input_ctx *ictx)
 		case -1:
 			break;
 		case 5:
-			input_reply(ictx, "\033[0n");
+			input_reply(ictx, 1, "\033[0n");
 			break;
 		case 6:
-			input_reply(ictx, "\033[%u;%uR", s->cy + 1, s->cx + 1);
+			input_reply(ictx, 1, "\033[%u;%uR", s->cy + 1,
+			    s->cx + 1);
 			break;
 		default:
 			log_debug("%s: unknown '%c'", __func__, ictx->ch);
@@ -1698,13 +1792,20 @@ input_csi_dispatch(struct input_ctx *ictx)
 		break;
 	case INPUT_CSI_DECSCUSR:
 		n = input_get(ictx, 0, 0, 0);
-		if (n != -1)
-			screen_set_cursor_style(n, &s->cstyle, &s->mode);
+		if (n == -1)
+			break;
+		screen_set_cursor_style(n, &s->cstyle, &s->mode);
+		if (n == 0) {
+			/* Go back to default blinking state. */
+			screen_write_mode_clear(sctx, MODE_CURSOR_BLINKING_SET);
+		}
 		break;
 	case INPUT_CSI_XDA:
 		n = input_get(ictx, 0, 0, 0);
-		if (n == 0)
-			input_reply(ictx, "\033P>|tmux %s\033\\", getversion());
+		if (n == 0) {
+			input_reply(ictx, 1, "\033P>|tmux %s\033\\",
+			    getversion());
+		}
 		break;
 
 	}
@@ -1797,6 +1898,11 @@ input_csi_dispatch_rm_private(struct input_ctx *ictx)
 			break;
 		case 2031:
 			screen_write_mode_clear(sctx, MODE_THEME_UPDATES);
+			break;
+		case 2026:	/* synchronized output */
+			screen_write_stop_sync(ictx->wp);
+			if (ictx->wp != NULL)
+				ictx->wp->flags |= PANE_REDRAW;
 			break;
 		default:
 			log_debug("%s: unknown '%c'", __func__, ictx->ch);
@@ -1896,6 +2002,9 @@ input_csi_dispatch_sm_private(struct input_ctx *ictx)
 		case 2031:
 			screen_write_mode_set(sctx, MODE_THEME_UPDATES);
 			break;
+		case 2026:	/* synchronized output */
+			screen_write_start_sync(ictx->wp);
+			break;
 		default:
 			log_debug("%s: unknown '%c'", __func__, ictx->ch);
 			break;
@@ -1953,26 +2062,26 @@ input_csi_dispatch_winops(struct input_ctx *ictx)
 		case 14:
 			if (w == NULL)
 				break;
-			input_reply(ictx, "\033[4;%u;%ut", y * w->ypixel,
+			input_reply(ictx, 1, "\033[4;%u;%ut", y * w->ypixel,
 			    x * w->xpixel);
 			break;
 		case 15:
 			if (w == NULL)
 				break;
-			input_reply(ictx, "\033[5;%u;%ut", y * w->ypixel,
+			input_reply(ictx, 1, "\033[5;%u;%ut", y * w->ypixel,
 			    x * w->xpixel);
 			break;
 		case 16:
 			if (w == NULL)
 				break;
-			input_reply(ictx, "\033[6;%u;%ut", w->ypixel,
+			input_reply(ictx, 1, "\033[6;%u;%ut", w->ypixel,
 			    w->xpixel);
 			break;
 		case 18:
-			input_reply(ictx, "\033[8;%u;%ut", y, x);
+			input_reply(ictx, 1, "\033[8;%u;%ut", y, x);
 			break;
 		case 19:
-			input_reply(ictx, "\033[9;%u;%ut", y, x);
+			input_reply(ictx, 1, "\033[9;%u;%ut", y, x);
 			break;
 		case 22:
 			m++;
@@ -2335,8 +2444,74 @@ input_enter_dcs(struct input_ctx *ictx)
 	log_debug("%s", __func__);
 
 	input_clear(ictx);
-	input_start_timer(ictx);
+	input_start_ground_timer(ictx);
 	ictx->flags &= ~INPUT_LAST;
+}
+
+/* Handle DECRQSS query. */
+static int
+input_handle_decrqss(struct input_ctx *ictx)
+{
+	struct window_pane	*wp = ictx->wp;
+	struct options		*oo;
+	struct screen_write_ctx	*sctx = &ictx->ctx;
+	u_char			*buf = ictx->input_buf;
+	size_t			 len = ictx->input_len;
+	struct screen		*s = sctx->s;
+	int			 ps, opt_ps, blinking;
+
+	if (len < 3 || buf[1] != ' ' || buf[2] != 'q')
+		goto not_recognized;
+
+	/*
+	 * Cursor style query: DCS $ q SP q
+	 * Reply: DCS 1 $ r SP q <Ps> SP q ST
+	 */
+	if (s->cstyle == SCREEN_CURSOR_BLOCK ||
+	    s->cstyle == SCREEN_CURSOR_UNDERLINE ||
+	    s->cstyle == SCREEN_CURSOR_BAR) {
+		blinking = (s->mode & MODE_CURSOR_BLINKING) != 0;
+		switch (s->cstyle) {
+		case SCREEN_CURSOR_BLOCK:
+			ps = blinking ? 1 : 2;
+			break;
+		case SCREEN_CURSOR_UNDERLINE:
+			ps = blinking ? 3 : 4;
+			break;
+		case SCREEN_CURSOR_BAR:
+			ps = blinking ? 5 : 6;
+			break;
+		default:
+			ps = 0;
+			break;
+		}
+	} else {
+		/*
+		 * No explicit runtime style: fall back to the configured
+		 * cursor-style option (integer Ps 0..6). Pane options inherit.
+		 */
+		if (wp != NULL)
+			oo = wp->options;
+		else
+			oo = global_options;
+		opt_ps = options_get_number(oo, "cursor-style");
+
+		/* Sanity clamp: valid Ps are 0..6 per DECSCUSR. */
+		if (opt_ps < 0 || opt_ps > 6)
+			opt_ps = 0;
+		ps = opt_ps;
+	}
+
+	log_debug("%s: DECRQSS cursor -> Ps=%d (cstyle=%d mode=%#x)", __func__,
+	    ps, s->cstyle, s->mode);
+
+	input_reply(ictx, 1, "\033P1$r q%d q\033\\", ps);
+	return (0);
+
+not_recognized:
+	/* Unrecognized DECRQSS: send DCS 0 $ r Pt ST. */
+	input_reply(ictx, 1, "\033P0$r\033\\");
+	return (0);
 }
 
 /* DCS terminator (ST) received. */
@@ -2344,6 +2519,7 @@ static int
 input_dcs_dispatch(struct input_ctx *ictx)
 {
 	struct window_pane	*wp = ictx->wp;
+	struct options		*oo;
 	struct screen_write_ctx	*sctx = &ictx->ctx;
 	u_char			*buf = ictx->input_buf;
 	size_t			 len = ictx->input_len;
@@ -2353,13 +2529,28 @@ input_dcs_dispatch(struct input_ctx *ictx)
 
 	if (wp == NULL)
 		return (0);
+	oo = wp->options;
+
 	if (ictx->flags & INPUT_DISCARD) {
 		log_debug("%s: %zu bytes (discard)", __func__, len);
 		return (0);
 	}
 	log_debug("%s: %zu bytes", __func__, len);
 
-	allow_passthrough = options_get_number(wp->options, "allow-passthrough");
+	/* DCS sequences with intermediate byte '$' (includes DECRQSS). */
+	if (ictx->interm_len == 1 && ictx->interm_buf[0] == '$') {
+		/* DECRQSS is DCS $ q Pt ST. */
+		if (len >= 1 && buf[0] == 'q')
+			return (input_handle_decrqss(ictx));
+
+		/*
+		 * Not DECRQSS. DCS '$' is currently only used by DECRQSS, but
+		 * leave other '$' DCS (if any appear in future) to existing
+		 * handlers.
+		 */
+	}
+
+	allow_passthrough = options_get_number(oo, "allow-passthrough");
 	if (!allow_passthrough)
 		return (0);
 	log_debug("%s: \"%s\"", __func__, buf);
@@ -2379,7 +2570,7 @@ input_enter_osc(struct input_ctx *ictx)
 	log_debug("%s", __func__);
 
 	input_clear(ictx);
-	input_start_timer(ictx);
+	input_start_ground_timer(ictx);
 	ictx->flags &= ~INPUT_LAST;
 }
 
@@ -2474,7 +2665,7 @@ input_enter_apc(struct input_ctx *ictx)
 	log_debug("%s", __func__);
 
 	input_clear(ictx);
-	input_start_timer(ictx);
+	input_start_ground_timer(ictx);
 	ictx->flags &= ~INPUT_LAST;
 }
 
@@ -2489,7 +2680,9 @@ input_exit_apc(struct input_ctx *ictx)
 		return;
 	log_debug("%s: \"%s\"", __func__, ictx->input_buf);
 
-	if (screen_set_title(sctx->s, ictx->input_buf) && wp != NULL) {
+	if (wp != NULL &&
+	    options_get_number(wp->options, "allow-set-title") &&
+	    screen_set_title(sctx->s, ictx->input_buf)) {
 		notify_pane("pane-title-changed", wp);
 		server_redraw_window_borders(wp->window);
 		server_status_window(wp->window);
@@ -2503,7 +2696,7 @@ input_enter_rename(struct input_ctx *ictx)
 	log_debug("%s", __func__);
 
 	input_clear(ictx);
-	input_start_timer(ictx);
+	input_start_ground_timer(ictx);
 	ictx->flags &= ~INPUT_LAST;
 }
 
@@ -2551,9 +2744,9 @@ input_top_bit_set(struct input_ctx *ictx)
 	ictx->flags &= ~INPUT_LAST;
 
 	if (!ictx->utf8started) {
-		if (utf8_open(ud, ictx->ch) != UTF8_MORE)
-			return (0);
 		ictx->utf8started = 1;
+		if (utf8_open(ud, ictx->ch) != UTF8_MORE)
+			input_stop_utf8(ictx);
 		return (0);
 	}
 
@@ -2561,7 +2754,7 @@ input_top_bit_set(struct input_ctx *ictx)
 	case UTF8_MORE:
 		return (0);
 	case UTF8_ERROR:
-		ictx->utf8started = 0;
+		input_stop_utf8(ictx);
 		return (0);
 	case UTF8_DONE:
 		break;
@@ -2582,32 +2775,42 @@ input_top_bit_set(struct input_ctx *ictx)
 
 /* Reply to a colour request. */
 static void
-input_osc_colour_reply(struct input_ctx *ictx, u_int n, int c)
+input_osc_colour_reply(struct input_ctx *ictx, int add, u_int n, int idx, int c,
+    enum input_end_type end_type)
 {
-    u_char	 r, g, b;
-    const char	*end;
+	u_char		 r, g, b;
+	const char	*end;
 
-    if (c != -1)
-	    c = colour_force_rgb(c);
-    if (c == -1)
+	if (c != -1)
+		c = colour_force_rgb(c);
+	if (c == -1)
 	    return;
-    colour_split_rgb(c, &r, &g, &b);
+	colour_split_rgb(c, &r, &g, &b);
 
-    if (ictx->input_end == INPUT_END_BEL)
-	    end = "\007";
-    else
-	    end = "\033\\";
-    input_reply(ictx, "\033]%u;rgb:%02hhx%02hhx/%02hhx%02hhx/%02hhx%02hhx%s",
-	n, r, r, g, g, b, b, end);
+	if (end_type == INPUT_END_BEL)
+		end = "\007";
+	else
+		end = "\033\\";
+
+	if (n == 4) {
+		input_reply(ictx, add,
+		    "\033]%u;%d;rgb:%02hhx%02hhx/%02hhx%02hhx/%02hhx%02hhx%s",
+		    n, idx, r, r, g, g, b, b, end);
+	} else {
+		input_reply(ictx, add,
+		    "\033]%u;rgb:%02hhx%02hhx/%02hhx%02hhx/%02hhx%02hhx%s",
+		    n, r, r, g, g, b, b, end);
+	}
 }
 
 /* Handle the OSC 4 sequence for setting (multiple) palette entries. */
 static void
 input_osc_4(struct input_ctx *ictx, const char *p)
 {
-	char	*copy, *s, *next = NULL;
-	long	 idx;
-	int	 c, bad = 0, redraw = 0;
+	char			*copy, *s, *next = NULL;
+	long			 idx;
+	int			 c, bad = 0, redraw = 0;
+	struct colour_palette	*palette = ictx->palette;
 
 	copy = s = xstrdup(p);
 	while (s != NULL && *s != '\0') {
@@ -2623,16 +2826,22 @@ input_osc_4(struct input_ctx *ictx, const char *p)
 
 		s = strsep(&next, ";");
 		if (strcmp(s, "?") == 0) {
-			c = colour_palette_get(ictx->palette, idx);
-			if (c != -1)
-				input_osc_colour_reply(ictx, 4, c);
+			c = colour_palette_get(palette, idx|COLOUR_FLAG_256);
+			if (c != -1) {
+				input_osc_colour_reply(ictx, 1, 4, idx, c,
+				    ictx->input_end);
+				s = next;
+				continue;
+			}
+			input_add_request(ictx, INPUT_REQUEST_PALETTE, idx);
+			s = next;
 			continue;
 		}
 		if ((c = colour_parseX11(s)) == -1) {
 			s = next;
 			continue;
 		}
-		if (colour_palette_set(ictx->palette, idx, c))
+		if (colour_palette_set(palette, idx, c))
 			redraw = 1;
 		s = next;
 	}
@@ -2650,7 +2859,7 @@ input_osc_8(struct input_ctx *ictx, const char *p)
 	struct hyperlinks	*hl = ictx->ctx.s->hyperlinks;
 	struct grid_cell	*gc = &ictx->cell.cell;
 	const char		*start, *end, *uri;
-	char	    		*id = NULL;
+	char			*id = NULL;
 
 	for (start = p; (end = strpbrk(start, ":;")) != NULL; start = end + 1) {
 		if (end - start >= 4 && strncmp(start, "id=", 3) == 0) {
@@ -2704,7 +2913,7 @@ input_osc_10(struct input_ctx *ictx, const char *p)
 			else
 				c = defaults.fg;
 		}
-		input_osc_colour_reply(ictx, 10, c);
+		input_osc_colour_reply(ictx, 1, 10, 0, c, ictx->input_end);
 		return;
 	}
 
@@ -2747,7 +2956,7 @@ input_osc_11(struct input_ctx *ictx, const char *p)
 		if (wp == NULL)
 			return;
 		c = window_pane_get_bg(wp);
-		input_osc_colour_reply(ictx, 11, c);
+		input_osc_colour_reply(ictx, 1, 11, 0, c, ictx->input_end);
 		return;
 	}
 
@@ -2791,7 +3000,7 @@ input_osc_12(struct input_ctx *ictx, const char *p)
 			c = ictx->ctx.s->ccolour;
 			if (c == -1)
 				c = ictx->ctx.s->default_ccolour;
-			input_osc_colour_reply(ictx, 12, c);
+			input_osc_colour_reply(ictx, 1, 12, 0, c, ictx->input_end);
 		}
 		return;
 	}
@@ -2833,20 +3042,43 @@ input_osc_133(struct input_ctx *ictx, const char *p)
 	}
 }
 
+/* Handle OSC 52 reply. */
+static void
+input_osc_52_reply(struct input_ctx *ictx)
+{
+	struct paste_buffer	*pb;
+	int			 state;
+	const char		*buf;
+	size_t			 len;
+
+	state = options_get_number(global_options, "get-clipboard");
+	if (state == 0)
+		return;
+	if (state == 1) {
+		if ((pb = paste_get_top(NULL)) == NULL)
+			return;
+		buf = paste_buffer_data(pb, &len);
+		if (ictx->input_end == INPUT_END_BEL)
+			input_reply_clipboard(ictx->event, buf, len, "\007");
+		else
+			input_reply_clipboard(ictx->event, buf, len, "\033\\");
+		return;
+	}
+	input_add_request(ictx, INPUT_REQUEST_CLIPBOARD, ictx->input_end);
+}
+
 /* Handle the OSC 52 sequence for setting the clipboard. */
 static void
 input_osc_52(struct input_ctx *ictx, const char *p)
 {
 	struct window_pane	*wp = ictx->wp;
+	size_t			 len;
 	char			*end;
-	const char		*buf = NULL;
-	size_t			 len = 0;
 	u_char			*out;
 	int			 outlen, state;
 	struct screen_write_ctx	 ctx;
-	struct paste_buffer	*pb;
-	const char*              allow = "cpqs01234567";
-	char                     flags[sizeof "cpqs01234567"] = "";
+	const char*		 allow = "cpqs01234567";
+	char			 flags[sizeof "cpqs01234567"] = "";
 	u_int			 i, j = 0;
 
 	if (wp == NULL)
@@ -2869,12 +3101,7 @@ input_osc_52(struct input_ctx *ictx, const char *p)
 	log_debug("%s: %.*s %s", __func__, (int)(end - p - 1), p, flags);
 
 	if (strcmp(end, "?") == 0) {
-		if ((pb = paste_get_top(NULL)) != NULL)
-			buf = paste_buffer_data(pb, &len);
-		if (ictx->input_end == INPUT_END_BEL)
-			input_reply_clipboard(ictx->event, buf, len, "\007");
-		else
-			input_reply_clipboard(ictx->event, buf, len, "\033\\");
+		input_osc_52_reply(ictx);
 		return;
 	}
 
@@ -2933,6 +3160,7 @@ input_osc_104(struct input_ctx *ictx, const char *p)
 	free(copy);
 }
 
+/* Send a clipboard reply. */
 void
 input_reply_clipboard(struct bufferevent *bev, const char *buf, size_t len,
     const char *end)
@@ -2966,17 +3194,222 @@ input_set_buffer_size(size_t buffer_size)
 	input_buffer_size = buffer_size;
 }
 
+/* Request timer. Remove any requests that are too old. */
+static void
+input_request_timer_callback(__unused int fd, __unused short events, void *arg)
+{
+	struct input_ctx	*ictx = arg;
+	struct input_request	*ir, *ir1;
+	time_t			 t = time(NULL);
+
+	TAILQ_FOREACH_SAFE(ir, &ictx->requests, entry, ir1) {
+		if (ir->t >= t - INPUT_REQUEST_TIMEOUT)
+			continue;
+		if (ir->type == INPUT_REQUEST_QUEUE)
+			input_send_reply(ir->ictx, ir->data);
+		input_free_request(ir);
+	}
+	if (ictx->request_count != 0)
+		input_start_request_timer(ictx);
+}
+
+/* Start the request timer. */
+static void
+input_start_request_timer(struct input_ctx *ictx)
+{
+	struct timeval	tv = { .tv_sec = 0, .tv_usec = 500000 };
+
+	event_del(&ictx->request_timer);
+	event_add(&ictx->request_timer, &tv);
+}
+
+/* Create a request. */
+static struct input_request *
+input_make_request(struct input_ctx *ictx, enum input_request_type type)
+{
+	struct input_request	*ir;
+
+	ir = xcalloc (1, sizeof *ir);
+	ir->type = type;
+	ir->ictx = ictx;
+	ir->t = time(NULL);
+
+	if (++ictx->request_count == 1)
+		input_start_request_timer(ictx);
+	TAILQ_INSERT_TAIL(&ictx->requests, ir, entry);
+
+	return (ir);
+}
+
+/* Free a request. */
+static void
+input_free_request(struct input_request *ir)
+{
+	struct input_ctx	*ictx = ir->ictx;
+
+	if (ir->c != NULL)
+		TAILQ_REMOVE(&ir->c->input_requests, ir, centry);
+
+	ictx->request_count--;
+	TAILQ_REMOVE(&ictx->requests, ir, entry);
+
+	free(ir->data);
+	free(ir);
+}
+
+/* Add a request. */
+static int
+input_add_request(struct input_ctx *ictx, enum input_request_type type, int idx)
+{
+	struct window_pane	*wp = ictx->wp;
+	struct window		*w;
+	struct client		*c = NULL, *loop;
+	struct input_request	*ir;
+	char			 s[64];
+
+	if (wp == NULL)
+		return (-1);
+	w = wp->window;
+
+	TAILQ_FOREACH(loop, &clients, entry) {
+		if (loop->flags & CLIENT_UNATTACHEDFLAGS)
+			continue;
+		if (loop->session == NULL || !session_has(loop->session, w))
+			continue;
+		if (~loop->tty.flags & TTY_STARTED)
+			continue;
+		if (c == NULL)
+			c = loop;
+		else if (timercmp(&loop->activity_time, &c->activity_time, >))
+			c = loop;
+	}
+	if (c == NULL)
+		return (-1);
+
+	ir = input_make_request(ictx, type);
+	ir->c = c;
+	ir->idx = idx;
+	ir->end = ictx->input_end;
+	TAILQ_INSERT_TAIL(&c->input_requests, ir, centry);
+
+	switch (type) {
+	case INPUT_REQUEST_PALETTE:
+		xsnprintf(s, sizeof s, "\033]4;%d;?\033\\", idx);
+		tty_puts(&c->tty, s);
+		break;
+	case INPUT_REQUEST_CLIPBOARD:
+		tty_putcode_ss(&c->tty, TTYC_MS, "", "?");
+		break;
+	case INPUT_REQUEST_QUEUE:
+		break;
+	}
+
+	return (0);
+}
+
+/* Handle a palette reply. */
+static void
+input_request_palette_reply(struct input_request *ir, void *data)
+{
+	struct input_request_palette_data	*pd = data;
+
+	input_osc_colour_reply(ir->ictx, 0, 4, pd->idx, pd->c, ir->end);
+}
+
+/* Handle a clipboard reply. */
+static void
+input_request_clipboard_reply(struct input_request *ir, void *data)
+{
+	struct input_ctx			*ictx = ir->ictx;
+	struct input_request_clipboard_data	*cd = data;
+	int					 state;
+	char					*copy;
+
+	state = options_get_number(global_options, "get-clipboard");
+	if (state == 0 || state == 1)
+		return;
+	if (state == 3) {
+		copy = xmalloc(cd->len);
+		memcpy(copy, cd->buf, cd->len);
+		paste_add(NULL, copy, cd->len);
+	}
+
+	if (ir->idx == INPUT_END_BEL)
+		input_reply_clipboard(ictx->event, cd->buf, cd->len, "\007");
+	else
+		input_reply_clipboard(ictx->event, cd->buf, cd->len, "\033\\");
+}
+
+/* Handle a reply to a request. */
+void
+input_request_reply(struct client *c, enum input_request_type type, void *data)
+{
+	struct input_request			*ir, *ir1, *found = NULL;
+	struct input_request_palette_data	*pd = data;
+	int					 complete = 0;
+
+	TAILQ_FOREACH_SAFE(ir, &c->input_requests, centry, ir1) {
+		if (ir->type != type) {
+			input_free_request(ir);
+			continue;
+		}
+		if (type == INPUT_REQUEST_PALETTE && pd->idx == ir->idx) {
+			found = ir;
+			break;
+		}
+		if (type == INPUT_REQUEST_CLIPBOARD) {
+			found = ir;
+			break;
+		}
+	}
+	if (found == NULL)
+		return;
+
+	TAILQ_FOREACH_SAFE(ir, &found->ictx->requests, entry, ir1) {
+		if (complete && ir->type != INPUT_REQUEST_QUEUE)
+			break;
+		if (ir->type == INPUT_REQUEST_QUEUE)
+			input_send_reply(ir->ictx, ir->data);
+		else if (ir == found) {
+			if (ir->type == INPUT_REQUEST_PALETTE)
+				input_request_palette_reply(ir, data);
+			else if (ir->type == INPUT_REQUEST_CLIPBOARD)
+				input_request_clipboard_reply(ir, data);
+			complete = 1;
+		}
+		input_free_request(ir);
+	}
+}
+
+/* Cancel pending requests for client. */
+void
+input_cancel_requests(struct client *c)
+{
+	struct input_request	*ir, *ir1;
+
+	TAILQ_FOREACH_SAFE(ir, &c->input_requests, entry, ir1)
+		input_free_request(ir);
+}
+
+/* Report current theme. */
 static void
 input_report_current_theme(struct input_ctx *ictx)
 {
-	switch (window_pane_get_theme(ictx->wp)) {
+	struct window_pane	*wp = ictx->wp;
+
+	if (wp == NULL)
+		return;
+	switch (window_pane_get_theme(wp)) {
 		case THEME_DARK:
-			input_reply(ictx, "\033[?997;1n");
+			log_debug("%s: %%%u dark theme", __func__, wp->id);
+			input_reply(ictx, 0, "\033[?997;1n");
 			break;
 		case THEME_LIGHT:
-			input_reply(ictx, "\033[?997;2n");
+			log_debug("%s: %%%u light theme", __func__, wp->id);
+			input_reply(ictx, 0, "\033[?997;2n");
 			break;
 		case THEME_UNKNOWN:
+			log_debug("%s: %%%u unknown theme", __func__, wp->id);
 			break;
 	}
 }

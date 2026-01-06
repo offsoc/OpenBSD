@@ -1,4 +1,4 @@
-/*	$OpenBSD: tty.c,v 1.178 2024/12/30 02:46:00 guenther Exp $	*/
+/*	$OpenBSD: tty.c,v 1.182 2025/09/25 08:46:50 mvs Exp $	*/
 /*	$NetBSD: tty.c,v 1.68.4.2 1996/06/06 16:04:52 thorpej Exp $	*/
 
 /*-
@@ -79,7 +79,6 @@ void 	filt_ttywdetach(struct knote *kn);
 int	filt_ttyexcept(struct knote *kn, long hint);
 void	ttystats_init(struct itty **, int *, size_t *);
 int	ttywait_nsec(struct tty *, uint64_t);
-int	ttysleep_nsec(struct tty *, void *, int, char *, uint64_t);
 
 /* Symbolic sleep message strings. */
 char ttclos[]	= "ttycls";
@@ -747,8 +746,8 @@ ttioctl(struct tty *tp, u_long cmd, caddr_t data, int flag, struct proc *p)
 			if (pr->ps_pgrp->pg_jobc == 0)
 				return (EIO);
 			pgsignal(pr->ps_pgrp, SIGTTOU, 1);
-			error = ttysleep(tp, &lbolt, TTOPRI | PCATCH,
-			    ttybg);
+			error = ttysleep_nsec(tp, &nowake, TTOPRI | PCATCH,
+				ttybg, SEC_TO_NSEC(1));
 			if (error)
 				return (error);
 		}
@@ -1515,7 +1514,8 @@ loop:	lflag = tp->t_lflag;
 			goto out;
 		}
 		pgsignal(pr->ps_pgrp, SIGTTIN, 1);
-		error = ttysleep(tp, &lbolt, TTIPRI | PCATCH, ttybg);
+		error = ttysleep_nsec(tp, &nowake, TTIPRI | PCATCH, ttybg, 
+			SEC_TO_NSEC(1));
 		if (error)
 			goto out;
 		goto loop;
@@ -1613,8 +1613,8 @@ read:
 		    ISSET(lflag, IEXTEN | ISIG) == (IEXTEN | ISIG)) {
 			pgsignal(tp->t_pgrp, SIGTSTP, 1);
 			if (first) {
-				error = ttysleep(tp, &lbolt, TTIPRI | PCATCH,
-				    ttybg);
+				error = ttysleep_nsec(tp, &nowake, TTIPRI | PCATCH, 
+					ttybg, SEC_TO_NSEC(1));
 				if (error)
 					break;
 				goto loop;
@@ -1765,7 +1765,8 @@ loop:
 			goto out;
 		}
 		pgsignal(pr->ps_pgrp, SIGTTOU, 1);
-		error = ttysleep(tp, &lbolt, TTIPRI | PCATCH, ttybg);
+		error = ttysleep_nsec(tp, &nowake, TTIPRI | PCATCH, ttybg, 
+			SEC_TO_NSEC(1));
 		if (error)
 			goto out;
 		goto loop;
@@ -2124,21 +2125,21 @@ ttsetwater(struct tty *tp)
  * Returns true if at least one thread is runnable/running.
  */
 static int
-process_sum(struct process *pr, fixpt_t *estcpup)
+process_sum(struct process *pr, fixpt_t *pctcpup)
 {
 	struct proc *p;
-	fixpt_t estcpu;
+	fixpt_t pctcpu;
 	int ret;
 
 	ret = 0;
-	estcpu = 0;
+	pctcpu = 0;
 	TAILQ_FOREACH(p, &pr->ps_threads, p_thr_link) {
 		if (p->p_stat == SRUN || p->p_stat == SONPROC)
 			ret = 1;
-		estcpu += p->p_pctcpu;
+		pctcpu += p->p_pctcpu;
 	}
 
-	*estcpup = estcpu;
+	*pctcpup = pctcpu;
 	return (ret);
 }
 
@@ -2198,8 +2199,8 @@ empty:		ttyprintf(tp, "empty foreground process group\n");
 			if (run2 || pctcpu2 > pctcpu)
 				goto update_pickpr;
 
-			/* if p has less cpu or is zombie, then it's worse */
-			if (pctcpu2 < pctcpu || (pr->ps_flags & PS_ZOMBIE))
+			/* if p has less cpu or is exiting, then it's worse */
+			if (pctcpu2 < pctcpu || (pr->ps_flags & PS_EXITING))
 				continue;
 update_pickpr:
 			pickpr = pr;
@@ -2209,7 +2210,7 @@ update_pickpr:
 
 		/* Calculate percentage cpu, resident set size. */
 		calc_pctcpu = (pctcpu * 10000 + FSCALE / 2) >> FSHIFT;
-		if ((pickpr->ps_flags & (PS_EMBRYO | PS_ZOMBIE)) == 0 &&
+		if ((pickpr->ps_flags & (PS_EMBRYO | PS_EXITING)) == 0 &&
 		    pickpr->ps_vmspace != NULL)
 			rss = vm_resident_count(pickpr->ps_vmspace);
 
@@ -2436,6 +2437,7 @@ ttystats_init(struct itty **ttystats, int *ttycp, size_t *ttystatssiz)
 	*ttycp = ntty;
 }
 
+#ifndef SMALL_KERNEL
 /*
  * Return tty-related information.
  */
@@ -2478,6 +2480,7 @@ sysctl_tty(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	}
 	/* NOTREACHED */
 }
+#endif
 
 void
 ttytstamp(struct tty *tp, int octs, int ncts, int odcd, int ndcd)

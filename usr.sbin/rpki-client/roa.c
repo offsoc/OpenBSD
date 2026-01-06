@@ -1,4 +1,4 @@
-/*	$OpenBSD: roa.c,v 1.80 2024/11/12 09:23:07 tb Exp $ */
+/*	$OpenBSD: roa.c,v 1.87 2025/09/09 08:23:24 job Exp $ */
 /*
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -30,55 +30,15 @@
 #include <openssl/x509.h>
 
 #include "extern.h"
-
-extern ASN1_OBJECT	*roa_oid;
+#include "rpki-asn1.h"
 
 /*
- * Types and templates for the ROA eContent, RFC 6482, section 3.
+ * ROA eContent definition in RFC 9582, section 4.
  */
 
-ASN1_ITEM_EXP ROAIPAddress_it;
-ASN1_ITEM_EXP ROAIPAddressFamily_it;
 ASN1_ITEM_EXP RouteOriginAttestation_it;
-
-typedef struct {
-	ASN1_BIT_STRING		*address;
-	ASN1_INTEGER		*maxLength;
-} ROAIPAddress;
-
-DECLARE_STACK_OF(ROAIPAddress);
-
-typedef struct {
-	ASN1_OCTET_STRING	*addressFamily;
-	STACK_OF(ROAIPAddress)	*addresses;
-} ROAIPAddressFamily;
-
-DECLARE_STACK_OF(ROAIPAddressFamily);
-
-#ifndef DEFINE_STACK_OF
-#define sk_ROAIPAddress_num(st)		SKM_sk_num(ROAIPAddress, (st))
-#define sk_ROAIPAddress_value(st, i)	SKM_sk_value(ROAIPAddress, (st), (i))
-
-#define sk_ROAIPAddressFamily_num(st)	SKM_sk_num(ROAIPAddressFamily, (st))
-#define sk_ROAIPAddressFamily_value(st, i) \
-    SKM_sk_value(ROAIPAddressFamily, (st), (i))
-#endif
-
-typedef struct {
-	ASN1_INTEGER			*version;
-	ASN1_INTEGER			*asid;
-	STACK_OF(ROAIPAddressFamily)	*ipAddrBlocks;
-} RouteOriginAttestation;
-
-ASN1_SEQUENCE(ROAIPAddress) = {
-	ASN1_SIMPLE(ROAIPAddress, address, ASN1_BIT_STRING),
-	ASN1_OPT(ROAIPAddress, maxLength, ASN1_INTEGER),
-} ASN1_SEQUENCE_END(ROAIPAddress);
-
-ASN1_SEQUENCE(ROAIPAddressFamily) = {
-	ASN1_SIMPLE(ROAIPAddressFamily, addressFamily, ASN1_OCTET_STRING),
-	ASN1_SEQUENCE_OF(ROAIPAddressFamily, addresses, ROAIPAddress),
-} ASN1_SEQUENCE_END(ROAIPAddressFamily);
+ASN1_ITEM_EXP ROAIPAddressFamily_it;
+ASN1_ITEM_EXP ROAIPAddress_it;
 
 ASN1_SEQUENCE(RouteOriginAttestation) = {
 	ASN1_EXP_OPT(RouteOriginAttestation, version, ASN1_INTEGER, 0),
@@ -87,11 +47,20 @@ ASN1_SEQUENCE(RouteOriginAttestation) = {
 	    ROAIPAddressFamily),
 } ASN1_SEQUENCE_END(RouteOriginAttestation);
 
-DECLARE_ASN1_FUNCTIONS(RouteOriginAttestation);
 IMPLEMENT_ASN1_FUNCTIONS(RouteOriginAttestation);
 
+ASN1_SEQUENCE(ROAIPAddressFamily) = {
+	ASN1_SIMPLE(ROAIPAddressFamily, addressFamily, ASN1_OCTET_STRING),
+	ASN1_SEQUENCE_OF(ROAIPAddressFamily, addresses, ROAIPAddress),
+} ASN1_SEQUENCE_END(ROAIPAddressFamily);
+
+ASN1_SEQUENCE(ROAIPAddress) = {
+	ASN1_SIMPLE(ROAIPAddress, address, ASN1_BIT_STRING),
+	ASN1_OPT(ROAIPAddress, maxLength, ASN1_INTEGER),
+} ASN1_SEQUENCE_END(ROAIPAddress);
+
 /*
- * Parses the eContent section of an ROA file, RFC 6482, section 3.
+ * Parses the eContent section of an ROA file, RFC 9582, section 4.
  * Returns zero on failure, non-zero on success.
  */
 static int
@@ -113,7 +82,7 @@ roa_parse_econtent(const char *fn, struct roa *roa, const unsigned char *d,
 
 	oder = d;
 	if ((roa_asn1 = d2i_RouteOriginAttestation(NULL, &d, dsz)) == NULL) {
-		warnx("%s: RFC 6482 section 3: failed to parse "
+		warnx("%s: RFC 9582 section 4: failed to parse "
 		    "RouteOriginAttestation", fn);
 		goto out;
 	}
@@ -126,8 +95,13 @@ roa_parse_econtent(const char *fn, struct roa *roa, const unsigned char *d,
 	if (!valid_econtent_version(fn, roa_asn1->version, 0))
 		goto out;
 
+	/*
+	 * XXX: from here until the function end should be refactored
+	 * to deduplicate similar code in ccr.c.
+	 */
+
 	if (!as_id_parse(roa_asn1->asid, &roa->asid)) {
-		warnx("%s: RFC 6482 section 3.2: asID: "
+		warnx("%s: RFC 9582 section 4.2: asID: "
 		    "malformed AS identifier", fn);
 		goto out;
 	}
@@ -146,7 +120,7 @@ roa_parse_econtent(const char *fn, struct roa *roa, const unsigned char *d,
 		addrsz = sk_ROAIPAddress_num(addrs);
 
 		if (!ip_addr_afi_parse(fn, addrfam->addressFamily, &afi)) {
-			warnx("%s: RFC 6482 section 3.3: addressFamily: "
+			warnx("%s: RFC 9582 section 4.3: addressFamily: "
 			    "invalid", fn);
 			goto out;
 		}
@@ -154,14 +128,14 @@ roa_parse_econtent(const char *fn, struct roa *roa, const unsigned char *d,
 		switch (afi) {
 		case AFI_IPV4:
 			if (ipv4_seen++ > 0) {
-				warnx("%s: RFC 9582 section 4.3.2: "
+				warnx("%s: RFC 9582 section 4.3.1: "
 				    "IPv4 appears twice", fn);
 				goto out;
 			}
 			break;
 		case AFI_IPV6:
 			if (ipv6_seen++ > 0) {
-				warnx("%s: RFC 9582 section 4.3.2: "
+				warnx("%s: RFC 9582 section 4.3.1: "
 				    "IPv6 appears twice", fn);
 				goto out;
 			}
@@ -169,7 +143,7 @@ roa_parse_econtent(const char *fn, struct roa *roa, const unsigned char *d,
 		}
 
 		if (addrsz == 0) {
-			warnx("%s: RFC 9582, section 4.3.2: "
+			warnx("%s: RFC 9582, section 4.3.1: "
 			    "empty ROAIPAddressFamily", fn);
 			goto out;
 		}
@@ -188,7 +162,7 @@ roa_parse_econtent(const char *fn, struct roa *roa, const unsigned char *d,
 			addr = sk_ROAIPAddress_value(addrs, j);
 
 			if (!ip_addr_parse(addr->address, afi, fn, &ipaddr)) {
-				warnx("%s: RFC 6482 section 3.3: address: "
+				warnx("%s: RFC 9582 section 4.3.2.1: address: "
 				    "invalid IP address", fn);
 				goto out;
 			}
@@ -197,7 +171,7 @@ roa_parse_econtent(const char *fn, struct roa *roa, const unsigned char *d,
 			if (addr->maxLength != NULL) {
 				if (!ASN1_INTEGER_get_uint64(&maxlen,
 				    addr->maxLength)) {
-					warnx("%s: RFC 6482 section 3.2: "
+					warnx("%s: RFC 9582 section 4.3.2.2: "
 					    "ASN1_INTEGER_get_uint64 failed",
 					    fn);
 					goto out;
@@ -231,21 +205,24 @@ roa_parse_econtent(const char *fn, struct roa *roa, const unsigned char *d,
 }
 
 /*
- * Parse a full RFC 6482 file.
+ * Parse a full RFC 9582 file.
  * Returns the ROA or NULL if the document was malformed.
  */
 struct roa *
-roa_parse(X509 **x509, const char *fn, int talid, const unsigned char *der,
-    size_t len)
+roa_parse(struct cert **out_cert, const char *fn, int talid,
+    const unsigned char *der, size_t len)
 {
 	struct roa	*roa;
+	struct cert	*cert = NULL;
 	size_t		 cmsz;
 	unsigned char	*cms;
-	struct cert	*cert = NULL;
 	time_t		 signtime = 0;
 	int		 rc = 0;
 
-	cms = cms_parse_validate(x509, fn, der, len, roa_oid, &cmsz, &signtime);
+	assert(*out_cert == NULL);
+
+	cms = cms_parse_validate(&cert, fn, talid, der, len, roa_oid, &cmsz,
+	    &signtime);
 	if (cms == NULL)
 		return NULL;
 
@@ -253,36 +230,13 @@ roa_parse(X509 **x509, const char *fn, int talid, const unsigned char *der,
 		err(1, NULL);
 	roa->signtime = signtime;
 
-	if (!x509_get_aia(*x509, fn, &roa->aia))
-		goto out;
-	if (!x509_get_aki(*x509, fn, &roa->aki))
-		goto out;
-	if (!x509_get_sia(*x509, fn, &roa->sia))
-		goto out;
-	if (!x509_get_ski(*x509, fn, &roa->ski))
-		goto out;
-	if (roa->aia == NULL || roa->aki == NULL || roa->sia == NULL ||
-	    roa->ski == NULL) {
-		warnx("%s: RFC 6487 section 4.8: "
-		    "missing AIA, AKI, SIA, or SKI X509 extension", fn);
-		goto out;
-	}
-
-	if (!x509_get_notbefore(*x509, fn, &roa->notbefore))
-		goto out;
-	if (!x509_get_notafter(*x509, fn, &roa->notafter))
-		goto out;
-
 	if (!roa_parse_econtent(fn, roa, cms, cmsz))
 		goto out;
 
-	if (x509_any_inherits(*x509)) {
+	if (x509_any_inherits(cert->x509)) {
 		warnx("%s: inherit elements not allowed in EE cert", fn);
 		goto out;
 	}
-
-	if ((cert = cert_parse_ee_cert(fn, talid, *x509)) == NULL)
-		goto out;
 
 	if (cert->num_ases > 0) {
 		warnx("%s: superfluous AS Resources extension present", fn);
@@ -300,13 +254,14 @@ roa_parse(X509 **x509, const char *fn, int talid, const unsigned char *der,
 	 */
 	roa->valid = valid_roa(fn, cert, roa);
 
+	*out_cert = cert;
+	cert = NULL;
+
 	rc = 1;
 out:
 	if (rc == 0) {
 		roa_free(roa);
 		roa = NULL;
-		X509_free(*x509);
-		*x509 = NULL;
 	}
 	cert_free(cert);
 	free(cms);
@@ -323,10 +278,6 @@ roa_free(struct roa *p)
 
 	if (p == NULL)
 		return;
-	free(p->aia);
-	free(p->aki);
-	free(p->sia);
-	free(p->ski);
 	free(p->ips);
 	free(p);
 }
@@ -345,10 +296,6 @@ roa_buffer(struct ibuf *b, const struct roa *p)
 	io_simple_buffer(b, &p->expires, sizeof(p->expires));
 
 	io_simple_buffer(b, p->ips, p->num_ips * sizeof(p->ips[0]));
-
-	io_str_buffer(b, p->aia);
-	io_str_buffer(b, p->aki);
-	io_str_buffer(b, p->ski);
 }
 
 /*
@@ -376,11 +323,6 @@ roa_read(struct ibuf *b)
 		io_read_buf(b, p->ips, p->num_ips * sizeof(p->ips[0]));
 	}
 
-	io_read_str(b, &p->aia);
-	io_read_str(b, &p->aki);
-	io_read_str(b, &p->ski);
-	assert(p->aia && p->aki && p->ski);
-
 	return p;
 }
 
@@ -403,10 +345,7 @@ roa_insert_vrps(struct vrp_tree *tree, struct roa *roa, struct repo *rp)
 		v->maxlength = roa->ips[i].maxlength;
 		v->asid = roa->asid;
 		v->talid = roa->talid;
-		if (rp != NULL)
-			v->repoid = repo_id(rp);
-		else
-			v->repoid = 0;
+		v->repoid = repo_id(rp);
 		v->expires = roa->expires;
 
 		/*

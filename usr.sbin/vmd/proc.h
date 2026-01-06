@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.h,v 1.26 2025/05/12 17:17:42 dv Exp $	*/
+/*	$OpenBSD: proc.h,v 1.30 2025/09/24 15:27:19 dv Exp $	*/
 
 /*
  * Copyright (c) 2010-2015 Reyk Floeter <reyk@openbsd.org>
@@ -26,13 +26,11 @@
 #define _PROC_H
 
 enum {
-	IMSG_NONE,
+	IMSG_NONE = 0,
 	IMSG_CTL_OK,
 	IMSG_CTL_FAIL,
 	IMSG_CTL_VERBOSE,
-	IMSG_CTL_END,
 	IMSG_CTL_RESET,
-	IMSG_CTL_PROCFD,
 	IMSG_PROC_MAX
 };
 
@@ -84,15 +82,10 @@ extern enum privsep_procid privsep_process;
 #define CONFIG_SWITCHES		0x02
 #define CONFIG_ALL		0xff
 
-struct privsep_pipes {
-	int				*pp_pipes[PROC_MAX];
-};
-
 struct privsep {
-	struct privsep_pipes		*ps_pipes[PROC_MAX];
-	struct privsep_pipes		*ps_pp;
+	int				 ps_pipes[PROC_MAX];
 
-	struct imsgev			*ps_ievs[PROC_MAX];
+	struct imsgev			 ps_ievs[PROC_MAX];
 	const char			*ps_title[PROC_MAX];
 	uint8_t				 ps_what[PROC_MAX];
 
@@ -101,9 +94,6 @@ struct privsep {
 
 	struct control_sock		 ps_csock;
 	struct control_socks		 ps_rcsocks;
-
-	unsigned int			 ps_instances[PROC_MAX];
-	unsigned int			 ps_instance;
 
 	/* Event and signal handlers */
 	struct event			 ps_evsigint;
@@ -129,11 +119,6 @@ struct privsep_proc {
 	struct privsep		*p_ps;
 };
 
-struct privsep_fd {
-	enum privsep_procid		 pf_procid;
-	unsigned int			 pf_instance;
-};
-
 #if DEBUG
 #define DPRINTF		log_debug
 #else
@@ -141,7 +126,6 @@ struct privsep_fd {
 #endif
 
 #define PROC_PARENT_SOCK_FILENO	3
-#define PROC_MAX_INSTANCES	32
 
 /* proc.c */
 void	 proc_init(struct privsep *, struct privsep_proc *, unsigned int, int,
@@ -161,23 +145,19 @@ int	 imsg_compose_event2(struct imsgev *, uint32_t, uint32_t,
 int	 imsg_composev_event(struct imsgev *, uint32_t, uint32_t,
 	    pid_t, int, const struct iovec *, int);
 void	 imsg_forward_event(struct imsgev *, struct imsg *);
-int	 proc_compose_imsg(struct privsep *, enum privsep_procid, int,
+int	 proc_compose_imsg(struct privsep *, enum privsep_procid,
 	    uint32_t, uint32_t, int, void *, size_t);
 int	 proc_compose(struct privsep *, enum privsep_procid,
 	    uint32_t, void *data, size_t);
-int	 proc_composev_imsg(struct privsep *, enum privsep_procid, int,
+int	 proc_composev_imsg(struct privsep *, enum privsep_procid,
 	    uint32_t, uint32_t, int, const struct iovec *, int);
 int	 proc_composev(struct privsep *, enum privsep_procid,
 	    uint32_t, const struct iovec *, int);
 int	 proc_forward_imsg(struct privsep *, struct imsg *,
 	    enum privsep_procid, uint32_t);
-struct imsgbuf *
-	 proc_ibuf(struct privsep *, enum privsep_procid, int);
-struct imsgev *
-	 proc_iev(struct privsep *, enum privsep_procid, int);
 enum privsep_procid
 	 proc_getid(struct privsep_proc *, unsigned int, const char *);
-int	 proc_flush_imsg(struct privsep *, enum privsep_procid, int);
+int	 proc_flush_imsg(struct privsep *, enum privsep_procid);
 
 /* control.c */
 void	 control(struct privsep *, struct privsep_proc *);
@@ -211,6 +191,5 @@ __dead void fatalx(const char *, ...)
 int 		 imsg_int_read(struct imsg *);
 unsigned int	 imsg_uint_read(struct imsg *);
 char		*imsg_string_read(struct imsg *, size_t max);
-void		 privsep_fd_read(struct imsg *, struct privsep_fd *);
 
 #endif /* _PROC_H */

@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_timeout.c,v 1.106 2025/05/24 00:19:09 dlg Exp $	*/
+/*	$OpenBSD: kern_timeout.c,v 1.112 2025/07/28 05:25:44 dlg Exp $	*/
 /*
  * Copyright (c) 2001 Thomas Nordin <nordin@openbsd.org>
  * Copyright (c) 2000-2001 Artur Grabowski <art@openbsd.org>
@@ -202,7 +202,6 @@ void softclock_thread(void *);
 #ifdef MULTIPROCESSOR
 void softclock_thread_mp(void *);
 #endif
-void timeout_barrier_timeout(void *);
 uint32_t timeout_bucket(const struct timeout *);
 uint32_t timeout_maskwheel(uint32_t, const struct timespec *);
 void timeout_run(struct timeout_ctx *, struct timeout *);
@@ -360,8 +359,21 @@ timeout_add(struct timeout *new, int to_ticks)
 static inline int
 timeout_add_ticks(struct timeout *to, uint64_t to_ticks)
 {
-	if (to_ticks > INT_MAX)
+	/*
+	 * XXX to_ticks is added to the current ticks value, but
+	 * timeouts are run in the next clock interrupt after ticks
+	 * is incremented. however, the deadline comparison in
+	 * softclock_process_tick_timeout will fire a timeout if it's
+	 * deadline is at the current ticks value. eg, a to_ticks
+	 * value of 1 plus the current ticks value will fire in the
+	 * next interrupt, which will be too early. add 1 here to
+	 * ensure the requested time has elapsed.
+	 */
+
+	if (to_ticks >= INT_MAX)
 		to_ticks = INT_MAX;
+	else
+		to_ticks++;
 
 	return timeout_add(to, (int)to_ticks);
 }
@@ -380,7 +392,7 @@ timeout_add_sec(struct timeout *to, int secs)
 
 /*
  * interpret the specified times below as a AT LEAST how long the
- * system should wait before firing the the timeouts. this requires
+ * system should wait before firing the timeouts. this requires
  * rounding up, which has the potential to overflow. if we detect
  * overflow, interpret it as "wait for as long as possible". this will
  * be shorter than specified time, which violates the "wait at least
@@ -502,7 +514,7 @@ timeout_barrier(struct timeout *to)
 	flags = to->to_flags & (TIMEOUT_PROC | TIMEOUT_MPSAFE);
 	timeout_sync_order(ISSET(flags, TIMEOUT_PROC));
 
-	timeout_set_flags(&barrier, timeout_barrier_timeout, &c, KCLOCK_NONE,
+	timeout_set_flags(&barrier, cond_signal_handler, &c, KCLOCK_NONE,
 	    flags);
 	barrier.to_process = curproc->p_p;
 	cond_init(&c);
@@ -535,14 +547,6 @@ timeout_barrier(struct timeout *to)
 	 */
 
 	cond_wait(&c, "tmobar");
-}
-
-void
-timeout_barrier_timeout(void *arg)
-{
-	struct cond *c = arg;
-
-	cond_signal(c);
 }
 
 uint32_t
@@ -827,7 +831,7 @@ softclock_thread_run(struct timeout_ctx *tctx)
 		 * at the same time.
 		 */
 		sleep_setup(todo, PSWP, "tmoslp");
-		sleep_finish(0, CIRCQ_EMPTY(tctx->tctx_todo));
+		sleep_finish(INFSLP, CIRCQ_EMPTY(tctx->tctx_todo));
 
 		mtx_enter(&timeout_mutex);
 		tostat.tos_thread_wakeups++;
@@ -906,6 +910,7 @@ timeout_adjust_ticks(int adj)
 }
 #endif
 
+#ifndef SMALL_KERNEL
 int
 timeout_sysctl(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 {
@@ -917,6 +922,7 @@ timeout_sysctl(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 
 	return sysctl_rdstruct(oldp, oldlenp, newp, &status, sizeof(status));
 }
+#endif /* SMALL_KERNEL */
 
 #ifdef DDB
 const char *db_kclock(int);

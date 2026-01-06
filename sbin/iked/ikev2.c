@@ -1,4 +1,4 @@
-/*	$OpenBSD: ikev2.c,v 1.392 2025/04/29 13:40:26 tobhe Exp $	*/
+/*	$OpenBSD: ikev2.c,v 1.395 2025/11/04 11:10:43 yasuoka Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -3112,7 +3112,8 @@ ikev2_handle_delete(struct iked *env, struct iked_message *msg,
 			goto done;
 		}
 		ikev2_ikesa_recv_delete(env, sa);
-		return (0);
+		ret = 0;
+		goto done;
 	default:
 		log_info("%s: error: invalid SPI size", __func__);
 		goto done;
@@ -3124,7 +3125,7 @@ ikev2_handle_delete(struct iked *env, struct iked_message *msg,
 	if ((len / sz) != cnt) {
 		log_debug("%s: invalid payload length %zu/%zu != %zu",
 		    __func__, len, sz, cnt);
-		return (-1);
+		goto done;
 	}
 
 	if (((peersas = calloc(cnt, sizeof(struct iked_childsa *))) == NULL ||
@@ -3819,6 +3820,7 @@ ikev2_resp_ike_eap_mschap(struct iked *env, struct iked_sa *sa,
 	switch (eap->eam_state) {
 	case EAP_STATE_IDENTITY:
 		sa->sa_eapid = eap->eam_identity;
+		eap->eam_identity = NULL;
 		return (eap_challenge_request(env, sa, eap->eam_id));
 	case EAP_STATE_MSCHAPV2_CHALLENGE:
 		if (eap->eam_user) {
@@ -7262,6 +7264,8 @@ ikev2_cp_setaddr_pool(struct iked *env, struct iked_sa *sa,
 			}
 			free(sa->sa_cp_addr);
 			free(sa->sa_rad_addr);
+			sa->sa_cp_addr = NULL;
+			sa->sa_rad_addr = NULL;
 			RB_INSERT(iked_addrpool, &env->sc_addrpool, sa);
 			goto done;
 		}
@@ -7551,7 +7555,7 @@ ikev2_info_sa(struct iked *env, struct imsg *imsg, int dolog, const char *msg,
 	    print_map(sa->sa_state, ikev2_state_map),
 	    sa->sa_hdr.sh_initiator ? 'i' : 'r',
 	    sa->sa_natt ? " natt" : "",
-	    sa->sa_udpencap ? " udpecap" : "",
+	    sa->sa_udpencap ? " udpencap" : "",
 	    sa->sa_nexti, sa->sa_policy);
 
 	if (buflen == -1 || buf == NULL)

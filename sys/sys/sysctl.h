@@ -1,4 +1,4 @@
-/*	$OpenBSD: sysctl.h,v 1.242 2025/04/29 02:24:32 tedu Exp $	*/
+/*	$OpenBSD: sysctl.h,v 1.246 2025/07/31 09:05:11 mvs Exp $	*/
 /*	$NetBSD: sysctl.h,v 1.16 1996/04/09 20:55:36 cgd Exp $	*/
 
 /*
@@ -1030,6 +1030,8 @@ struct sysctl_bounded_args {
  */
 typedef int (sysctlfn)(int *, u_int, void *, size_t *, void *, size_t, struct proc *);
 
+extern struct rwlock sysctl_lock;
+
 int sysctl_vslock(void *, size_t);
 void sysctl_vsunlock(void *, size_t);
 
@@ -1040,7 +1042,6 @@ int sysctl_securelevel_int(void *, size_t *, void *, size_t, int *);
 int sysctl_int_bounded(void *, size_t *, void *, size_t, int *, int, int);
 int sysctl_bounded_arr(const struct sysctl_bounded_args *, u_int,
     int *, u_int, void *, size_t *, void *, size_t);
-int sysctl_quad(void *, size_t *, void *, size_t, int64_t *);
 int sysctl_rdquad(void *, size_t *, void *, int64_t);
 int sysctl_string(void *, size_t *, void *, size_t, char *, size_t);
 int sysctl_tstring(void *, size_t *, void *, size_t, char *, size_t);
@@ -1054,7 +1055,7 @@ struct mbuf_queue;
 int sysctl_mq(int *, u_int, void *, size_t *, void *, size_t,
     struct mbuf_queue *);
 struct rtentry;
-int sysctl_dumpentry(struct rtentry *, void *, unsigned int);
+int sysctl_dumpentry(const struct rtentry *, void *, unsigned int);
 int sysctl_rtable(int *, u_int, void *, size_t *, void *, size_t);
 int sysctl_clockrate(char *, size_t *, void *);
 #if defined(GPROF) || defined(DDBPROF)
@@ -1070,10 +1071,6 @@ int hw_sysctl(int *, u_int, void *, size_t *, void *, size_t,
 int debug_sysctl(int *, u_int, void *, size_t *, void *, size_t,
 		      struct proc *);
 #endif
-int fs_sysctl(int *, u_int, void *, size_t *, void *, size_t,
-		   struct proc *);
-int fs_posix_sysctl(int *, u_int, void *, size_t *, void *, size_t,
-			 struct proc *);
 int net_sysctl(int *, u_int, void *, size_t *, void *, size_t,
 		    struct proc *);
 int cpu_sysctl(int *, u_int, void *, size_t *, void *, size_t,

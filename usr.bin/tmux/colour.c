@@ -1,4 +1,4 @@
-/* $OpenBSD: colour.c,v 1.29 2025/03/04 08:45:04 nicm Exp $ */
+/* $OpenBSD: colour.c,v 1.31 2025/12/03 07:41:38 nicm Exp $ */
 
 /*
  * Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -986,7 +986,8 @@ colour_byname(const char *name)
 	int		 c;
 	const char	*errstr;
 
-	if (strncmp(name, "grey", 4) == 0 || strncmp(name, "gray", 4) == 0) {
+	if (strncasecmp(name, "grey", 4) == 0 ||
+	    strncasecmp(name, "gray", 4) == 0) {
 		if (name[4] == '\0')
 			return (0xbebebe|COLOUR_FLAG_RGB);
 		c = strtonum(name + 4, 0, 100, &errstr);
@@ -1081,22 +1082,22 @@ colour_palette_free(struct colour_palette *p)
 
 /* Get a colour from a palette. */
 int
-colour_palette_get(struct colour_palette *p, int c)
+colour_palette_get(struct colour_palette *p, int n)
 {
 	if (p == NULL)
 		return (-1);
 
-	if (c >= 90 && c <= 97)
-		c = 8 + c - 90;
-	else if (c & COLOUR_FLAG_256)
-		c &= ~COLOUR_FLAG_256;
-	else if (c >= 8)
+	if (n >= 90 && n <= 97)
+		n = 8 + n - 90;
+	else if (n & COLOUR_FLAG_256)
+		n &= ~COLOUR_FLAG_256;
+	else if (n >= 8)
 		return (-1);
 
-	if (p->palette != NULL && p->palette[c] != -1)
-		return (p->palette[c]);
-	if (p->default_palette != NULL && p->default_palette[c] != -1)
-		return (p->default_palette[c]);
+	if (p->palette != NULL && p->palette[n] != -1)
+		return (p->palette[n]);
+	if (p->default_palette != NULL && p->default_palette[n] != -1)
+		return (p->default_palette[n]);
 	return (-1);
 }
 
@@ -1106,15 +1107,14 @@ colour_palette_set(struct colour_palette *p, int n, int c)
 {
 	u_int	i;
 
-	if (p == NULL || n > 255)
+	if (p == NULL || n < 0 || n > 255)
 		return (0);
 
 	if (c == -1 && p->palette == NULL)
 		return (0);
 
-	if (c != -1 && p->palette == NULL) {
-		if (p->palette == NULL)
-			p->palette = xcalloc(256, sizeof *p->palette);
+	if (p->palette == NULL) {
+		p->palette = xcalloc(256, sizeof *p->palette);
 		for (i = 0; i < 256; i++)
 			p->palette[i] = -1;
 	}

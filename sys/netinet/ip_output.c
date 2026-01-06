@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_output.c,v 1.409 2025/05/14 14:32:15 mvs Exp $	*/
+/*	$OpenBSD: ip_output.c,v 1.416 2025/12/13 00:55:02 jsg Exp $	*/
 /*	$NetBSD: ip_output.c,v 1.28 1996/02/13 23:43:07 christos Exp $	*/
 
 /*
@@ -39,9 +39,7 @@
 #include <sys/mbuf.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 #include <sys/proc.h>
-#include <sys/kernel.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -177,7 +175,7 @@ reroute:
 		if (ip->ip_src.s_addr == INADDR_ANY) {
 			struct in_ifaddr *ia;
 
-			IFP_TO_IA(ifp, ia);
+			ia = in_ifp2ia(ifp);
 			if (ia != NULL)
 				ip->ip_src = ia->ia_addr.sin_addr;
 		}
@@ -295,7 +293,7 @@ reroute:
 		if (ip->ip_src.s_addr == INADDR_ANY) {
 			struct in_ifaddr *ia;
 
-			IFP_TO_IA(ifp, ia);
+			ia = in_ifp2ia(ifp);
 			if (ia != NULL)
 				ip->ip_src = ia->ia_addr.sin_addr;
 		}
@@ -326,7 +324,8 @@ reroute:
 			 * above, will be forwarded by the ip_input() routine,
 			 * if necessary.
 			 */
-			if (ipmforwarding && ip_mrouter[ifp->if_rdomain] &&
+			if (atomic_load_int(&ipmforwarding) &&
+			    ip_mrouter[ifp->if_rdomain] &&
 			    (flags & IP_FORWARDING) == 0) {
 				int rv;
 
@@ -445,7 +444,7 @@ reroute:
 	 */
 	if (ip->ip_off & htons(IP_DF)) {
 #ifdef IPSEC
-		if (ip_mtudisc)
+		if (atomic_load_int(&ip_mtudisc))
 			ipsec_adjust_mtu(m, ifp->if_mtu);
 #endif
 		error = EMSGSIZE;
@@ -583,7 +582,8 @@ ip_output_ipsec_send(struct tdb *tdb, struct mbuf *m, struct route *ro,
 	struct ip *ip;
 	struct in_addr dst;
 	u_int len;
-	int error, tso = 0;
+	int tso = 0, ip_mtudisc_local = atomic_load_int(&ip_mtudisc);
+	int error = 0;
 
 #if NPF > 0
 	/*
@@ -616,7 +616,7 @@ ip_output_ipsec_send(struct tdb *tdb, struct mbuf *m, struct route *ro,
 
 	/* Check if we are allowed to fragment */
 	dst = ip->ip_dst;
-	if (ip_mtudisc && (ip->ip_off & htons(IP_DF)) && tdb->tdb_mtu &&
+	if (ip_mtudisc_local && (ip->ip_off & htons(IP_DF)) && tdb->tdb_mtu &&
 	    len > tdb->tdb_mtu && tdb->tdb_mtutimeout > gettime()) {
 		ip_output_ipsec_pmtu_update(tdb, ro, dst, rtableid);
 		ipsec_adjust_mtu(m, tdb->tdb_mtu);
@@ -624,7 +624,7 @@ ip_output_ipsec_send(struct tdb *tdb, struct mbuf *m, struct route *ro,
 		return EMSGSIZE;
 	}
 	/* propagate IP_DF for v4-over-v6 */
-	if (ip_mtudisc && ip->ip_off & htons(IP_DF))
+	if (ip_mtudisc_local && ip->ip_off & htons(IP_DF))
 		SET(m->m_pkthdr.csum_flags, M_IPV6_DF_OUT);
 
 	/*
@@ -661,7 +661,7 @@ ip_output_ipsec_send(struct tdb *tdb, struct mbuf *m, struct route *ro,
 	}
 	if (!error && tso)
 		tcpstat_inc(tcps_outswtso);
-	if (ip_mtudisc && error == EMSGSIZE)
+	if (ip_mtudisc_local && error == EMSGSIZE)
 		ip_output_ipsec_pmtu_update(tdb, ro, dst, rtableid);
 	return error;
 }
@@ -908,7 +908,8 @@ ip_ctloutput(int op, struct socket *so, int level, int optname,
 					if (optval > 0 && optval <= MAXTTL)
 						inp->inp_ip.ip_ttl = optval;
 					else if (optval == -1)
-						inp->inp_ip.ip_ttl = ip_defttl;
+						inp->inp_ip.ip_ttl =
+						    atomic_load_int(&ip_defttl);
 					else
 						error = EINVAL;
 					break;
@@ -1124,7 +1125,7 @@ ip_ctloutput(int op, struct socket *so, int level, int optname,
 				break;
 
 			case IP_IPDEFTTL:
-				optval = ip_defttl;
+				optval = atomic_load_int(&ip_defttl);
 				break;
 
 #define	OPTBIT(bit)	(inp->inp_flags & bit ? 1 : 0)
@@ -1553,8 +1554,8 @@ ip_setmoptions(int optname, struct ip_moptions **imop, struct mbuf *m,
 		 */
 		for (i = 0; i < imo->imo_num_memberships; ++i) {
 			if (imo->imo_membership[i]->inm_ifidx == ifidx &&
-			    imo->imo_membership[i]->inm_addr.s_addr
-						== mreqn.imr_multiaddr.s_addr)
+			    imo->imo_membership[i]->inm_addr.s_addr ==
+			    mreqn.imr_multiaddr.s_addr)
 				break;
 		}
 		if (i < imo->imo_num_memberships) {
@@ -1639,8 +1640,8 @@ ip_setmoptions(int optname, struct ip_moptions **imop, struct mbuf *m,
 		for (i = 0; i < imo->imo_num_memberships; ++i) {
 			if ((ifidx == 0 ||
 			    imo->imo_membership[i]->inm_ifidx == ifidx) &&
-			     imo->imo_membership[i]->inm_addr.s_addr ==
-			     mreqn.imr_multiaddr.s_addr)
+			    imo->imo_membership[i]->inm_addr.s_addr ==
+			    mreqn.imr_multiaddr.s_addr)
 				break;
 		}
 		if (i == imo->imo_num_memberships) {
@@ -1701,9 +1702,9 @@ ip_getmoptions(int optname, struct ip_moptions *imo, struct mbuf *m)
 		if (imo == NULL || (ifp = if_get(imo->imo_ifidx)) == NULL)
 			addr->s_addr = INADDR_ANY;
 		else {
-			IFP_TO_IA(ifp, ia);
-			addr->s_addr = (ia == NULL) ? INADDR_ANY
-					: ia->ia_addr.sin_addr.s_addr;
+			ia = in_ifp2ia(ifp);
+			addr->s_addr = (ia == NULL) ? INADDR_ANY :
+			    ia->ia_addr.sin_addr.s_addr;
 			if_put(ifp);
 		}
 		return (0);

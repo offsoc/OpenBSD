@@ -1,4 +1,4 @@
-/*	$OpenBSD: session_bgp.c,v 1.4 2025/02/27 13:35:00 claudio Exp $ */
+/*	$OpenBSD: session_bgp.c,v 1.6 2025/11/04 15:01:09 claudio Exp $ */
 
 /*
  * Copyright (c) 2004 - 2025 Claudio Jeker <claudio@openbsd.org>
@@ -146,7 +146,7 @@ session_capa_add_afi(struct ibuf *b, uint8_t aid, uint8_t flags)
 	uint16_t	afi;
 	uint8_t		safi;
 
-	if (aid2afi(aid, &afi, &safi)) {
+	if (aid2afi(aid, &afi, &safi) == -1) {
 		log_warn("%s: bad AID", __func__);
 		return (-1);
 	}
@@ -165,7 +165,7 @@ session_capa_add_ext_nh(struct ibuf *b, uint8_t aid)
 	uint16_t	afi;
 	uint8_t		safi;
 
-	if (aid2afi(aid, &afi, &safi)) {
+	if (aid2afi(aid, &afi, &safi) == -1) {
 		log_warn("%s: bad AID", __func__);
 		return (-1);
 	}
@@ -559,7 +559,7 @@ session_rrefresh(struct peer *p, uint8_t aid, uint8_t subtype)
 	}
 
 	if (aid2afi(aid, &afi, &safi) == -1)
-		fatalx("session_rrefresh: bad afi/safi pair");
+		fatalx("%s: bad AID", __func__);
 
 	if ((buf = session_newmsg(BGP_RREFRESH, MSGSIZE_RREFRESH)) == NULL) {
 		bgp_fsm(p, EVNT_CON_FATAL, NULL);
@@ -1799,10 +1799,18 @@ void
 change_state(struct peer *peer, enum session_state state,
     enum session_events event)
 {
-	switch (state) {
+	enum session_state ostate;
+
+	/* first apply new state */
+	ostate = peer->prev_state;
+	peer->prev_state = peer->state;
+	peer->state = state;
+
+	/* then act on it */
+	switch (peer->state) {
 	case STATE_IDLE:
 		/* carp demotion first. new peers handled in init_peer */
-		if (peer->state == STATE_ESTABLISHED &&
+		if (peer->prev_state == STATE_ESTABLISHED &&
 		    peer->conf.demote_group[0] && !peer->demoted)
 			session_demote(peer, +1);
 
@@ -1810,7 +1818,7 @@ change_state(struct peer *peer, enum session_state state,
 		 * try to write out what's buffered (maybe a notification),
 		 * don't bother if it fails
 		 */
-		if (peer->state >= STATE_OPENSENT &&
+		if (peer->prev_state >= STATE_OPENSENT &&
 		    msgbuf_queuelen(peer->wbuf) > 0)
 			ibuf_write(peer->fd, peer->wbuf);
 
@@ -1835,7 +1843,7 @@ change_state(struct peer *peer, enum session_state state,
 		memset(&peer->capa.peer, 0, sizeof(peer->capa.peer));
 		session_md5_reload(peer);
 
-		if (peer->state == STATE_ESTABLISHED) {
+		if (peer->prev_state == STATE_ESTABLISHED) {
 			if (peer->capa.neg.grestart.restart == 2 &&
 			    (event == EVNT_CON_CLOSED ||
 			    event == EVNT_CON_FATAL ||
@@ -1864,15 +1872,15 @@ change_state(struct peer *peer, enum session_state state,
 				peer->IdleHoldTime *= 2;
 		}
 
-		if (peer->state == STATE_NONE ||
-		    peer->state == STATE_ESTABLISHED) {
+		if (peer->prev_state == STATE_NONE ||
+		    peer->prev_state == STATE_ESTABLISHED) {
 			/* initialize capability negotiation structures */
 			memcpy(&peer->capa.ann, &peer->conf.capabilities,
 			    sizeof(peer->capa.ann));
 		}
 		break;
 	case STATE_CONNECT:
-		if (peer->state == STATE_ESTABLISHED &&
+		if (peer->prev_state == STATE_ESTABLISHED &&
 		    peer->capa.neg.grestart.restart == 2) {
 			/* do the graceful restart dance */
 			session_graceful_restart(peer);
@@ -1907,10 +1915,6 @@ change_state(struct peer *peer, enum session_state state,
 		break;
 	}
 
-	log_statechange(peer, state, event);
-
-	session_mrt_dump_state(peer, peer->state, state);
-
-	peer->prev_state = peer->state;
-	peer->state = state;
+	log_statechange(peer, ostate, event);
+	session_mrt_dump_state(peer);
 }

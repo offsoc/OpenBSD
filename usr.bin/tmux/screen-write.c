@@ -1,4 +1,4 @@
-/* $OpenBSD: screen-write.c,v 1.233 2025/05/01 07:12:00 nicm Exp $ */
+/* $OpenBSD: screen-write.c,v 1.244 2026/01/05 08:32:19 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -576,7 +576,6 @@ screen_write_fast_copy(struct screen_write_ctx *ctx, struct screen *src,
 	if (nx == 0 || ny == 0)
 		return;
 
-	cy = s->cy;
 	for (yy = py; yy < py + ny; yy++) {
 		if (yy >= gd->hsize + gd->sy)
 			break;
@@ -584,7 +583,8 @@ screen_write_fast_copy(struct screen_write_ctx *ctx, struct screen *src,
 		if (wp != NULL)
 			screen_write_initctx(ctx, &ttyctx, 0);
 		for (xx = px; xx < px + nx; xx++) {
-			if (xx >= grid_get_line(gd, yy)->cellsize)
+			if (xx >= grid_get_line(gd, yy)->cellsize &&
+			    s->cx >= grid_get_line(ctx->s->grid, s->cy)->cellsize)
 				break;
 			grid_get_cell(gd, xx, yy, &gc);
 			if (xx + gc.data.width > px + nx)
@@ -892,6 +892,52 @@ screen_write_mode_clear(struct screen_write_ctx *ctx, int mode)
 
 	if (log_get_level() != 0)
 		log_debug("%s: %s", __func__, screen_mode_to_string(mode));
+}
+
+/* Sync timeout callback. */
+static void
+screen_write_sync_callback(__unused int fd, __unused short events, void *arg)
+{
+	struct window_pane	*wp = arg;
+
+	log_debug("%s: %%%u sync timer expired", __func__, wp->id);
+	evtimer_del(&wp->sync_timer);
+
+	if (wp->base.mode & MODE_SYNC) {
+		wp->base.mode &= ~MODE_SYNC;
+		wp->flags |= PANE_REDRAW;
+	}
+}
+
+/* Start sync mode. */
+void
+screen_write_start_sync(struct window_pane *wp)
+{
+	struct timeval	tv = { .tv_sec = 1, .tv_usec = 0 };
+
+	if (wp == NULL)
+		return;
+
+	wp->base.mode |= MODE_SYNC;
+	if (!event_initialized(&wp->sync_timer))
+		evtimer_set(&wp->sync_timer, screen_write_sync_callback, wp);
+	evtimer_add(&wp->sync_timer, &tv);
+
+	log_debug("%s: %%%u started sync mode", __func__, wp->id);
+}
+
+/* Stop sync mode. */
+void
+screen_write_stop_sync(struct window_pane *wp)
+{
+	if (wp == NULL)
+		return;
+
+	if (event_initialized(&wp->sync_timer))
+		evtimer_del(&wp->sync_timer);
+	wp->base.mode &= ~MODE_SYNC;
+
+	log_debug("%s: %%%u stopped sync mode", __func__, wp->id);
 }
 
 /* Cursor up by ny. */
@@ -1692,6 +1738,17 @@ screen_write_collect_flush(struct screen_write_ctx *ctx, int scroll_only,
 	u_int				 y, cx, cy, last, items = 0;
 	struct tty_ctx			 ttyctx;
 
+	if (s->mode & MODE_SYNC) {
+		for (y = 0; y < screen_size_y(s); y++) {
+			cl = &ctx->s->write_list[y];
+			TAILQ_FOREACH_SAFE(ci, &cl->items, entry, tmp) {
+				TAILQ_REMOVE(&cl->items, ci, entry);
+				screen_write_free_citem(ci);
+			}
+		}
+		return;
+	}
+
 	if (ctx->scrolled != 0) {
 		log_debug("%s: scrolled %u (region %u-%u)", __func__,
 		    ctx->scrolled, s->rupper, s->rlower);
@@ -1782,9 +1839,13 @@ screen_write_collect_end(struct screen_write_ctx *ctx)
 			grid_view_set_cell(s->grid, xx, s->cy,
 			    &grid_default_cell);
 		}
-		if (gc.data.width > 1) {
-			grid_view_set_cell(s->grid, xx, s->cy,
-			    &grid_default_cell);
+		if (xx != s->cx) {
+			if (xx == 0)
+				grid_view_get_cell(s->grid, 0, s->cy, &gc);
+			if (gc.data.width > 1) {
+				grid_view_set_cell(s->grid, xx, s->cy,
+				    &grid_default_cell);
+			}
 		}
 	}
 
@@ -1897,7 +1958,7 @@ screen_write_cell(struct screen_write_ctx *ctx, const struct grid_cell *gc)
 		log_debug("%s: wrapped at %u,%u", __func__, s->cx, s->cy);
 		screen_write_linefeed(ctx, 1, 8);
 		screen_write_set_cursor(ctx, 0, -1);
-		screen_write_collect_flush(ctx, 1, __func__);
+		screen_write_collect_flush(ctx, 0, __func__);
 	}
 
 	/* Sanity check cursor position. */
@@ -1981,7 +2042,7 @@ screen_write_cell(struct screen_write_ctx *ctx, const struct grid_cell *gc)
 	}
 
 	/* Write to the screen. */
-	if (!skip) {
+	if (!skip && !(s->mode & MODE_SYNC)) {
 		if (selected) {
 			screen_select_cell(s, &tmp_gc, gc);
 			ttyctx.cell = &tmp_gc;
@@ -2002,6 +2063,10 @@ screen_write_combine(struct screen_write_ctx *ctx, const struct grid_cell *gc)
 	struct grid_cell	 last;
 	struct tty_ctx		 ttyctx;
 	int			 force_wide = 0, zero_width = 0;
+
+	/* Ignore U+3164 HANGUL_FILLER entirely. */
+	if (utf8_is_hangul_filler(ud))
+		return (1);
 
 	/*
 	 * Is this character which makes no sense without being combined? If
@@ -2034,17 +2099,27 @@ screen_write_combine(struct screen_write_ctx *ctx, const struct grid_cell *gc)
 		return (zero_width);
 
 	/*
-	 * Check if we need to combine characters. This could be zero width
-	 * (set above), a modifier character (with an existing Unicode
-	 * character) or a previous ZWJ.
+	 * Check if we need to combine characters. This could be a Korean
+	 * Hangul Jamo character, zero width (set above), a modifier character
+	 * (with an existing Unicode character) or a previous ZWJ.
 	 */
 	if (!zero_width) {
-		if (utf8_is_modifier(ud)) {
-			if (last.data.size < 2)
-				return (0);
-			force_wide = 1;
-		} else if (!utf8_has_zwj(&last.data))
+		switch (hanguljamo_check_state(&last.data, ud)) {
+		case HANGULJAMO_STATE_NOT_COMPOSABLE:
+			return (1);
+		case HANGULJAMO_STATE_CHOSEONG:
 			return (0);
+		case HANGULJAMO_STATE_COMPOSABLE:
+			break;
+		case HANGULJAMO_STATE_NOT_HANGULJAMO:
+			if (utf8_should_combine(&last.data, ud))
+				force_wide = 1;
+			else if (utf8_should_combine(ud, &last.data))
+                               force_wide = 1;
+			else if (!utf8_has_zwj(&last.data))
+				return (0);
+			break;
+		}
 	}
 
 	/* Check if this combined character would be too long. */
@@ -2207,8 +2282,10 @@ screen_write_alternateon(struct screen_write_ctx *ctx, struct grid_cell *gc,
 	screen_write_collect_flush(ctx, 0, __func__);
 	screen_alternate_on(ctx->s, gc, cursor);
 
-	if (wp != NULL)
+	if (wp != NULL) {
 		layout_fix_panes(wp->window, NULL);
+		server_redraw_window_borders(wp->window);
+	}
 
 	screen_write_initctx(ctx, &ttyctx, 1);
 	if (ttyctx.redraw_cb != NULL)
@@ -2229,8 +2306,10 @@ screen_write_alternateoff(struct screen_write_ctx *ctx, struct grid_cell *gc,
 	screen_write_collect_flush(ctx, 0, __func__);
 	screen_alternate_off(ctx->s, gc, cursor);
 
-	if (wp != NULL)
+	if (wp != NULL) {
 		layout_fix_panes(wp->window, NULL);
+		server_redraw_window_borders(wp->window);
+	}
 
 	screen_write_initctx(ctx, &ttyctx, 1);
 	if (ttyctx.redraw_cb != NULL)

@@ -1,4 +1,4 @@
-/*	$OpenBSD: in_pcb.h,v 1.168 2025/05/20 05:51:43 bluhm Exp $	*/
+/*	$OpenBSD: in_pcb.h,v 1.172 2025/10/24 15:09:56 bluhm Exp $	*/
 /*	$NetBSD: in_pcb.h,v 1.14 1996/02/13 23:42:00 christos Exp $	*/
 
 /*
@@ -81,13 +81,12 @@
  *	t	inpt_mtx		pcb table mutex
  *	L	pf_inp_mtx		link pf to inp mutex
  *	s	so_lock			socket rwlock
- *	f	inp_sofree_mtx		socket detach and lock
  */
 
 /*
  * The pcb table mutex guarantees that all inpcb are consistent and
  * that bind(2) and connect(2) create unique combinations of
- * laddr/faddr/lport/fport/rtalbleid.  This mutex is used to protect
+ * laddr/faddr/lport/fport/rtableid.  This mutex is used to protect
  * both address consistency and inpcb lookup during protocol input.
  * All writes to inp_[lf]addr take table mutex.  A per socket lock is
  * needed, so that socket layer input have a consistent view at these
@@ -138,9 +137,8 @@ struct inpcb {
 #define	inp_laddr6	inp_laddru.iau_addr6
 	u_int16_t inp_fport;		/* [t] foreign port */
 	u_int16_t inp_lport;		/* [t] local port */
-	struct	  socket *inp_socket;	/* [f] back pointer to socket */
-	struct	  mutex inp_sofree_mtx;	/* protect socket free */
-	caddr_t	  inp_ppcb;		/* pointer to per-protocol pcb */
+	struct	  socket *inp_socket;	/* [I] back pointer to socket */
+	caddr_t	  inp_ppcb;		/* [s] pointer to per-protocol pcb */
 	struct    route inp_route;	/* [s] cached route */
 	struct    refcnt inp_refcnt;	/* refcount PCB, delay memory free */
 	int	  inp_flags;		/* generic IP/datagram flags */
@@ -311,8 +309,8 @@ int	 in_pcbaddrisavail(const struct inpcb *, struct sockaddr_in *, int,
 int	 in_pcbconnect(struct inpcb *, struct mbuf *);
 void	 in_pcbdetach(struct inpcb *);
 struct socket *
-	 in_pcbsolock_ref(struct inpcb *);
-void	 in_pcbsounlock_rele(struct inpcb *, struct socket *);
+	 in_pcbsolock(struct inpcb *);
+void	 in_pcbsounlock(struct inpcb *, struct socket *);
 struct inpcb *
 	 in_pcbref(struct inpcb *);
 void	 in_pcbunref(struct inpcb *);
@@ -359,6 +357,7 @@ void	 in_setpeeraddr(struct inpcb *, struct mbuf *);
 void	 in_setsockaddr(struct inpcb *, struct mbuf *);
 int	 in_sockaddr(struct socket *, struct mbuf *);
 int	 in_peeraddr(struct socket *, struct mbuf *);
+int	 in_flowid(struct socket *);
 int	 in_baddynamic(u_int16_t, u_int16_t);
 int	 in_rootonly(u_int16_t, u_int16_t);
 int	 in_pcbselsrc(struct in_addr *, const struct sockaddr_in *,

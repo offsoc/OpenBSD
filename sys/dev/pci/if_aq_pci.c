@@ -1,4 +1,4 @@
-/* $OpenBSD: if_aq_pci.c,v 1.31 2025/02/16 10:11:37 jmatthew Exp $ */
+/* $OpenBSD: if_aq_pci.c,v 1.33 2025/11/11 17:43:18 bluhm Exp $ */
 /*	$NetBSD: if_aq.c,v 1.27 2021/06/16 00:21:18 riastradh Exp $	*/
 
 /*
@@ -1310,8 +1310,8 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 		int nmsix = pci_intr_msix_count(pa);
 		if (nmsix > 1) {
 			nmsix--;
-			sc->sc_intrmap = intrmap_create(&sc->sc_dev,
-			    nmsix, AQ_MAXQ, INTRMAP_POWEROF2);
+			sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix,
+			    MIN(AQ_MAXQ, IF_MAX_VECTORS), INTRMAP_POWEROF2);
 			sc->sc_nqueues = intrmap_count(sc->sc_intrmap);
 			KASSERT(sc->sc_nqueues > 0);
 			KASSERT(powerof2(sc->sc_nqueues));
@@ -2441,18 +2441,6 @@ int
 aq2_fw_get_stats(struct aq_softc *sc, struct aq_hw_stats_s *w)
 {
 	return 0;
-}
-
-void
-aq_hw_l3_filter_set(struct aq_softc *sc)
-{
-	int i;
-
-	/* clear all filter */
-	for (i = 0; i < 8; i++) {
-		AQ_WRITE_REG_BIT(sc, RPF_L3_FILTER_REG(i),
-		    RPF_L3_FILTER_L4_EN, 0);
-	}
 }
 
 int

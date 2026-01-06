@@ -1,8 +1,10 @@
-#	$OpenBSD: Makefile,v 1.42 2025/02/26 15:49:56 claudio Exp $
+#	$OpenBSD: Makefile,v 1.45 2025/12/11 12:18:27 claudio Exp $
 
 PROG=	bgpd
 SRCS=	bgpd.c
+SRCS+=	bitmap.c
 SRCS+=	carp.c
+SRCS+=	chash.c
 SRCS+=	config.c
 SRCS+=	control.c
 SRCS+=	flowspec.c
@@ -17,6 +19,7 @@ SRCS+=	pfkey.c
 SRCS+=	pftable.c
 SRCS+=	printconf.c
 SRCS+=	rde.c
+SRCS+=	rde_adjout.c
 SRCS+=	rde_aspa.c
 SRCS+=	rde_attr.c
 SRCS+=	rde_community.c

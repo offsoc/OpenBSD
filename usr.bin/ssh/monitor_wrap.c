@@ -1,4 +1,4 @@
-/* $OpenBSD: monitor_wrap.c,v 1.139 2025/05/05 02:40:30 djm Exp $ */
+/* $OpenBSD: monitor_wrap.c,v 1.144 2025/12/19 00:56:34 djm Exp $ */
 /*
  * Copyright 2002 Niels Provos <provos@citi.umich.edu>
  * Copyright 2002 Markus Friedl <markus@openbsd.org>
@@ -33,9 +33,9 @@
 #include <errno.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdarg.h>
 #include <unistd.h>
 
 #ifdef WITH_OPENSSL
@@ -102,8 +102,13 @@ mm_log_handler(LogLevel level, int forced, const char *msg, void *ctx)
 		fatal_f("bad length %zu", len);
 	POKE_U32(sshbuf_mutable_ptr(log_msg), len - 4);
 	if (atomicio(vwrite, mon->m_log_sendfd,
-	    sshbuf_mutable_ptr(log_msg), len) != len)
+	    sshbuf_mutable_ptr(log_msg), len) != len) {
+		if (errno == EPIPE) {
+			debug_f("write: %s", strerror(errno));
+			cleanup_exit(255);
+		}
 		fatal_f("write: %s", strerror(errno));
+	}
 	sshbuf_free(log_msg);
 }
 
@@ -146,7 +151,7 @@ mm_request_send(int sock, enum monitor_reqtype type, struct sshbuf *m)
 
 	debug3_f("entering, type %d", type);
 
-	if (mlen >= 0xffffffff)
+	if (mlen >= MONITOR_MAX_MSGLEN)
 		fatal_f("bad length %zu", mlen);
 	POKE_U32(buf, mlen + 1);
 	buf[4] = (u_char) type;		/* 1st byte of payload is mesg-type */
@@ -179,7 +184,7 @@ mm_request_receive(int sock, struct sshbuf *m)
 		fatal_f("read: %s", strerror(errno));
 	}
 	msg_len = PEEK_U32(buf);
-	if (msg_len > 256 * 1024)
+	if (msg_len > MONITOR_MAX_MSGLEN)
 		fatal_f("read: bad msg_len %d", msg_len);
 	sshbuf_reset(m);
 	if ((r = sshbuf_reserve(m, msg_len, &p)) != 0)
@@ -296,7 +301,7 @@ mm_decode_activate_server_options(struct ssh *ssh, struct sshbuf *m)
 		    (r = sshbuf_get_cstring(m, &newopts->x, NULL)) != 0) \
 			fatal_fr(r, "parse %s", #x); \
 	} while (0)
-#define M_CP_STRARRAYOPT(x, nx) do { \
+#define M_CP_STRARRAYOPT(x, nx, clobber) do { \
 		newopts->x = newopts->nx == 0 ? \
 		    NULL : xcalloc(newopts->nx, sizeof(*newopts->x)); \
 		for (i = 0; i < newopts->nx; i++) { \
@@ -315,6 +320,17 @@ mm_decode_activate_server_options(struct ssh *ssh, struct sshbuf *m)
 	log_verbose_reset();
 	for (i = 0; i < options.num_log_verbose; i++)
 		log_verbose_add(options.log_verbose[i]);
+
+	/* use the macro hell to clean up too */
+#define M_CP_STROPT(x) free(newopts->x)
+#define M_CP_STRARRAYOPT(x, nx, clobber) do { \
+		for (i = 0; i < newopts->nx; i++) \
+			free(newopts->x[i]); \
+		free(newopts->x); \
+	} while (0)
+	COPY_MATCH_STRING_OPTS();
+#undef M_CP_STROPT
+#undef M_CP_STRARRAYOPT
 	free(newopts);
 }
 

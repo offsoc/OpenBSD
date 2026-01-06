@@ -1,4 +1,4 @@
-.\"	$OpenBSD: smtpd.conf.5,v 1.274 2025/05/12 20:58:27 sobrado Exp $
+.\"	$OpenBSD: smtpd.conf.5,v 1.278 2025/08/26 13:46:59 sthen Exp $
 .\"
 .\" Copyright (c) 2008 Janne Johansson <jj@openbsd.org>
 .\" Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
@@ -17,7 +17,7 @@
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
 .\"
-.Dd $Mdocdate: May 12 2025 $
+.Dd $Mdocdate: August 26 2025 $
 .Dt SMTPD.CONF 5
 .Os
 .Sh NAME
@@ -68,11 +68,16 @@ must be quoted.
 Arguments containing whitespace should be surrounded by double quotes
 .Pq \&" .
 .Pp
-Macros can be defined that are later expanded in context.
-Macro names must start with a letter, digit, or underscore,
-and may contain any of those characters,
-but may not be reserved words.
-Macros are not expanded inside quotes.
+A macro is defined with a command of the form
+.Ar name Ns = Ns Ar value .
+The macro
+.Ar name
+can contain letters, digits, and underscores and cannot be a reserved word.
+Within unquoted arguments, the string
+.Pf $ Ar name
+is later expanded to
+.Ar value .
+.Pp
 For example:
 .Bd -literal -offset indent
 lan_addr = "192.168.0.1"
@@ -530,10 +535,14 @@ In addition, if the
 option is provided,
 the From header is rewritten
 to match the sender provided in the SMTP session.
-.It Cm smtps
+.It Cm smtps Op Cm verify
 Support SMTPS, by default on port 465.
 Mutually exclusive with
 .Cm tls .
+With the
+.Cm verify
+option, clients must also provide a valid certificate
+to establish an SMTP session.
 .It Cm tag Ar tag
 Clients connecting to the listener are tagged with the given
 .Ar tag .
@@ -596,7 +605,10 @@ of one
 directive, receive the incoming message, put a copy into each
 matching envelope, and atomically save the envelopes to the mail
 spool for later processing by the respective dispatcher
-.Ar name .
+.Ar name
+which has to be declared beforehand with the
+.Ic action
+directive.
 .Pp
 The following matching options are supported and can all be negated:
 .Bl -tag -width Ds
@@ -998,7 +1010,7 @@ The following phases are currently supported:
 .It mail-from Ta after MAIL FROM command is submitted
 .It rcpt-to   Ta after RCPT TO command is submitted
 .It data       Ta after DATA command is submitted
-.It commit     Ta after message is fully is submitted
+.It commit     Ta after message is fully submitted
 .El
 .Pp
 At each phase, various conditions may be matched.

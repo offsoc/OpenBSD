@@ -1,4 +1,4 @@
-/*	$OpenBSD: subr_pool.c,v 1.239 2025/05/21 09:33:48 mvs Exp $	*/
+/*	$OpenBSD: subr_pool.c,v 1.242 2025/08/01 19:00:38 cludwig Exp $	*/
 /*	$NetBSD: subr_pool.c,v 1.61 2001/09/26 07:14:56 chs Exp $	*/
 
 /*-
@@ -561,6 +561,9 @@ pool_get(struct pool *pp, int flags)
 {
 	void *v = NULL;
 	int slowdown = 0;
+
+	if (flags & PR_WAITOK)
+		assertwaitok();
 
 	KASSERT(flags & (PR_WAITOK | PR_NOWAIT));
 	if (pp->pr_flags & PR_RWLOCK)
@@ -1454,6 +1457,7 @@ pool_walk(struct pool *pp, int full,
 }
 #endif
 
+#ifndef SMALL_KERNEL
 /*
  * We have three different sysctls.
  * kern.pool.npools - the number of pools.
@@ -1541,6 +1545,7 @@ sysctl_dopool(int *name, u_int namelen, char *oldp, size_t *oldlenp)
 
 	return (rv);
 }
+#endif /* SMALL_KERNEL */
 
 void
 pool_gc_sched(void *null)
@@ -2242,7 +2247,7 @@ void
 pool_lock_rw_init(struct pool *pp, union pool_lock *lock,
     const struct lock_type *type)
 {
-	_rw_init_flags(&lock->prl_rwlock, pp->pr_wchan, 0, type);
+	_rw_init_flags(&lock->prl_rwlock, pp->pr_wchan, 0, type, 0);
 }
 
 void

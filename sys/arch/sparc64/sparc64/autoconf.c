@@ -1,4 +1,4 @@
-/*	$OpenBSD: autoconf.c,v 1.151 2024/05/17 20:05:08 miod Exp $	*/
+/*	$OpenBSD: autoconf.c,v 1.154 2025/10/05 14:29:16 deraadt Exp $	*/
 /*	$NetBSD: autoconf.c,v 1.51 2001/07/24 19:32:11 eeh Exp $ */
 
 /*
@@ -519,7 +519,7 @@ bootpath_build(void)
 				 * be an ethernet media specification, so be
 				 * sure to skip all letters.
 				 */
-				bp->val[2] = *++cp - 'a';
+				bp->val[2] = DL_PARTNAME2NUM(*++cp);
 				while (*cp != '\0' && *cp != '/')
 					cp++;
 			}
@@ -605,15 +605,14 @@ bootpath_print(struct bootpath *bp)
 		else
 			printf("/%s@%lx,%lx", bp->name, bp->val[0], bp->val[1]);
 		if (bp->val[2] != 0)
-			printf(":%c", (int)bp->val[2] + 'a');
+			printf(":%c", DL_PARTNUM2NAME((int)bp->val[2]));
 		bp++;
 	}
 	printf("\n");
 }
 
-
 /*
- * save or read a bootpath pointer from the boothpath store.
+ * save or read a bootpath pointer from the bootpath store.
  *
  * XXX. required because of SCSI... we don't have control over the "sd"
  * device, so we can't set boot device there.   we patch in with

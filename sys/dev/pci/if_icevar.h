@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_icevar.h,v 1.6 2025/04/01 08:32:16 stsp Exp $	*/
+/*	$OpenBSD: if_icevar.h,v 1.11 2025/11/18 09:13:55 jan Exp $	*/
 
 /*  Copyright (c) 2024, Intel Corporation
  *  All rights reserved.
@@ -274,7 +274,7 @@ static inline void ice_zero_bitmap(ice_bitmap_t *bmp, uint16_t size)
  * ice_and_bitmap - bitwise AND 2 bitmaps and store result in dst bitmap
  * @dst: Destination bitmap that receive the result of the operation
  * @bmp1: The first bitmap to intersect
- * @bmp2: The second bitmap to intersect wit the first
+ * @bmp2: The second bitmap to intersect with the first
  * @size: Size of the bitmaps in bits
  *
  * This function performs a bitwise AND on two "source" bitmaps of the same size
@@ -313,7 +313,7 @@ ice_and_bitmap(ice_bitmap_t *dst, const ice_bitmap_t *bmp1,
  * ice_or_bitmap - bitwise OR 2 bitmaps and store result in dst bitmap
  * @dst: Destination bitmap that receive the result of the operation
  * @bmp1: The first bitmap to intersect
- * @bmp2: The second bitmap to intersect wit the first
+ * @bmp2: The second bitmap to intersect with the first
  * @size: Size of the bitmaps in bits
  *
  * This function performs a bitwise OR on two "source" bitmaps of the same size
@@ -633,7 +633,7 @@ struct ice_dma_mem {
 #define ICE_DMA_KVA(_m)	((void *)(_m)->va)
 #define ICE_DMA_LEN(_m)	((_m)->size)
 
-#define ICE_STR_BUF_LEN 32
+#define ICE_STR_BUF_LEN 64
 
 /**
  * @struct ice_lock
@@ -764,7 +764,7 @@ enum ice_fw_modes {
 #define ICE_MIN_TSO_MSS		64
 
 #define ICE_MAX_TX_SEGS		8
-#define ICE_MAX_TSO_SEGS	128
+#define ICE_MAX_TSO_SEGS	8
 
 #define ICE_MAX_DMA_SEG_SIZE	((16*1024) - 1)
 
@@ -847,7 +847,7 @@ enum ice_dyn_idx_t {
 	ICE_ITR_NONE = 3	/* ITR_NONE must not be used as an index */
 };
 
-/* By convenction ITR0 is used for RX, and ITR1 is used for TX */
+/* By convention ITR0 is used for RX, and ITR1 is used for TX */
 #define ICE_RX_ITR ICE_IDX_ITR0
 #define ICE_TX_ITR ICE_IDX_ITR1
 
@@ -2120,7 +2120,7 @@ enum ice_prot_id {
 	ICE_PROT_LLDP_OF	= 117,
 	ICE_PROT_ARP_OF		= 118,
 	ICE_PROT_EAPOL_OF	= 120,
-	ICE_PROT_META_ID	= 255, /* when offset == metaddata */
+	ICE_PROT_META_ID	= 255, /* when offset == metadata */
 	ICE_PROT_INVALID	= 255  /* when offset == ICE_FV_OFFSET_INVAL */
 };
 
@@ -4537,6 +4537,7 @@ struct ice_pf_sw_stats {
 struct ice_tx_map {
 	struct mbuf		*txm_m;
 	bus_dmamap_t		 txm_map;
+	bus_dmamap_t		 txm_map_tso;
 	unsigned int		 txm_eop;
 };
 
@@ -4694,3 +4695,5 @@ struct ice_vsi {
 
 /* Driver always calls main vsi_handle first */
 #define ICE_MAIN_VSI_HANDLE		0
+
+#define ICE_I2C_MAX_RETRIES		10

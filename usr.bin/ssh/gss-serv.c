@@ -1,4 +1,4 @@
-/* $OpenBSD: gss-serv.c,v 1.32 2020/03/13 03:17:07 djm Exp $ */
+/* $OpenBSD: gss-serv.c,v 1.35 2025/12/22 03:12:05 djm Exp $ */
 
 /*
  * Copyright (c) 2001-2003 Simon Wilkinson. All rights reserved.
@@ -24,10 +24,10 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#ifdef GSSAPI
+
 #include <sys/types.h>
 #include <sys/queue.h>
-
-#ifdef GSSAPI
 
 #include <string.h>
 
@@ -327,6 +327,11 @@ ssh_gssapi_cleanup_creds(void)
 void
 ssh_gssapi_storecreds(void)
 {
+	if (options.gss_deleg_creds == 0) {
+		debug_f("delegate credential is disabled, doing nothing");
+		return;
+	}
+
 	if (gssapi_client.mech && gssapi_client.mech->storecreds) {
 		(*gssapi_client.mech->storecreds)(&gssapi_client);
 	} else
