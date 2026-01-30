@@ -1,4 +1,4 @@
-/* $OpenBSD: server-client.c,v 1.440 2026/01/07 08:16:20 nicm Exp $ */
+/* $OpenBSD: server-client.c,v 1.444 2026/01/23 10:45:53 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -165,38 +165,58 @@ server_client_clear_overlay(struct client *c)
 	server_redraw_client(c);
 }
 
+/* Are these ranges empty? That is, nothing is visible. */
+int
+server_client_ranges_is_empty(struct visible_ranges *r)
+{
+	u_int	i;
+
+	for (i = 0; i < r->used; i++) {
+		if (r->ranges[i].nx != 0)
+			return (0);
+	}
+	return (1);
+}
+
+/* Ensure we have space for at least n ranges. */
+void
+server_client_ensure_ranges(struct visible_ranges *r, u_int n)
+{
+	if (r->size >= n)
+		return;
+	r->ranges = xrecallocarray(r->ranges, r->size, n, sizeof *r->ranges);
+	r->size = n;
+}
+
 /*
  * Given overlay position and dimensions, return parts of the input range which
  * are visible.
  */
 void
 server_client_overlay_range(u_int x, u_int y, u_int sx, u_int sy, u_int px,
-    u_int py, u_int nx, struct overlay_ranges *r)
+    u_int py, u_int nx, struct visible_ranges *r)
 {
 	u_int	ox, onx;
 
-	/* Return up to 2 ranges. */
-	r->px[2] = 0;
-	r->nx[2] = 0;
-
 	/* Trivial case of no overlap in the y direction. */
 	if (py < y || py > y + sy - 1) {
-		r->px[0] = px;
-		r->nx[0] = nx;
-		r->px[1] = 0;
-		r->nx[1] = 0;
+		server_client_ensure_ranges(r, 1);
+		r->ranges[0].px = px;
+		r->ranges[0].nx = nx;
+		r->used = 1;
 		return;
 	}
+	server_client_ensure_ranges(r, 2);
 
 	/* Visible bit to the left of the popup. */
 	if (px < x) {
-		r->px[0] = px;
-		r->nx[0] = x - px;
-		if (r->nx[0] > nx)
-			r->nx[0] = nx;
+		r->ranges[0].px = px;
+		r->ranges[0].nx = x - px;
+		if (r->ranges[0].nx > nx)
+			r->ranges[0].nx = nx;
 	} else {
-		r->px[0] = 0;
-		r->nx[0] = 0;
+		r->ranges[0].px = 0;
+		r->ranges[0].nx = 0;
 	}
 
 	/* Visible bit to the right of the popup. */
@@ -205,12 +225,13 @@ server_client_overlay_range(u_int x, u_int y, u_int sx, u_int sy, u_int px,
 		ox = px;
 	onx = px + nx;
 	if (onx > ox) {
-		r->px[1] = ox;
-		r->nx[1] = onx - ox;
+		r->ranges[1].px = ox;
+		r->ranges[1].nx = onx - ox;
 	} else {
-		r->px[1] = 0;
-		r->nx[1] = 0;
+		r->ranges[1].px = 0;
+		r->ranges[1].nx = 0;
 	}
+	r->used = 2;
 }
 
 /* Check if this client is inside this server. */
@@ -315,6 +336,8 @@ server_client_create(int fd)
 	evtimer_set(&c->repeat_timer, server_client_repeat_timer, c);
 	evtimer_set(&c->click_timer, server_client_click_timer, c);
 
+	c->click_wp = -1;
+
 	TAILQ_INIT(&c->input_requests);
 
 	TAILQ_INSERT_TAIL(&clients, c, entry);
@@ -405,13 +428,13 @@ server_client_set_session(struct client *c, struct session *s)
 	if (old != NULL && old->curw != NULL)
 		window_update_focus(old->curw->window);
 	if (s != NULL) {
+		s->curw->window->latest = c;
 		recalculate_sizes();
 		window_update_focus(s->curw->window);
 		session_update_activity(s, NULL);
 		session_theme_changed(s);
 		gettimeofday(&s->last_attached_time, NULL);
 		s->curw->flags &= ~WINLINK_ALERTFLAGS;
-		s->curw->window->latest = c;
 		alerts_check_session(s);
 		tty_update_client_offset(c);
 		status_timer_start(c);
@@ -737,21 +760,17 @@ server_client_check_mouse(struct client *c, struct key_event *event)
 		if (c->flags & CLIENT_DOUBLECLICK) {
 			evtimer_del(&c->click_timer);
 			c->flags &= ~CLIENT_DOUBLECLICK;
-			if (m->b == c->click_button) {
-				type = SECOND;
-				x = m->x, y = m->y, b = m->b;
-				log_debug("second-click at %u,%u", x, y);
-				c->flags |= CLIENT_TRIPLECLICK;
-			}
+			type = SECOND;
+			x = m->x, y = m->y, b = m->b;
+			log_debug("second-click at %u,%u", x, y);
+			c->flags |= CLIENT_TRIPLECLICK;
 		} else if (c->flags & CLIENT_TRIPLECLICK) {
 			evtimer_del(&c->click_timer);
 			c->flags &= ~CLIENT_TRIPLECLICK;
-			if (m->b == c->click_button) {
-				type = TRIPLE;
-				x = m->x, y = m->y, b = m->b;
-				log_debug("triple-click at %u,%u", x, y);
-				goto have_event;
-			}
+			type = TRIPLE;
+			x = m->x, y = m->y, b = m->b;
+			log_debug("triple-click at %u,%u", x, y);
+			goto have_event;
 		}
 
 		/* DOWN is the only remaining event type. */
@@ -760,17 +779,6 @@ server_client_check_mouse(struct client *c, struct key_event *event)
 			x = m->x, y = m->y, b = m->b;
 			log_debug("down at %u,%u", x, y);
 			c->flags |= CLIENT_DOUBLECLICK;
-		}
-
-		if (KEYC_CLICK_TIMEOUT != 0) {
-			memcpy(&c->click_event, m, sizeof c->click_event);
-			c->click_button = m->b;
-
-			log_debug("click timer started");
-			tv.tv_sec = KEYC_CLICK_TIMEOUT / 1000;
-			tv.tv_usec = (KEYC_CLICK_TIMEOUT % 1000) * 1000L;
-			evtimer_del(&c->click_timer);
-			evtimer_add(&c->click_timer, &tv);
 		}
 	}
 
@@ -884,6 +892,34 @@ have_event:
 			}
 			m->wp = wp->id;
 			m->w = wp->window->id;
+		}
+	}
+
+	/* Reset click type or add a click timer if needed. */
+	if (type == DOWN ||
+	    type == SECOND ||
+	    type == TRIPLE) {
+		if (type != DOWN &&
+		    (m->b != c->click_button ||
+		    where != (enum mouse_where)c->click_where ||
+		    m->wp != c->click_wp)) {
+			type = DOWN;
+			log_debug("click sequence reset at %u,%u", x, y);
+			c->flags &= ~CLIENT_TRIPLECLICK;
+			c->flags |= CLIENT_DOUBLECLICK;
+		}
+
+		if (type != TRIPLE && KEYC_CLICK_TIMEOUT != 0) {
+			memcpy(&c->click_event, m, sizeof c->click_event);
+			c->click_button = m->b;
+			c->click_where = where;
+			c->click_wp = m->wp;
+
+			log_debug("click timer started");
+			tv.tv_sec = KEYC_CLICK_TIMEOUT / 1000;
+			tv.tv_usec = (KEYC_CLICK_TIMEOUT % 1000) * 1000L;
+			evtimer_del(&c->click_timer);
+			evtimer_add(&c->click_timer, &tv);
 		}
 	}
 
@@ -2402,16 +2438,6 @@ server_client_key_callback(struct cmdq_item *item, void *data)
 		event->key = key;
 	}
 
-	/* Handle theme reporting keys. */
-	if (key == KEYC_REPORT_LIGHT_THEME) {
-		server_client_report_theme(c, THEME_LIGHT);
-		goto out;
-	}
-	if (key == KEYC_REPORT_DARK_THEME) {
-		server_client_report_theme(c, THEME_DARK);
-		goto out;
-	}
-
 	/* Find affected pane. */
 	if (!KEYC_IS_MOUSE(key) || cmd_find_from_mouse(&fs, m, 0) != 0)
 		cmd_find_from_client(&fs, c, 0);
@@ -2629,6 +2655,19 @@ server_client_handle_key(struct client *c, struct key_event *event)
 	/* Check the client is good to accept input. */
 	if (s == NULL || (c->flags & CLIENT_UNATTACHEDFLAGS))
 		return (0);
+
+	/*
+	 * Handle theme reporting keys before overlays so they work even when a
+	 * popup is open.
+	 */
+	if (event->key == KEYC_REPORT_LIGHT_THEME) {
+		server_client_report_theme(c, THEME_LIGHT);
+		return (0);
+	}
+	if (event->key == KEYC_REPORT_DARK_THEME) {
+		server_client_report_theme(c, THEME_DARK);
+		return (0);
+	}
 
 	/*
 	 * Key presses in overlay mode and the command prompt are a special

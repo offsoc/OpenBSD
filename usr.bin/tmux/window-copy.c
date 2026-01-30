@@ -1,4 +1,4 @@
-/* $OpenBSD: window-copy.c,v 1.380 2025/12/25 18:05:15 nicm Exp $ */
+/* $OpenBSD: window-copy.c,v 1.382 2026/01/22 08:55:01 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -2708,6 +2708,11 @@ window_copy_cmd_refresh_from_pane(struct window_copy_cmd_state *cs)
 	data->backing = window_copy_clone_screen(&wp->base, &data->screen, NULL,
 	    NULL, wme->swp != wme->wp);
 
+	if (data->oy > screen_hsize(data->backing)) {
+		data->cy = 0;
+		data->oy = screen_hsize(data->backing);
+	}
+
 	window_copy_size_changed(wme);
 	return (WINDOW_COPY_CMD_REDRAW);
 }
@@ -3237,6 +3242,15 @@ window_copy_command(struct window_mode_entry *wme, struct client *c,
 		window_pane_reset_mode(wp);
 	else if (action == WINDOW_COPY_CMD_REDRAW)
 		window_copy_redraw_screen(wme);
+	else if (action == WINDOW_COPY_CMD_NOTHING) {
+		/*
+		 * Nothing is not actually nothing - most commands at least
+		 * move the cursor (what would be the point of a command that
+		 * literally does nothing?) and in that case we need to redraw
+		 * the first line to update the indicator.
+		 */
+		window_copy_redraw_lines(wme, 0, 1);
+	}
 }
 
 static void

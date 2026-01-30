@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile.inc,v 1.44 2025/11/13 15:18:53 job Exp $
+# $OpenBSD: Makefile.inc,v 1.46 2026/01/16 11:25:27 job Exp $
 
 .PATH:		${.CURDIR}/../../../../usr.sbin/rpki-client
 
@@ -7,7 +7,6 @@ CFLAGS += -Werror
 
 PROGS += test-ip
 PROGS += test-cert
-PROGS += test-geofeed
 PROGS += test-mft
 PROGS += test-roa
 PROGS += test-rsc
@@ -23,8 +22,8 @@ REGRESS_TARGETS += run-regress-$p
 .endfor
 
 CFLAGS+=	-I${.CURDIR}/.. -I${.CURDIR}/../../../../usr.sbin/rpki-client
-LDADD+=		-lcrypto -lutil -lpthread
-DPADD+=		${LIBCRYPTO} ${LIBUTIL} ${LIBPTHREAD}
+LDADD+=		-lcrypto -lutil -lpthread -lz
+DPADD+=		${LIBCRYPTO} ${LIBUTIL} ${LIBPTHREAD} ${LIBZ}
 
 CLEANFILES+=	*.out *.err *.txt
 
@@ -60,10 +59,6 @@ SRCS_test-rsc+=	test-rsc.c rsc.c ${TEST_COMMON}
 
 run-regress-test-rsc: test-rsc
 	./test-rsc -v ${.CURDIR}/../rsc/*.sig
-
-SRCS_test-geofeed+=	test-geofeed.c geofeed.c ${TEST_COMMON}
-run-regress-test-geofeed: test-geofeed
-	./test-geofeed -v ${.CURDIR}/../geofeed/*.csv
 
 SRCS_test-tal+=	test-tal.c tal.c ${TEST_COMMON}
 run-regress-test-tal: test-tal

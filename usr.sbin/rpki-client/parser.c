@@ -1,4 +1,4 @@
-/*	$OpenBSD: parser.c,v 1.173 2025/11/13 15:18:53 job Exp $ */
+/*	$OpenBSD: parser.c,v 1.178 2026/01/27 09:41:42 tb Exp $ */
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -585,7 +585,7 @@ proc_parser_cert(char *file, const unsigned char *der, size_t len,
 
 	/* Extract certificate data. */
 
-	cert = cert_parse(file, der, len);
+	cert = cert_parse_ca_or_brk(file, der, len);
 	if (cert == NULL)
 		goto out;
 
@@ -666,7 +666,7 @@ proc_parser_ta_cmp(const struct cert *cert1, const struct cert *cert2)
 
 	/*
 	 * Both certs are valid from our perspective. If anything changed,
-	 * prefer the freshly-fetched one. We rely on cert_parse_pre() having
+	 * prefer the freshly-fetched one. We rely on cert_parse_ta() having
 	 * cached the extensions and thus libcrypto has already computed the
 	 * certs' hashes (SHA-1 for OpenSSL, SHA-512 for LibreSSL). The below
 	 * compares them.
@@ -685,25 +685,23 @@ proc_parser_root_cert(struct entity *entp, struct cert **out_cert)
 {
 	struct cert		*cert1 = NULL, *cert2 = NULL;
 	char			*file1 = NULL, *file2 = NULL;
-	unsigned char		*der = NULL, *pkey = entp->data;
-	size_t			 der_len = 0, pkeysz = entp->datasz;
+	unsigned char		*der = NULL, *spki = entp->data;
+	size_t			 der_len = 0, spkisz = entp->datasz;
 	int			 cmp;
 
 	*out_cert = NULL;
 
 	file2 = parse_filepath(entp->repoid, entp->path, entp->file, DIR_VALID);
 	der = load_file(file2, &der_len);
-	cert2 = cert_parse(file2, der, der_len);
+	cert2 = cert_parse_ta(file2, der, der_len, spki, spkisz);
 	free(der);
-	cert2 = ta_parse(file2, cert2, pkey, pkeysz);
 
 	if (!noop) {
 		file1 = parse_filepath(entp->repoid, entp->path, entp->file,
 		    DIR_TEMP);
 		der = load_file(file1, &der_len);
-		cert1 = cert_parse(file1, der, der_len);
+		cert1 = cert_parse_ta(file1, der, der_len, spki, spkisz);
 		free(der);
-		cert1 = ta_parse(file1, cert1, pkey, pkeysz);
 	}
 
 	if ((cmp = proc_parser_ta_cmp(cert1, cert2)) > 0) {
@@ -892,6 +890,7 @@ parse_entity(struct entityq *q, struct ibufqueue *msgq, X509_STORE_CTX *ctx,
 			/*
 			 * If entp->datasz == SHA256_DIGEST_LENGTH, we have a
 			 * cert added from a manifest, so it is not a root cert.
+			 * proc_parser_cert() will also make sure of this.
 			 */
 			if (entp->data != NULL &&
 			    entp->datasz != SHA256_DIGEST_LENGTH) {
